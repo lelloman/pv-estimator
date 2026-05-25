@@ -14,6 +14,8 @@ shortcuts that make future directions harder.
 
 - `SPEC.md` defines product and technical requirements.
 - `IMPLEMENTATION_PLAN.md` defines the ordered implementation roadmap.
+- `ARCHITECTURE.md` defines crate boundaries, extension axes, and core
+  contracts.
 - This file defines development workflow, contribution rules, branching, and CI
   expectations.
 
