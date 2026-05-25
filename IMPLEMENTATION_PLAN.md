@@ -8,13 +8,16 @@ Tasks:
 
 - Maintain `SPEC.md` as the source of product truth.
 - Use this file as the ordered implementation checklist.
-- Update both documents when scope changes.
+- Maintain `DEVELOPMENT.md` as the workflow, branching, review, and CI guide.
+- Update the relevant documents when scope, architecture, or process changes.
 
 Acceptance criteria:
 
 - The spec describes the UI-agnostic core, project model, embedded data,
   simulation, validation, extension policy, and deployment targets.
-- No implementation work contradicts the spec without updating it first.
+- The development guide describes branching, commits, review rules, CI, and
+  compatibility expectations.
+- No implementation work contradicts the docs without updating them first.
 
 ## 2. Abstraction And Extension Policy
 
