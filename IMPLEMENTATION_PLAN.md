@@ -1,5 +1,12 @@
 # PV Estimator Implementation Plan
 
+## Current Status
+
+- Phase 1: Documentation Baseline - complete.
+- Phase 2: Abstraction And Extension Policy - complete.
+- Phase 3: Rust Workspace Skeleton - complete.
+- Phase 4: Core Units And Types - complete.
+
 ## 1. Documentation Baseline
 
 Goal: keep the product and engineering target explicit before writing code.
