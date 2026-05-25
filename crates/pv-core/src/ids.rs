@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,7 +20,8 @@ impl std::error::Error for IdError {}
 
 macro_rules! id_type {
     ($name:ident) => {
-        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+        #[serde(try_from = "String", into = "String")]
         pub struct $name(String);
 
         impl $name {
@@ -31,6 +33,20 @@ macro_rules! id_type {
 
             pub fn as_str(&self) -> &str {
                 &self.0
+            }
+        }
+
+        impl TryFrom<String> for $name {
+            type Error = IdError;
+
+            fn try_from(value: String) -> Result<Self, Self::Error> {
+                Self::new(value)
+            }
+        }
+
+        impl From<$name> for String {
+            fn from(value: $name) -> Self {
+                value.0
             }
         }
 
@@ -85,5 +101,15 @@ mod tests {
             ComponentId::new("bad id").unwrap_err(),
             IdError::ContainsWhitespace
         );
+    }
+
+    #[test]
+    fn ids_round_trip_through_json_strings() {
+        let id = LocationId::new("rome").expect("valid id");
+        let encoded = serde_json::to_string(&id).expect("serialize id");
+        let decoded: LocationId = serde_json::from_str(&encoded).expect("deserialize id");
+
+        assert_eq!(encoded, "\"rome\"");
+        assert_eq!(decoded, id);
     }
 }

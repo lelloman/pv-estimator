@@ -1,8 +1,9 @@
+use serde::{Deserialize, Serialize};
 use std::ops::{Add, Div, Mul, Sub};
 
 macro_rules! quantity {
     ($name:ident, $field:ident) => {
-        #[derive(Debug, Clone, Copy, Default, PartialEq, PartialOrd)]
+        #[derive(Debug, Clone, Copy, Default, PartialEq, PartialOrd, Serialize, Deserialize)]
         pub struct $name {
             $field: f64,
         }
