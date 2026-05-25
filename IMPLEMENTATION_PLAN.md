@@ -6,6 +6,7 @@
 - Phase 2: Abstraction And Extension Policy - complete.
 - Phase 3: Rust Workspace Skeleton - complete.
 - Phase 4: Core Units And Types - complete.
+- Phase 5: Project Schema - complete.
 
 ## 1. Documentation Baseline
 
