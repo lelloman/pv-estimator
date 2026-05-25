@@ -9,6 +9,7 @@ Tasks:
 - Maintain `SPEC.md` as the source of product truth.
 - Use this file as the ordered implementation checklist.
 - Maintain `DEVELOPMENT.md` as the workflow, branching, review, and CI guide.
+- Maintain `ARCHITECTURE.md` as the crate boundary and abstraction guide.
 - Update the relevant documents when scope, architecture, or process changes.
 
 Acceptance criteria:
@@ -17,6 +18,8 @@ Acceptance criteria:
   simulation, validation, extension policy, and deployment targets.
 - The development guide describes branching, commits, review rules, CI, and
   compatibility expectations.
+- The architecture guide describes extension axes, module boundaries, and core
+  contracts.
 - No implementation work contradicts the docs without updating them first.
 
 ## 2. Abstraction And Extension Policy
@@ -42,6 +45,8 @@ Acceptance criteria:
 - Each major abstraction has a named reason tied to likely project evolution.
 - The implementation avoids throwaway abstractions that have no plausible second
   implementation or extension path.
+- `ARCHITECTURE.md` documents the first set of extension axes and crate
+  boundaries before code is introduced.
 
 ## 3. Rust Workspace Skeleton
 
