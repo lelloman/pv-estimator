@@ -1,0 +1,22 @@
+[workspace]
+members = [
+    "crates/pv-core",
+    "crates/pv-data",
+    "crates/pv-service",
+    "crates/pv-wasm",
+    "xtask",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lelloman/pv-estimator"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
