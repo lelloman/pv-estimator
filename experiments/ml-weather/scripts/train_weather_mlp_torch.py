@@ -41,6 +41,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=8192)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--cache-dir", type=Path, default=None)
+    parser.add_argument("--rebuild-cache", action="store_true")
+    parser.add_argument("--resident-device", action="store_true")
     return parser.parse_args()
 
 
@@ -56,7 +59,7 @@ def main() -> int:
         print(f"gpu={torch.cuda.get_device_name(0)}")
 
     started = time.time()
-    train_x, train_y, val_x, val_y = load_samples(args)
+    train_x, train_y, val_x, val_y = load_or_build_samples(args)
     print(f"loaded train_rows={len(train_x)} val_rows={len(val_x)} in {time.time() - started:.1f}s")
 
     target_mean = train_y.mean(axis=0).astype(np.float32)
@@ -68,17 +71,23 @@ def main() -> int:
     parameters = sum(parameter.numel() for parameter in model.parameters())
     print(f"parameters={parameters}")
 
-    train_dataset = TensorDataset(
-        torch.from_numpy(train_x),
-        torch.from_numpy(train_y_norm.astype(np.float32)),
-    )
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=0,
-        pin_memory=device.type == "cuda",
-    )
+    if args.resident_device:
+        print("moving training tensors to device", flush=True)
+        train_x_t = torch.from_numpy(train_x).to(device)
+        train_y_t = torch.from_numpy(train_y_norm.astype(np.float32)).to(device)
+        train_loader = None
+    else:
+        train_dataset = TensorDataset(
+            torch.from_numpy(train_x),
+            torch.from_numpy(train_y_norm.astype(np.float32)),
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=0,
+            pin_memory=device.type == "cuda",
+        )
     val_x_t = torch.from_numpy(val_x).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
@@ -89,16 +98,30 @@ def main() -> int:
         model.train()
         total_loss = 0.0
         batches = 0
-        for batch_x, batch_y in train_loader:
-            batch_x = batch_x.to(device, non_blocking=True)
-            batch_y = batch_y.to(device, non_blocking=True)
-            optimizer.zero_grad(set_to_none=True)
-            predictions = model(batch_x).view(-1, TARGETS, 3)
-            loss = pinball_loss(predictions, batch_y, quantiles)
-            loss.backward()
-            optimizer.step()
-            total_loss += float(loss.detach().cpu())
-            batches += 1
+        if args.resident_device:
+            permutation = torch.randperm(train_x_t.shape[0], device=device)
+            for start in range(0, train_x_t.shape[0], args.batch_size):
+                batch_indices = permutation[start : start + args.batch_size]
+                batch_x = train_x_t.index_select(0, batch_indices)
+                batch_y = train_y_t.index_select(0, batch_indices)
+                optimizer.zero_grad(set_to_none=True)
+                predictions = model(batch_x).view(-1, TARGETS, 3)
+                loss = pinball_loss(predictions, batch_y, quantiles)
+                loss.backward()
+                optimizer.step()
+                total_loss += float(loss.detach().cpu())
+                batches += 1
+        else:
+            for batch_x, batch_y in train_loader:
+                batch_x = batch_x.to(device, non_blocking=True)
+                batch_y = batch_y.to(device, non_blocking=True)
+                optimizer.zero_grad(set_to_none=True)
+                predictions = model(batch_x).view(-1, TARGETS, 3)
+                loss = pinball_loss(predictions, batch_y, quantiles)
+                loss.backward()
+                optimizer.step()
+                total_loss += float(loss.detach().cpu())
+                batches += 1
 
         metrics = evaluate(model, val_x_t, val_y, target_mean, target_std, quantiles, device)
         metrics["epoch"] = epoch
@@ -125,6 +148,8 @@ def main() -> int:
         "target_mean": target_mean.tolist(),
         "target_std": target_std.tolist(),
         "device": str(device),
+        "cache_dir": str(args.cache_dir) if args.cache_dir else None,
+        "resident_device": args.resident_device,
         "gpu": torch.cuda.get_device_name(0) if device.type == "cuda" else None,
         "history": history,
         **{key: value for key, value in final_metrics.items() if key != "epoch"},
@@ -166,6 +191,32 @@ def pinball_loss(predictions: torch.Tensor, targets: torch.Tensor, quantiles: to
     errors = targets.unsqueeze(-1) - predictions
     losses = torch.maximum(quantiles * errors, (quantiles - 1.0) * errors)
     return losses.mean()
+
+
+def load_or_build_samples(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    if args.cache_dir is None:
+        return load_samples(args)
+
+    args.cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = args.cache_dir / (
+        f"samples_train{args.train_limit}_val{args.val_limit}_"
+        f"ts{args.train_stride}_vs{args.val_stride}_v1.npz"
+    )
+    if cache_path.exists() and not args.rebuild_cache:
+        print(f"loading cached tensors from {cache_path}")
+        cached = np.load(cache_path)
+        return cached["train_x"], cached["train_y"], cached["val_x"], cached["val_y"]
+
+    train_x, train_y, val_x, val_y = load_samples(args)
+    print(f"writing cached tensors to {cache_path}")
+    np.savez(
+        cache_path,
+        train_x=train_x,
+        train_y=train_y,
+        val_x=val_x,
+        val_y=val_y,
+    )
+    return train_x, train_y, val_x, val_y
 
 
 def load_samples(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:

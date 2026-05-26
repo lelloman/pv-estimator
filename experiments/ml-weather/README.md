@@ -87,6 +87,24 @@ python3 experiments/ml-weather/scripts/train_weather_mlp_torch.py \
   --learning-rate 0.001
 ```
 
+For larger GPU runs, cache encoded tensors and keep them resident on the GPU:
+
+```sh
+python3 experiments/ml-weather/scripts/train_weather_mlp_torch.py \
+  --data experiments/ml-weather/runs/global_grid_408/normalized/nasa_power_hourly.csv.gz \
+  --out-dir experiments/ml-weather/runs/global_grid_408/models/weather_mlp_100k_8m \
+  --cache-dir experiments/ml-weather/runs/global_grid_408/cache \
+  --train-limit 8000000 \
+  --val-limit 500000 \
+  --train-stride 2 \
+  --val-stride 2 \
+  --resident-device \
+  --hidden-width 256 \
+  --epochs 20 \
+  --batch-size 32768 \
+  --learning-rate 0.001
+```
+
 Compute the day/hour climatology baseline:
 
 ```sh
