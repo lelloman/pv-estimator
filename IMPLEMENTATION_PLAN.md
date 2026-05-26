@@ -9,6 +9,8 @@
 - Phase 5: Project Schema - complete.
 - Phase 6: Catalog Model - complete.
 - Phase 7: Location And Weather Data Format - complete.
+- Phase 8: Data Import Tooling - paused/reframed by ML research spike.
+- ML Research Spike - planned in `ML_EXPERIMENT_PLAN.md`.
 
 ## 1. Documentation Baseline
 
@@ -162,6 +164,9 @@ Acceptance criteria:
 
 ## 8. Data Import Tooling
 
+Status: paused. This phase is not deleted, but it is reframed by the global ML
+research spike in `ML_EXPERIMENT_PLAN.md`.
+
 Goal: make embedded data reproducible.
 
 Tasks:
@@ -178,6 +183,34 @@ Acceptance criteria:
 - Normalized outputs are deterministic.
 - Import tests use checked-in fixtures, not live network calls.
 - Runtime simulation does not require network access.
+
+## ML Research Spike
+
+Goal: test whether a compact coordinate/time-based model can approximate global
+solar/weather and PV production behavior with uncertainty bands before committing
+to a large embedded weather-data strategy.
+
+Tasks:
+
+- Measure source size, availability, access limits, and licensing for NASA
+  POWER, PVGIS, ERA5/Copernicus, NSRDB, SARAH/EUMETSAT, and optional commercial
+  sources where terms allow.
+- Build small checked-in raw and normalized fixtures for parser tests.
+- Design a global non-polar sampling strategy based on coordinates, not city
+  IDs.
+- Train and compare two baselines: weather quantiles and canonical PV output
+  quantiles.
+- Evaluate against held-out regions, held-out years, and simple climatology or
+  nearest-neighbor baselines.
+
+Acceptance criteria:
+
+- `ML_EXPERIMENT_PLAN.md` is reviewed step by step before experiment code starts.
+- No bulk source data is committed until an explicit data-size policy is
+  approved.
+- Production crates remain independent from training frameworks.
+- The spike ends with a clear recommendation to continue, narrow, or abandon the
+  ML-compression direction.
 
 ## 9. Validation Engine
 
