@@ -72,6 +72,8 @@ Initial data work:
 - normalize into a shared training format
 - measure normalized compressed size
 - record download time and API constraints
+- follow `SOURCE_HARMONIZATION.md` for canonical fields, source mappings,
+  missing-data policy, derivation policy, and source-disagreement handling
 
 Training data should be stored in a compact generated format such as
 Parquet/Zstd or another columnar/compressed format chosen after measurement.
@@ -193,12 +195,14 @@ Go through the research plan in this order:
 1. Confirm the ML goal: global coordinate-based estimates with uncertainty
    bands.
 2. Review source candidates and licensing/API constraints.
-3. Review data volume measurements and storage format choices.
-4. Review sampling strategy.
-5. Review model targets and baseline definitions.
-6. Review evaluation metrics.
-7. Decide what data, if any, may be committed.
-8. Only then implement experiment scaffolding.
+3. Review `SOURCE_HARMONIZATION.md`: canonical fields, source mappings, missing
+   data, derivations, and disagreement policy.
+4. Review data volume measurements and storage format choices.
+5. Review sampling strategy.
+6. Review model targets and baseline definitions.
+7. Review evaluation metrics.
+8. Decide what data, if any, may be committed.
+9. Only then implement experiment scaffolding.
 
 ## Non-Goals For The Spike
 

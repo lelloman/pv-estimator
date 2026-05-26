@@ -195,6 +195,8 @@ Tasks:
 - Measure source size, availability, access limits, and licensing for NASA
   POWER, PVGIS, ERA5/Copernicus, NSRDB, SARAH/EUMETSAT, and optional commercial
   sources where terms allow.
+- Review `SOURCE_HARMONIZATION.md` before implementing source importers or model
+  training datasets.
 - Build small checked-in raw and normalized fixtures for parser tests.
 - Design a global non-polar sampling strategy based on coordinates, not city
   IDs.
@@ -205,7 +207,8 @@ Tasks:
 
 Acceptance criteria:
 
-- `ML_EXPERIMENT_PLAN.md` is reviewed step by step before experiment code starts.
+- `ML_EXPERIMENT_PLAN.md` and `SOURCE_HARMONIZATION.md` are reviewed step by
+  step before experiment code starts.
 - No bulk source data is committed until an explicit data-size policy is
   approved.
 - Production crates remain independent from training frameworks.
