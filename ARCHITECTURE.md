@@ -43,6 +43,7 @@ The first implementation should create explicit boundaries around these axes:
 - report formats and aggregations
 - UI/API adapters
 - data importers
+- experimental surrogate models
 
 These are expected to change earlier than the core identity of a PV system.
 
@@ -90,6 +91,30 @@ V1 implementations:
 - PVGIS TMY importer
 - NASA POWER importer
 - embedded normalized datasets for supported locations
+
+## Experimental Model Boundary
+
+Reason for abstraction: the project may explore trained coordinate/time-based
+surrogate models as a lossy replacement or supplement for large source-backed
+weather datasets.
+
+Rules:
+
+- ML training code must stay outside `pv-core`.
+- Production crates must not depend on training frameworks.
+- A model is an experimental estimator until validation proves it is useful.
+- Model outputs must identify whether they represent weather-field estimates,
+  production estimates, or uncertainty bands.
+- Source-backed datasets remain the evaluation reference during the research
+  spike.
+
+Potential future core-facing contract:
+
+- receives coordinates, elevation when available, and time features
+- returns weather quantiles or canonical PV production quantiles
+- reports model id, training data manifest, and evaluation metadata
+- can be swapped with source-backed weather repositories through a named
+  boundary
 
 ## Equipment Catalog Boundary
 

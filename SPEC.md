@@ -176,6 +176,18 @@ Normalized hourly records should support:
 The simulator must allow selecting the weather source when multiple embedded
 sources are available for a location.
 
+## 8.1 Research Direction: ML Weather And PV Surrogates
+
+The project is pausing production data-import work after the initial
+location/weather format to investigate whether a compact coordinate/time-based
+model can approximate global solar/weather behavior and PV production.
+
+This is a research spike, not a production requirement. The experiment should
+test global non-polar coordinate-based predictions, uncertainty bands, and
+compression potential before the production weather-data strategy is finalized.
+
+The research plan lives in `ML_EXPERIMENT_PLAN.md`.
+
 Known source documentation:
 
 - PVGIS TMY:
