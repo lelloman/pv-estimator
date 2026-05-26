@@ -7,6 +7,7 @@
 - Phase 3: Rust Workspace Skeleton - complete.
 - Phase 4: Core Units And Types - complete.
 - Phase 5: Project Schema - complete.
+- Phase 6: Catalog Model - complete.
 
 ## 1. Documentation Baseline
 
