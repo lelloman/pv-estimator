@@ -79,6 +79,8 @@ Core-facing contract:
 - does not know the original provider wire format
 - can report source id, source name, import metadata, and quality flags
 - can handle missing optional fields through typed optional values
+- follows `SOURCE_HARMONIZATION.md` for canonical fields, source mappings,
+  missing-data policy, derivation policy, and source-disagreement handling
 
 Importer-facing contract:
 
