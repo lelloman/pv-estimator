@@ -116,6 +116,9 @@ Extreme polar latitudes can be excluded from the first experiment.
 
 Train two baseline directions and compare them.
 
+Initial neural-network architectures, feature encoding, output heads, and
+training criteria are specified in `ML_MODEL_PLAN.md`.
+
 ### Weather Quantile Model
 
 Predict weather-like variables from coordinates and time:
@@ -199,10 +202,12 @@ Go through the research plan in this order:
    data, derivations, and disagreement policy.
 4. Review data volume measurements and storage format choices.
 5. Review sampling strategy.
-6. Review model targets and baseline definitions.
-7. Review evaluation metrics.
-8. Decide what data, if any, may be committed.
-9. Only then implement experiment scaffolding.
+6. Review `ML_MODEL_PLAN.md`: encoded inputs, 10k/100k architectures, output
+   heads, losses, and success criteria.
+7. Review model targets and baseline definitions.
+8. Review evaluation metrics.
+9. Decide what data, if any, may be committed.
+10. Only then implement experiment scaffolding.
 
 ## Non-Goals For The Spike
 
