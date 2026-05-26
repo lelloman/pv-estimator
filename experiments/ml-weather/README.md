@@ -81,7 +81,7 @@ python3 experiments/ml-weather/scripts/train_weather_mlp_torch.py \
   --out-dir experiments/ml-weather/runs/global_grid_408/models/weather_mlp_100k_torch \
   --train-limit 1000000 \
   --val-limit 100000 \
-  --hidden-width 256 \
+  --hidden-layers 256,256 \
   --epochs 20 \
   --batch-size 8192 \
   --learning-rate 0.001
@@ -99,10 +99,31 @@ python3 experiments/ml-weather/scripts/train_weather_mlp_torch.py \
   --train-stride 2 \
   --val-stride 2 \
   --resident-device \
-  --hidden-width 256 \
+  --hidden-layers 256,256 \
   --epochs 20 \
   --batch-size 32768 \
   --learning-rate 0.001
+```
+
+Run an architecture sweep on the cached 8M/500k split:
+
+```sh
+for spec in 128,128 256,256 512,512 256,256,128; do
+  name=$(echo "$spec" | tr , x)
+  python3 experiments/ml-weather/scripts/train_weather_mlp_torch.py \
+    --data experiments/ml-weather/runs/global_grid_408/normalized/nasa_power_hourly.csv.gz \
+    --out-dir experiments/ml-weather/runs/global_grid_408/models/sweep_8m_${name} \
+    --cache-dir experiments/ml-weather/runs/global_grid_408/cache \
+    --train-limit 8000000 \
+    --val-limit 500000 \
+    --train-stride 2 \
+    --val-stride 2 \
+    --resident-device \
+    --hidden-layers "$spec" \
+    --epochs 20 \
+    --batch-size 32768 \
+    --learning-rate 0.001
+done
 ```
 
 Compute the day/hour climatology baseline:

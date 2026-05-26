@@ -37,6 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-stride", type=int, default=13)
     parser.add_argument("--val-stride", type=int, default=7)
     parser.add_argument("--hidden-width", type=int, default=256)
+    parser.add_argument("--hidden-layers", default=None, help="comma-separated hidden layer widths, e.g. 256,256,128")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=8192)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
@@ -47,9 +48,19 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def parse_hidden_layers(args: argparse.Namespace) -> list[int]:
+    if args.hidden_layers is None:
+        return [args.hidden_width, args.hidden_width]
+    layers = [int(value.strip()) for value in args.hidden_layers.split(",") if value.strip()]
+    if not layers or any(width <= 0 for width in layers):
+        raise ValueError("--hidden-layers must contain positive integer widths")
+    return layers
+
+
 def main() -> int:
     args = parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    hidden_layers = parse_hidden_layers(args)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
@@ -67,7 +78,7 @@ def main() -> int:
     target_std = np.maximum(target_std, 1.0).astype(np.float32)
     train_y_norm = (train_y - target_mean) / target_std
 
-    model = WeatherMlp(args.hidden_width).to(device)
+    model = WeatherMlp(hidden_layers).to(device)
     parameters = sum(parameter.numel() for parameter in model.parameters())
     print(f"parameters={parameters}")
 
@@ -137,6 +148,7 @@ def main() -> int:
         "model": "weather_mlp_torch",
         "input_features": INPUTS,
         "hidden_width": args.hidden_width,
+        "hidden_layers": hidden_layers,
         "outputs": TARGETS * 3,
         "parameters": parameters,
         "epochs": args.epochs,
@@ -162,7 +174,7 @@ def main() -> int:
             "target_mean": target_mean,
             "target_std": target_std,
             "target_names": TARGET_NAMES,
-            "hidden_width": args.hidden_width,
+            "hidden_layers": hidden_layers,
             "input_features": INPUTS,
         },
         args.out_dir / "model.pt",
@@ -173,15 +185,16 @@ def main() -> int:
 
 
 class WeatherMlp(nn.Module):
-    def __init__(self, hidden_width: int) -> None:
+    def __init__(self, hidden_layers: list[int]) -> None:
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(INPUTS, hidden_width),
-            nn.SiLU(),
-            nn.Linear(hidden_width, hidden_width),
-            nn.SiLU(),
-            nn.Linear(hidden_width, TARGETS * 3),
-        )
+        layers: list[nn.Module] = []
+        previous_width = INPUTS
+        for hidden_width in hidden_layers:
+            layers.append(nn.Linear(previous_width, hidden_width))
+            layers.append(nn.SiLU())
+            previous_width = hidden_width
+        layers.append(nn.Linear(previous_width, TARGETS * 3))
+        self.net = nn.Sequential(*layers)
 
     def forward(self, values: torch.Tensor) -> torch.Tensor:
         return self.net(values)
