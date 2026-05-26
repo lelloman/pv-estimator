@@ -60,6 +60,18 @@ python3 experiments/ml-weather/scripts/normalize_nasa_power.py \
   --out experiments/ml-weather/runs/global_grid_408/normalized/nasa_power_hourly.csv.gz
 ```
 
+Train the first 10k-parameter weather MLP:
+
+```sh
+cargo run --release -p xtask -- train-weather-mlp \
+  --train-limit 1000000 \
+  --val-limit 100000 \
+  --epochs 20 \
+  --batch-size 256 \
+  --learning-rate 0.001 \
+  --out-dir experiments/ml-weather/runs/global_grid_408/models/weather_mlp_10k_run2
+```
+
 The normalized CSV schema is:
 
 ```text
