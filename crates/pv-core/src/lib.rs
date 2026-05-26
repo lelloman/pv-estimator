@@ -5,6 +5,7 @@ pub mod ids;
 pub mod issues;
 pub mod project;
 pub mod units;
+pub mod weather;
 
 pub mod prelude {
     //! Commonly used core types for adapters and downstream crates.
@@ -27,5 +28,9 @@ pub mod prelude {
     };
     pub use crate::units::{
         Angle, Area, Current, Energy, Length, Power, Temperature, TimeSpan, Voltage,
+    };
+    pub use crate::weather::{
+        HourlyWeatherRecord, Location, LocationCatalog, Speed, WeatherDataError, WeatherDataset,
+        WeatherProvider, WeatherQualityFlag, WeatherRepository, WeatherSourceMetadata,
     };
 }
