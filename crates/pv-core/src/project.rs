@@ -1,3 +1,4 @@
+use crate::catalog::CatalogItem;
 use crate::ids::{CatalogItemId, ComponentId, EndpointId, LocationId, ProjectId, WeatherSourceId};
 use crate::issues::{Issue, IssueCode, IssueSeverity};
 use crate::units::{Angle, Length, TimeSpan};
@@ -133,24 +134,9 @@ pub enum OperatingMode {
     OffGrid,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CustomEquipmentDefinition {
-    pub custom_equipment_id: CatalogItemId,
-    pub category: EquipmentCategory,
-    pub manufacturer: Option<String>,
-    pub model: String,
-    pub notes: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EquipmentCategory {
-    Panel,
-    Inverter,
-    Battery,
-    Bms,
-    BlockingDiode,
-    Cable,
+    pub item: CatalogItem,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -337,6 +323,8 @@ fn missing_required_field_issue(field: &str) -> Issue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::{CatalogItemMetadata, Equipment, ModuleDimensions, PanelSpec};
+    use crate::units::{Area, Current, Power, Voltage};
 
     #[test]
     fn minimal_project_round_trips_through_json() {
@@ -351,11 +339,7 @@ mod tests {
     fn representative_hybrid_project_round_trips_through_json() {
         let mut project = minimal_project();
         project.custom_equipment.push(CustomEquipmentDefinition {
-            custom_equipment_id: CatalogItemId::new("custom.panel.1").expect("valid id"),
-            category: EquipmentCategory::Panel,
-            manufacturer: Some("Example Solar".to_string()),
-            model: "Example 450 W".to_string(),
-            notes: Some("phase 5 inline equipment fixture".to_string()),
+            item: custom_panel_item("custom.panel.1"),
         });
         project.components = vec![
             ComponentInstance {
@@ -441,6 +425,39 @@ mod tests {
             issue.code().as_str() == "project_schema.missing_required_field"
                 && issue.parameters().get("field") == Some(&"metadata.project_id".to_string())
         }));
+    }
+
+    fn custom_panel_item(id: &str) -> CatalogItem {
+        CatalogItem {
+            catalog_item_id: CatalogItemId::new(id).expect("valid id"),
+            metadata: CatalogItemMetadata {
+                manufacturer: "Example Solar".to_string(),
+                model: "Example 450 W".to_string(),
+                source: None,
+                notes: Some("phase 6 inline equipment fixture".to_string()),
+            },
+            equipment: Equipment::Panel(PanelSpec {
+                dimensions: ModuleDimensions {
+                    width: Length::from_meters(1.13),
+                    height: Length::from_meters(1.76),
+                    thickness: None,
+                },
+                nominal_power: Power::from_watts(450.0),
+                area: Area::from_square_meters(1.9888),
+                module_efficiency: None,
+                vmp: Voltage::from_volts(41.0),
+                imp: Current::from_amperes(10.98),
+                voc: Voltage::from_volts(49.0),
+                isc: Current::from_amperes(11.5),
+                temperature_coefficient_power_per_celsius: None,
+                temperature_coefficient_voc_per_celsius: None,
+                temperature_coefficient_isc_per_celsius: None,
+                noct: None,
+                nmot: None,
+                maximum_system_voltage: None,
+                maximum_series_fuse_rating: None,
+            }),
+        }
     }
 
     fn minimal_project() -> PvSystemProject {
