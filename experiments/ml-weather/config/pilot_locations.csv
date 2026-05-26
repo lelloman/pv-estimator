@@ -1,0 +1,23 @@
+location_id,name,latitude,longitude,region
+rome_it,Rome Italy,41.9028,12.4964,europe_south
+milan_it,Milan Italy,45.4642,9.1900,europe_south
+palermo_it,Palermo Italy,38.1157,13.3615,europe_south
+berlin_de,Berlin Germany,52.5200,13.4050,europe_central
+london_uk,London United Kingdom,51.5072,-0.1276,europe_oceanic
+madrid_es,Madrid Spain,40.4168,-3.7038,europe_south
+cairo_eg,Cairo Egypt,30.0444,31.2357,africa_north
+nairobi_ke,Nairobi Kenya,-1.2921,36.8219,africa_equatorial
+cape_town_za,Cape Town South Africa,-33.9249,18.4241,africa_south
+new_york_us,New York United States,40.7128,-74.0060,north_america_east
+phoenix_us,Phoenix United States,33.4484,-112.0740,north_america_desert
+mexico_city_mx,Mexico City Mexico,19.4326,-99.1332,north_america_highland
+sao_paulo_br,Sao Paulo Brazil,-23.5558,-46.6396,south_america_subtropical
+santiago_cl,Santiago Chile,-33.4489,-70.6693,south_america_mediterranean
+buenos_aires_ar,Buenos Aires Argentina,-34.6037,-58.3816,south_america_temperate
+dubai_ae,Dubai United Arab Emirates,25.2048,55.2708,middle_east_desert
+mumbai_in,Mumbai India,19.0760,72.8777,south_asia_monsoon
+singapore_sg,Singapore Singapore,1.3521,103.8198,southeast_asia_equatorial
+tokyo_jp,Tokyo Japan,35.6762,139.6503,east_asia_temperate
+sydney_au,Sydney Australia,-33.8688,151.2093,oceania_temperate
+perth_au,Perth Australia,-31.9523,115.8613,oceania_mediterranean
+reykjavik_is,Reykjavik Iceland,64.1466,-21.9426,north_atlantic_high_latitude

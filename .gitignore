@@ -1,2 +1,6 @@
 /target/
+experiments/ml-weather/runs/*
+!experiments/ml-weather/runs/.gitignore
 **/*.rs.bk
+__pycache__/
+*.py[cod]
