@@ -60,10 +60,11 @@ python3 experiments/ml-weather/scripts/normalize_nasa_power.py \
   --out experiments/ml-weather/runs/global_grid_408/normalized/nasa_power_hourly.csv.gz
 ```
 
-Train the first 10k-parameter weather MLP:
+Train the first 10k-parameter weather MLP with the Rust CPU trainer:
 
 ```sh
 cargo run --release -p xtask -- train-weather-mlp \
+  --hidden-width 64 \
   --train-limit 1000000 \
   --val-limit 100000 \
   --epochs 20 \
@@ -71,6 +72,31 @@ cargo run --release -p xtask -- train-weather-mlp \
   --learning-rate 0.001 \
   --out-dir experiments/ml-weather/runs/global_grid_408/models/weather_mlp_10k_run2
 ```
+
+Train the 100k-parameter weather MLP with PyTorch/CUDA on a GPU machine:
+
+```sh
+python3 experiments/ml-weather/scripts/train_weather_mlp_torch.py \
+  --data experiments/ml-weather/runs/global_grid_408/normalized/nasa_power_hourly.csv.gz \
+  --out-dir experiments/ml-weather/runs/global_grid_408/models/weather_mlp_100k_torch \
+  --train-limit 1000000 \
+  --val-limit 100000 \
+  --hidden-width 256 \
+  --epochs 20 \
+  --batch-size 8192 \
+  --learning-rate 0.001
+```
+
+Compute the day/hour climatology baseline:
+
+```sh
+cargo run --release -p xtask -- weather-climatology-baseline \
+  --train-limit 1000000 \
+  --val-limit 100000 \
+  --out-dir experiments/ml-weather/runs/global_grid_408/models/weather_climatology_day_hour
+```
+
+## Normalized Schema
 
 The normalized CSV schema is:
 
