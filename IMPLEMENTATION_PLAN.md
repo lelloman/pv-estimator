@@ -10,7 +10,8 @@
 - Phase 6: Catalog Model - complete.
 - Phase 7: Location And Weather Data Format - complete.
 - Phase 8: Data Import Tooling - paused/reframed by ML research spike.
-- ML Research Spike - planned in `ML_EXPERIMENT_PLAN.md`.
+- ML Research Spike - planned in `ML_EXPERIMENT_PLAN.md`,
+  `SOURCE_HARMONIZATION.md`, and `ML_MODEL_PLAN.md`.
 
 ## 1. Documentation Baseline
 
@@ -197,6 +198,7 @@ Tasks:
   sources where terms allow.
 - Review `SOURCE_HARMONIZATION.md` before implementing source importers or model
   training datasets.
+- Review `ML_MODEL_PLAN.md` before implementing model training code.
 - Build small checked-in raw and normalized fixtures for parser tests.
 - Design a global non-polar sampling strategy based on coordinates, not city
   IDs.
@@ -207,8 +209,8 @@ Tasks:
 
 Acceptance criteria:
 
-- `ML_EXPERIMENT_PLAN.md` and `SOURCE_HARMONIZATION.md` are reviewed step by
-  step before experiment code starts.
+- `ML_EXPERIMENT_PLAN.md`, `SOURCE_HARMONIZATION.md`, and `ML_MODEL_PLAN.md`
+  are reviewed step by step before experiment code starts.
 - No bulk source data is committed until an explicit data-size policy is
   approved.
 - Production crates remain independent from training frameworks.
