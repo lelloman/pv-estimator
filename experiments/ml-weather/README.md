@@ -18,6 +18,7 @@ The checked-in location lists are:
 
 - `config/pilot_locations.csv`: a small human-readable smoke set
 - `config/global_grid_408_locations.csv`: a deterministic non-polar global grid
+- `config/global_grid_368_interpolation_locations.csv`: cell-center points between grid locations
 
 Generated raw and normalized data goes under `runs/`, which is ignored by git.
 Run summaries that are small enough for review go under `results/`.
@@ -103,6 +104,21 @@ python3 experiments/ml-weather/scripts/train_weather_mlp_torch.py \
   --epochs 20 \
   --batch-size 32768 \
   --learning-rate 0.001
+```
+
+Generate cell-center interpolation locations:
+
+```sh
+python3 experiments/ml-weather/scripts/generate_interpolation_locations.py
+```
+
+Evaluate a trained PyTorch model on a normalized interpolation dataset:
+
+```sh
+python3 experiments/ml-weather/scripts/evaluate_weather_mlp_torch.py \
+  --data experiments/ml-weather/runs/interpolation_grid_368/normalized/nasa_power_hourly.csv.gz \
+  --model experiments/ml-weather/runs/global_grid_408/models/sweep_8m_256x256x128/model.pt \
+  --out experiments/ml-weather/runs/interpolation_grid_368/eval/metrics.json
 ```
 
 Run an architecture sweep on the cached 8M/500k split:
