@@ -7,10 +7,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 const INPUTS: usize = 64;
-const HIDDEN: usize = 64;
 const TARGETS: usize = 5;
 const QUANTILES: [f32; 3] = [0.1, 0.5, 0.9];
 const OUTPUTS: usize = TARGETS * 3;
+const CLIMATOLOGY_BUCKETS: usize = 366 * 24;
+const NORMAL_10_90_Z: f32 = 1.281_551_6;
 const TARGET_NAMES: [&str; TARGETS] = [
     "ghi_w_m2",
     "dni_w_m2",
@@ -18,6 +19,8 @@ const TARGET_NAMES: [&str; TARGETS] = [
     "ambient_temperature_c",
     "wind_speed_m_s",
 ];
+const DEFAULT_DATA: &str =
+    "experiments/ml-weather/runs/global_grid_408/normalized/nasa_power_hourly.csv.gz";
 
 fn main() {
     if let Err(error) = run() {
@@ -29,7 +32,10 @@ fn main() {
 fn run() -> Result<(), Box<dyn Error>> {
     let mut args = env::args().skip(1);
     match args.next().as_deref() {
-        Some("train-weather-mlp") => train_weather_mlp(TrainConfig::from_args(args.collect())?),
+        Some("train-weather-mlp") => train_weather_mlp(RunConfig::from_args(args.collect())?),
+        Some("weather-climatology-baseline") => {
+            weather_climatology_baseline(RunConfig::from_args(args.collect())?)
+        }
         Some("help") | None => {
             print_help();
             Ok(())
@@ -41,10 +47,11 @@ fn run() -> Result<(), Box<dyn Error>> {
 fn print_help() {
     println!("xtask commands:");
     println!("  train-weather-mlp --data <csv.gz> --out-dir <dir> [options]");
+    println!("  weather-climatology-baseline --data <csv.gz> --out-dir <dir> [options]");
 }
 
 #[derive(Debug)]
-struct TrainConfig {
+struct RunConfig {
     data: PathBuf,
     out_dir: PathBuf,
     train_limit: usize,
@@ -55,16 +62,15 @@ struct TrainConfig {
     batch_size: usize,
     learning_rate: f32,
     seed: u64,
+    hidden_width: usize,
 }
 
-impl TrainConfig {
+impl RunConfig {
     fn from_args(args: Vec<String>) -> Result<Self, Box<dyn Error>> {
         let mut config = Self {
-            data: PathBuf::from(
-                "experiments/ml-weather/runs/global_grid_408/normalized/nasa_power_hourly.csv.gz",
-            ),
+            data: PathBuf::from(DEFAULT_DATA),
             out_dir: PathBuf::from(
-                "experiments/ml-weather/runs/global_grid_408/models/weather_mlp_10k",
+                "experiments/ml-weather/runs/global_grid_408/models/weather_mlp",
             ),
             train_limit: 1_000_000,
             val_limit: 100_000,
@@ -74,6 +80,7 @@ impl TrainConfig {
             batch_size: 256,
             learning_rate: 0.001,
             seed: 42,
+            hidden_width: 64,
         };
 
         let mut index = 0;
@@ -93,7 +100,8 @@ impl TrainConfig {
                 "--batch-size" => config.batch_size = value.parse()?,
                 "--learning-rate" => config.learning_rate = value.parse()?,
                 "--seed" => config.seed = value.parse()?,
-                _ => return Err(format!("unknown train-weather-mlp option: {key}").into()),
+                "--hidden-width" => config.hidden_width = value.parse()?,
+                _ => return Err(format!("unknown xtask option: {key}").into()),
             }
             index += 2;
         }
@@ -104,6 +112,12 @@ impl TrainConfig {
         if config.train_limit == 0 || config.val_limit == 0 {
             return Err("train and validation limits must be positive".into());
         }
+        if config.train_stride == 0 || config.val_stride == 0 {
+            return Err("train and validation strides must be positive".into());
+        }
+        if config.hidden_width == 0 {
+            return Err("--hidden-width must be positive".into());
+        }
         Ok(config)
     }
 }
@@ -112,12 +126,34 @@ impl TrainConfig {
 struct Dataset {
     xs: Vec<[f32; INPUTS]>,
     ys: Vec<[f32; TARGETS]>,
+    buckets: Vec<usize>,
 }
 
 impl Dataset {
-    fn len(&self) -> usize {
-        self.xs.len()
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            xs: Vec::with_capacity(capacity),
+            ys: Vec::with_capacity(capacity),
+            buckets: Vec::with_capacity(capacity),
+        }
     }
+
+    fn push(&mut self, sample: Sample) {
+        self.xs.push(sample.x);
+        self.ys.push(sample.y);
+        self.buckets.push(sample.bucket);
+    }
+
+    fn len(&self) -> usize {
+        self.ys.len()
+    }
+}
+
+struct Sample<'a> {
+    location_id: &'a str,
+    x: [f32; INPUTS],
+    y: [f32; TARGETS],
+    bucket: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -126,7 +162,7 @@ struct TargetStats {
     std: [f32; TARGETS],
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 struct RunningStats {
     count: usize,
     sum: [f64; TARGETS],
@@ -157,7 +193,7 @@ impl RunningStats {
     }
 }
 
-fn train_weather_mlp(config: TrainConfig) -> Result<(), Box<dyn Error>> {
+fn train_weather_mlp(config: RunConfig) -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(&config.out_dir)?;
     println!("loading samples from {}", config.data.display());
     let (mut train, val, stats) = load_datasets(&config)?;
@@ -166,7 +202,7 @@ fn train_weather_mlp(config: TrainConfig) -> Result<(), Box<dyn Error>> {
     println!("target_std={:?}", stats.std);
 
     normalize_targets(&mut train, &stats);
-    let mut model = Mlp::new(config.seed);
+    let mut model = Mlp::new(config.hidden_width, config.seed);
     println!("parameters={}", model.parameter_count());
 
     for epoch in 0..config.epochs {
@@ -183,7 +219,7 @@ fn train_weather_mlp(config: TrainConfig) -> Result<(), Box<dyn Error>> {
             batches += 1;
         }
         let average_loss = epoch_loss / batches.max(1) as f64;
-        let metrics = evaluate(&model, &val, &stats);
+        let metrics = evaluate_mlp(&model, &val, &stats);
         println!(
             "epoch={} train_pinball={average_loss:.6} val_pinball={:.6} val_mae={:?}",
             epoch + 1,
@@ -192,12 +228,14 @@ fn train_weather_mlp(config: TrainConfig) -> Result<(), Box<dyn Error>> {
         );
     }
 
-    let metrics = evaluate(&model, &val, &stats);
+    let metrics = evaluate_mlp(&model, &val, &stats);
     write_metrics(
         &config,
         &stats,
         &metrics,
         &config.out_dir.join("metrics.json"),
+        "weather_mlp",
+        Some(model.parameter_count()),
     )?;
     write_model(&model, &stats, &config.out_dir.join("model.json"))?;
     println!("wrote {}", config.out_dir.join("metrics.json").display());
@@ -205,7 +243,45 @@ fn train_weather_mlp(config: TrainConfig) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn load_datasets(config: &TrainConfig) -> Result<(Dataset, Dataset, TargetStats), Box<dyn Error>> {
+fn weather_climatology_baseline(config: RunConfig) -> Result<(), Box<dyn Error>> {
+    fs::create_dir_all(&config.out_dir)?;
+    println!("loading samples from {}", config.data.display());
+    let (train, val, global_stats) = load_datasets(&config)?;
+    println!("train_rows={} val_rows={}", train.len(), val.len());
+
+    let mut buckets = vec![RunningStats::default(); CLIMATOLOGY_BUCKETS];
+    for (bucket, y) in train.buckets.iter().zip(&train.ys) {
+        buckets[*bucket].add(y);
+    }
+    let bucket_stats = buckets
+        .iter()
+        .map(|bucket| {
+            if bucket.count == 0 {
+                global_stats
+            } else {
+                bucket.finish()
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let metrics = evaluate_climatology(&val, &bucket_stats);
+    write_metrics(
+        &config,
+        &global_stats,
+        &metrics,
+        &config.out_dir.join("metrics.json"),
+        "weather_climatology_day_hour",
+        None,
+    )?;
+    println!(
+        "baseline_pinball={:.6} baseline_mae={:?}",
+        metrics.pinball_loss, metrics.mae
+    );
+    println!("wrote {}", config.out_dir.join("metrics.json").display());
+    Ok(())
+}
+
+fn load_datasets(config: &RunConfig) -> Result<(Dataset, Dataset, TargetStats), Box<dyn Error>> {
     let mut child = Command::new("gzip")
         .arg("-cd")
         .arg(&config.data)
@@ -216,18 +292,12 @@ fn load_datasets(config: &TrainConfig) -> Result<(Dataset, Dataset, TargetStats)
     let mut line = String::new();
     reader.read_line(&mut line)?;
 
-    let mut train = Dataset {
-        xs: Vec::with_capacity(config.train_limit),
-        ys: Vec::with_capacity(config.train_limit),
-    };
-    let mut val = Dataset {
-        xs: Vec::with_capacity(config.val_limit),
-        ys: Vec::with_capacity(config.val_limit),
-    };
+    let mut train = Dataset::with_capacity(config.train_limit);
+    let mut val = Dataset::with_capacity(config.val_limit);
     let mut stats = RunningStats::default();
     let mut row_index = 0usize;
-
     let mut stopped_early = false;
+
     loop {
         line.clear();
         if reader.read_line(&mut line)? == 0 {
@@ -239,22 +309,20 @@ fn load_datasets(config: &TrainConfig) -> Result<(Dataset, Dataset, TargetStats)
             break;
         }
 
-        let Some(record) = parse_record(line.trim_end()) else {
+        let Some(sample) = parse_sample(line.trim_end()) else {
             continue;
         };
-        let location_number = parse_grid_number(record.location_id).unwrap_or(0);
+        let location_number = parse_grid_number(sample.location_id).unwrap_or(0);
         let is_validation_location = location_number != 0 && location_number.is_multiple_of(17);
 
         if is_validation_location {
             if val.len() < config.val_limit && row_index.is_multiple_of(config.val_stride) {
-                val.xs.push(record.x);
-                val.ys.push(record.y);
+                val.push(sample);
             }
         } else if train.len() < config.train_limit && row_index.is_multiple_of(config.train_stride)
         {
-            train.xs.push(record.x);
-            train.ys.push(record.y);
-            stats.add(&record.y);
+            stats.add(&sample.y);
+            train.push(sample);
         }
     }
 
@@ -273,13 +341,7 @@ fn load_datasets(config: &TrainConfig) -> Result<(Dataset, Dataset, TargetStats)
     Ok((train, val, stats.finish()))
 }
 
-struct Record<'a> {
-    location_id: &'a str,
-    x: [f32; INPUTS],
-    y: [f32; TARGETS],
-}
-
-fn parse_record(line: &str) -> Option<Record<'_>> {
+fn parse_sample(line: &str) -> Option<Sample<'_>> {
     let mut fields = line.split(',');
     let _source_id = fields.next()?;
     let _source_record_type = fields.next()?;
@@ -298,10 +360,11 @@ fn parse_record(line: &str) -> Option<Record<'_>> {
     let _wind_height = fields.next()?;
     let _flags = fields.next().unwrap_or_default();
     let (day_of_year, hour) = parse_timestamp(timestamp)?;
-    Some(Record {
+    Some(Sample {
         location_id,
         x: encode_features(latitude, longitude, elevation, day_of_year, hour),
         y,
+        bucket: ((day_of_year as usize - 1) * 24 + hour as usize).min(CLIMATOLOGY_BUCKETS - 1),
     })
 }
 
@@ -406,26 +469,26 @@ fn normalize_targets(dataset: &mut Dataset, stats: &TargetStats) {
 }
 
 struct Mlp {
+    hidden_width: usize,
     w1: Vec<f32>,
     b1: Vec<f32>,
     w2: Vec<f32>,
     b2: Vec<f32>,
     w3: Vec<f32>,
     b3: Vec<f32>,
-    step: usize,
 }
 
 impl Mlp {
-    fn new(seed: u64) -> Self {
+    fn new(hidden_width: usize, seed: u64) -> Self {
         let mut rng = Rng::new(seed);
         Self {
-            w1: init_weights(&mut rng, INPUTS, HIDDEN),
-            b1: vec![0.0; HIDDEN],
-            w2: init_weights(&mut rng, HIDDEN, HIDDEN),
-            b2: vec![0.0; HIDDEN],
-            w3: init_weights(&mut rng, HIDDEN, OUTPUTS),
+            hidden_width,
+            w1: init_weights(&mut rng, INPUTS, hidden_width),
+            b1: vec![0.0; hidden_width],
+            w2: init_weights(&mut rng, hidden_width, hidden_width),
+            b2: vec![0.0; hidden_width],
+            w3: init_weights(&mut rng, hidden_width, OUTPUTS),
             b3: vec![0.0; OUTPUTS],
-            step: 0,
         }
     }
 
@@ -439,20 +502,22 @@ impl Mlp {
     }
 
     fn predict(&self, x: &[f32; INPUTS]) -> [f32; OUTPUTS] {
-        let mut z1 = [0.0; HIDDEN];
-        let mut a1 = [0.0; HIDDEN];
-        let mut z2 = [0.0; HIDDEN];
-        let mut a2 = [0.0; HIDDEN];
+        let h = self.hidden_width;
+        let mut z1 = vec![0.0; h];
+        let mut a1 = vec![0.0; h];
+        let mut z2 = vec![0.0; h];
+        let mut a2 = vec![0.0; h];
         let mut out = [0.0; OUTPUTS];
-        dense::<INPUTS, HIDDEN>(x, &self.w1, &self.b1, &mut z1);
-        for index in 0..HIDDEN {
+
+        dense_dynamic(x, INPUTS, h, &self.w1, &self.b1, &mut z1);
+        for index in 0..h {
             a1[index] = silu(z1[index]);
         }
-        dense::<HIDDEN, HIDDEN>(&a1, &self.w2, &self.b2, &mut z2);
-        for index in 0..HIDDEN {
+        dense_dynamic(&a1, h, h, &self.w2, &self.b2, &mut z2);
+        for index in 0..h {
             a2[index] = silu(z2[index]);
         }
-        dense::<HIDDEN, OUTPUTS>(&a2, &self.w3, &self.b3, &mut out);
+        dense_dynamic(&a2, h, OUTPUTS, &self.w3, &self.b3, &mut out);
         out
     }
 
@@ -463,26 +528,41 @@ impl Mlp {
         ys: &[[f32; TARGETS]],
         learning_rate: f32,
     ) -> f32 {
-        let mut gradients = Gradients::new();
+        let h = self.hidden_width;
+        let mut gradients = Gradients::new(h);
         let mut loss = 0.0f32;
 
+        let mut z1 = vec![0.0; h];
+        let mut a1 = vec![0.0; h];
+        let mut z2 = vec![0.0; h];
+        let mut a2 = vec![0.0; h];
+        let mut d_a2 = vec![0.0; h];
+        let mut d_z2 = vec![0.0; h];
+        let mut d_a1 = vec![0.0; h];
+        let mut d_z1 = vec![0.0; h];
+
         for (x, y) in xs.iter().zip(ys) {
-            let mut z1 = [0.0; HIDDEN];
-            let mut a1 = [0.0; HIDDEN];
-            let mut z2 = [0.0; HIDDEN];
-            let mut a2 = [0.0; HIDDEN];
+            z1.fill(0.0);
+            a1.fill(0.0);
+            z2.fill(0.0);
+            a2.fill(0.0);
+            d_a2.fill(0.0);
+            d_z2.fill(0.0);
+            d_a1.fill(0.0);
+            d_z1.fill(0.0);
             let mut out = [0.0; OUTPUTS];
-            dense::<INPUTS, HIDDEN>(x, &self.w1, &self.b1, &mut z1);
-            for index in 0..HIDDEN {
+            let mut d_out = [0.0; OUTPUTS];
+
+            dense_dynamic(x, INPUTS, h, &self.w1, &self.b1, &mut z1);
+            for index in 0..h {
                 a1[index] = silu(z1[index]);
             }
-            dense::<HIDDEN, HIDDEN>(&a1, &self.w2, &self.b2, &mut z2);
-            for index in 0..HIDDEN {
+            dense_dynamic(&a1, h, h, &self.w2, &self.b2, &mut z2);
+            for index in 0..h {
                 a2[index] = silu(z2[index]);
             }
-            dense::<HIDDEN, OUTPUTS>(&a2, &self.w3, &self.b3, &mut out);
+            dense_dynamic(&a2, h, OUTPUTS, &self.w3, &self.b3, &mut out);
 
-            let mut d_out = [0.0; OUTPUTS];
             for target in 0..TARGETS {
                 for (quantile_index, quantile) in QUANTILES.iter().enumerate() {
                     let output_index = target * 3 + quantile_index;
@@ -500,8 +580,7 @@ impl Mlp {
                 }
             }
 
-            let mut d_a2 = [0.0; HIDDEN];
-            for hidden in 0..HIDDEN {
+            for hidden in 0..h {
                 for output in 0..OUTPUTS {
                     gradients.w3[hidden * OUTPUTS + output] += a2[hidden] * d_out[output];
                     d_a2[hidden] += self.w3[hidden * OUTPUTS + output] * d_out[output];
@@ -511,39 +590,35 @@ impl Mlp {
                 gradients.b3[output] += d_out[output];
             }
 
-            let mut d_z2 = [0.0; HIDDEN];
-            for hidden in 0..HIDDEN {
+            for hidden in 0..h {
                 d_z2[hidden] = d_a2[hidden] * silu_derivative(z2[hidden]);
             }
 
-            let mut d_a1 = [0.0; HIDDEN];
-            for previous in 0..HIDDEN {
-                for hidden in 0..HIDDEN {
-                    gradients.w2[previous * HIDDEN + hidden] += a1[previous] * d_z2[hidden];
-                    d_a1[previous] += self.w2[previous * HIDDEN + hidden] * d_z2[hidden];
+            for previous in 0..h {
+                for hidden in 0..h {
+                    gradients.w2[previous * h + hidden] += a1[previous] * d_z2[hidden];
+                    d_a1[previous] += self.w2[previous * h + hidden] * d_z2[hidden];
                 }
             }
-            for hidden in 0..HIDDEN {
+            for hidden in 0..h {
                 gradients.b2[hidden] += d_z2[hidden];
             }
 
-            let mut d_z1 = [0.0; HIDDEN];
-            for hidden in 0..HIDDEN {
+            for hidden in 0..h {
                 d_z1[hidden] = d_a1[hidden] * silu_derivative(z1[hidden]);
             }
 
             for input in 0..INPUTS {
-                for hidden in 0..HIDDEN {
-                    gradients.w1[input * HIDDEN + hidden] += x[input] * d_z1[hidden];
+                for hidden in 0..h {
+                    gradients.w1[input * h + hidden] += x[input] * d_z1[hidden];
                 }
             }
-            for hidden in 0..HIDDEN {
+            for hidden in 0..h {
                 gradients.b1[hidden] += d_z1[hidden];
             }
         }
 
         let batch_scale = 1.0 / xs.len().max(1) as f32;
-        self.step += 1;
         let rate = learning_rate * batch_scale;
         clip_and_apply(&mut self.w1, &gradients.w1, rate);
         clip_and_apply(&mut self.b1, &gradients.b1, rate);
@@ -565,28 +640,32 @@ struct Gradients {
 }
 
 impl Gradients {
-    fn new() -> Self {
+    fn new(hidden_width: usize) -> Self {
         Self {
-            w1: vec![0.0; INPUTS * HIDDEN],
-            b1: vec![0.0; HIDDEN],
-            w2: vec![0.0; HIDDEN * HIDDEN],
-            b2: vec![0.0; HIDDEN],
-            w3: vec![0.0; HIDDEN * OUTPUTS],
+            w1: vec![0.0; INPUTS * hidden_width],
+            b1: vec![0.0; hidden_width],
+            w2: vec![0.0; hidden_width * hidden_width],
+            b2: vec![0.0; hidden_width],
+            w3: vec![0.0; hidden_width * OUTPUTS],
             b3: vec![0.0; OUTPUTS],
         }
     }
 }
 
-fn dense<const IN: usize, const OUT: usize>(
-    input: &[f32; IN],
+fn dense_dynamic<T: AsRef<[f32]>, U: AsMut<[f32]>>(
+    input: T,
+    inputs: usize,
+    outputs: usize,
     weights: &[f32],
     bias: &[f32],
-    output: &mut [f32; OUT],
+    mut output: U,
 ) {
-    for out_index in 0..OUT {
+    let input = input.as_ref();
+    let output = output.as_mut();
+    for out_index in 0..outputs {
         let mut value = bias[out_index];
-        for in_index in 0..IN {
-            value += input[in_index] * weights[in_index * OUT + out_index];
+        for in_index in 0..inputs {
+            value += input[in_index] * weights[in_index * outputs + out_index];
         }
         output[out_index] = value;
     }
@@ -623,7 +702,32 @@ struct Metrics {
     crossing_rate: f64,
 }
 
-fn evaluate(model: &Mlp, val: &Dataset, stats: &TargetStats) -> Metrics {
+fn evaluate_mlp(model: &Mlp, val: &Dataset, stats: &TargetStats) -> Metrics {
+    evaluate_predictions(val, |sample_index, target| {
+        let out = model.predict(&val.xs[sample_index]);
+        [
+            denormalize(out[target * 3], target, stats),
+            denormalize(out[target * 3 + 1], target, stats),
+            denormalize(out[target * 3 + 2], target, stats),
+        ]
+    })
+}
+
+fn evaluate_climatology(val: &Dataset, bucket_stats: &[TargetStats]) -> Metrics {
+    evaluate_predictions(val, |sample_index, target| {
+        let stats = bucket_stats[val.buckets[sample_index]];
+        [
+            stats.mean[target] - NORMAL_10_90_Z * stats.std[target],
+            stats.mean[target],
+            stats.mean[target] + NORMAL_10_90_Z * stats.std[target],
+        ]
+    })
+}
+
+fn evaluate_predictions<F>(val: &Dataset, mut predict: F) -> Metrics
+where
+    F: FnMut(usize, usize) -> [f32; 3],
+{
     let mut pinball_loss = 0.0f64;
     let mut abs_error = [0.0f64; TARGETS];
     let mut squared_error = [0.0f64; TARGETS];
@@ -631,13 +735,11 @@ fn evaluate(model: &Mlp, val: &Dataset, stats: &TargetStats) -> Metrics {
     let mut crossings = 0usize;
     let mut quantile_sets = 0usize;
 
-    for (x, y) in val.xs.iter().zip(&val.ys) {
-        let out = model.predict(x);
+    for sample_index in 0..val.len() {
+        let y = &val.ys[sample_index];
         for target in 0..TARGETS {
             let actual = y[target];
-            let mut q10 = denormalize(out[target * 3], target, stats);
-            let q50 = denormalize(out[target * 3 + 1], target, stats);
-            let mut q90 = denormalize(out[target * 3 + 2], target, stats);
+            let [mut q10, q50, mut q90] = predict(sample_index, target);
             if q10 > q50 || q50 > q90 {
                 crossings += 1;
                 let mut sorted = [q10, q50, q90];
@@ -652,8 +754,7 @@ fn evaluate(model: &Mlp, val: &Dataset, stats: &TargetStats) -> Metrics {
                 covered[target] += 1;
             }
 
-            for (quantile_index, quantile) in QUANTILES.iter().enumerate() {
-                let prediction = denormalize(out[target * 3 + quantile_index], target, stats);
+            for (prediction, quantile) in [q10, q50, q90].iter().zip(QUANTILES) {
                 let q_error = actual - prediction;
                 let loss = if q_error >= 0.0 {
                     quantile * q_error
@@ -695,6 +796,7 @@ fn shuffle_dataset(dataset: &mut Dataset, seed: u64) {
         let swap_with = (rng.next_u64() as usize) % (index + 1);
         dataset.xs.swap(index, swap_with);
         dataset.ys.swap(index, swap_with);
+        dataset.buckets.swap(index, swap_with);
     }
 }
 
@@ -723,22 +825,22 @@ impl Rng {
 }
 
 fn write_metrics(
-    config: &TrainConfig,
+    config: &RunConfig,
     stats: &TargetStats,
     metrics: &Metrics,
     path: &Path,
+    model_name: &str,
+    parameters: Option<usize>,
 ) -> Result<(), Box<dyn Error>> {
     let mut writer = BufWriter::new(File::create(path)?);
     writeln!(writer, "{{")?;
-    writeln!(writer, "  \"model\": \"weather_mlp_10k\",")?;
+    writeln!(writer, "  \"model\": \"{model_name}\",")?;
     writeln!(writer, "  \"input_features\": {INPUTS},")?;
-    writeln!(writer, "  \"hidden_width\": {HIDDEN},")?;
+    writeln!(writer, "  \"hidden_width\": {},", config.hidden_width)?;
     writeln!(writer, "  \"outputs\": {OUTPUTS},")?;
-    writeln!(
-        writer,
-        "  \"parameters\": {},",
-        Mlp::new(config.seed).parameter_count()
-    )?;
+    if let Some(parameters) = parameters {
+        writeln!(writer, "  \"parameters\": {parameters},")?;
+    }
     writeln!(writer, "  \"epochs\": {},", config.epochs)?;
     writeln!(writer, "  \"batch_size\": {},", config.batch_size)?;
     writeln!(writer, "  \"learning_rate\": {},", config.learning_rate)?;
@@ -771,10 +873,10 @@ fn write_metrics(
 fn write_model(model: &Mlp, stats: &TargetStats, path: &Path) -> Result<(), Box<dyn Error>> {
     let mut writer = BufWriter::new(File::create(path)?);
     writeln!(writer, "{{")?;
-    writeln!(writer, "  \"model\": \"weather_mlp_10k\",")?;
+    writeln!(writer, "  \"model\": \"weather_mlp\",")?;
     writeln!(writer, "  \"activation\": \"silu\",")?;
     writeln!(writer, "  \"input_features\": {INPUTS},")?;
-    writeln!(writer, "  \"hidden_width\": {HIDDEN},")?;
+    writeln!(writer, "  \"hidden_width\": {},", model.hidden_width)?;
     writeln!(writer, "  \"outputs\": {OUTPUTS},")?;
     writeln!(
         writer,
