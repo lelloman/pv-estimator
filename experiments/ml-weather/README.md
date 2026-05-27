@@ -19,6 +19,8 @@ The checked-in location lists are:
 - `config/pilot_locations.csv`: a small human-readable smoke set
 - `config/global_grid_408_locations.csv`: a deterministic non-polar global grid
 - `config/global_grid_368_interpolation_locations.csv`: cell-center points between grid locations
+- `config/global_grid_7056_locations.csv`: a denser 2.5-degree non-polar global grid
+- `config/global_grid_7056_locations_shuffled.csv`: deterministic shuffled order for resumable large downloads
 
 Generated raw and normalized data goes under `runs/`, which is ignored by git.
 Run summaries that are small enough for review go under `results/`.
@@ -43,6 +45,66 @@ python3 experiments/ml-weather/scripts/download_nasa_power.py \
   --start 20200101 \
   --end 20241231 \
   --workers 4
+```
+
+Generate and download the denser 7,056-point grid. Use the shuffled file for large
+pulls so partial checkpoints remain geographically mixed:
+
+```sh
+python3 experiments/ml-weather/scripts/generate_global_grid_locations.py \
+  --out experiments/ml-weather/config/global_grid_7056_locations.csv \
+  --lat-start -60 \
+  --lat-stop 60 \
+  --lat-step 2.5 \
+  --lon-start -178.75 \
+  --lon-stop 178.75 \
+  --lon-step 2.5
+
+python3 experiments/ml-weather/scripts/shuffle_locations.py \
+  --input experiments/ml-weather/config/global_grid_7056_locations.csv \
+  --out experiments/ml-weather/config/global_grid_7056_locations_shuffled.csv \
+  --seed 7056
+
+python3 experiments/ml-weather/scripts/download_nasa_power.py \
+  --locations experiments/ml-weather/config/global_grid_7056_locations_shuffled.csv \
+  --out-dir experiments/ml-weather/runs/global_grid_7056/raw/nasa_power_hourly \
+  --start 20200101 \
+  --end 20241231 \
+  --workers 4 \
+  --timeout-seconds 60 \
+  --retries 2
+```
+
+NASA POWER may return HTTP 429 for dense pulls. The downloader writes a partial
+manifest and can be resumed with the same command after the rate limit clears.
+NASA's multiprocessing tutorial says not to exceed five concurrent requests, so
+keep `--workers` totals across machines at or below 5. Use delay and jitter for
+long runs:
+
+```sh
+python3 experiments/ml-weather/scripts/download_nasa_power.py \
+  --locations experiments/ml-weather/config/global_grid_7056_locations_shuffled.csv \
+  --out-dir experiments/ml-weather/runs/global_grid_7056/raw/nasa_power_hourly \
+  --start 20200101 \
+  --end 20241231 \
+  --workers 4 \
+  --timeout-seconds 60 \
+  --retries 2 \
+  --request-delay-seconds 1 \
+  --request-jitter-seconds 2
+```
+
+To split only missing locations into distributed shards:
+
+```sh
+python3 experiments/ml-weather/scripts/shard_locations.py \
+  --input experiments/ml-weather/config/global_grid_7056_locations_shuffled.csv \
+  --out-dir experiments/ml-weather/runs/global_grid_7056/shards \
+  --prefix remaining \
+  --shards 3 \
+  --exclude-raw-dir experiments/ml-weather/runs/global_grid_7056/raw/nasa_power_hourly \
+  --start 20200101 \
+  --end 20241231
 ```
 
 Download the smaller pilot set:
