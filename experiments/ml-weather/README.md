@@ -180,6 +180,27 @@ python3 experiments/ml-weather/scripts/train_weather_mlp_torch.py \
   --learning-rate 0.001
 ```
 
+For the 7,056-location dense grid, use reservoir sampling so the training cache
+covers the whole sorted CSV instead of stopping after a geographic prefix:
+
+```sh
+python3 experiments/ml-weather/scripts/train_weather_mlp_torch.py \
+  --data data/nasa_power_hourly_global_grid_7056.csv.gz \
+  --out-dir results/dense_7056_16m_256x256x128 \
+  --cache-dir cache/dense_7056 \
+  --rebuild-cache \
+  --sample-mode reservoir \
+  --train-limit 16000000 \
+  --val-limit 1000000 \
+  --train-stride 2 \
+  --val-stride 2 \
+  --resident-device \
+  --hidden-layers 256,256,128 \
+  --epochs 20 \
+  --batch-size 32768 \
+  --learning-rate 0.001
+```
+
 Generate cell-center interpolation locations:
 
 ```sh

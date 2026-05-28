@@ -45,6 +45,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-dir", type=Path, default=None)
     parser.add_argument("--rebuild-cache", action="store_true")
     parser.add_argument("--resident-device", action="store_true")
+    parser.add_argument(
+        "--sample-mode",
+        choices=["prefix", "reservoir"],
+        default="prefix",
+        help="prefix is fast for small/full-covered datasets; reservoir samples across the whole CSV",
+    )
     return parser.parse_args()
 
 
@@ -162,6 +168,7 @@ def main() -> int:
         "device": str(device),
         "cache_dir": str(args.cache_dir) if args.cache_dir else None,
         "resident_device": args.resident_device,
+        "sample_mode": args.sample_mode,
         "gpu": torch.cuda.get_device_name(0) if device.type == "cuda" else None,
         "history": history,
         **{key: value for key, value in final_metrics.items() if key != "epoch"},
@@ -212,8 +219,8 @@ def load_or_build_samples(args: argparse.Namespace) -> tuple[np.ndarray, np.ndar
 
     args.cache_dir.mkdir(parents=True, exist_ok=True)
     cache_path = args.cache_dir / (
-        f"samples_train{args.train_limit}_val{args.val_limit}_"
-        f"ts{args.train_stride}_vs{args.val_stride}_v1.npz"
+        f"samples_{args.sample_mode}_train{args.train_limit}_val{args.val_limit}_"
+        f"ts{args.train_stride}_vs{args.val_stride}_v2.npz"
     )
     if cache_path.exists() and not args.rebuild_cache:
         print(f"loading cached tensors from {cache_path}")
@@ -233,6 +240,12 @@ def load_or_build_samples(args: argparse.Namespace) -> tuple[np.ndarray, np.ndar
 
 
 def load_samples(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    if args.sample_mode == "reservoir":
+        return load_samples_reservoir(args)
+    return load_samples_prefix(args)
+
+
+def load_samples_prefix(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     train_x = np.empty((args.train_limit, INPUTS), dtype=np.float32)
     train_y = np.empty((args.train_limit, TARGETS), dtype=np.float32)
     val_x = np.empty((args.val_limit, INPUTS), dtype=np.float32)
@@ -255,13 +268,7 @@ def load_samples(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, np.n
             elif train_count >= args.train_limit or row_index % args.train_stride != 0:
                 continue
 
-            timestamp = row[3]
-            latitude = float(row[4])
-            longitude = float(row[5])
-            elevation = float(row[6] or 0.0)
-            target = np.array([float(row[7]), float(row[8]), float(row[9]), float(row[10]), float(row[11])], dtype=np.float32)
-            day_of_year, hour = parse_timestamp(timestamp)
-            features = encode_features(latitude, longitude, elevation, day_of_year, hour)
+            features, target = parse_training_row(row)
 
             if is_validation:
                 val_x[val_count] = features
@@ -275,6 +282,81 @@ def load_samples(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, np.n
     if train_count == 0 or val_count == 0:
         raise RuntimeError("empty train or validation sample")
     return train_x[:train_count], train_y[:train_count], val_x[:val_count], val_y[:val_count]
+
+
+def load_samples_reservoir(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    train_x = np.empty((args.train_limit, INPUTS), dtype=np.float32)
+    train_y = np.empty((args.train_limit, TARGETS), dtype=np.float32)
+    val_x = np.empty((args.val_limit, INPUTS), dtype=np.float32)
+    val_y = np.empty((args.val_limit, TARGETS), dtype=np.float32)
+    rng = np.random.default_rng(args.seed)
+
+    train_seen = 0
+    val_seen = 0
+    train_count = 0
+    val_count = 0
+    started = time.time()
+    with gzip.open(args.data, "rt", newline="", encoding="utf-8") as handle:
+        reader = csv.reader(handle)
+        next(reader)
+        for row_index, row in enumerate(reader, start=1):
+            location_id = row[2]
+            grid_number = parse_grid_number(location_id)
+            is_validation = grid_number is not None and grid_number % 17 == 0
+            if is_validation:
+                if row_index % args.val_stride != 0:
+                    continue
+                val_seen += 1
+                if val_count < args.val_limit:
+                    target_index = val_count
+                    val_count += 1
+                else:
+                    replacement = int(rng.integers(val_seen))
+                    if replacement >= args.val_limit:
+                        continue
+                    target_index = replacement
+                features, target = parse_training_row(row)
+                val_x[target_index] = features
+                val_y[target_index] = target
+            else:
+                if row_index % args.train_stride != 0:
+                    continue
+                train_seen += 1
+                if train_count < args.train_limit:
+                    target_index = train_count
+                    train_count += 1
+                else:
+                    replacement = int(rng.integers(train_seen))
+                    if replacement >= args.train_limit:
+                        continue
+                    target_index = replacement
+                features, target = parse_training_row(row)
+                train_x[target_index] = features
+                train_y[target_index] = target
+
+            if row_index % 10_000_000 == 0:
+                elapsed = time.time() - started
+                print(
+                    f"sample_scan_rows={row_index} train_seen={train_seen} val_seen={val_seen} "
+                    f"train_count={train_count} val_count={val_count} elapsed={elapsed:.1f}s",
+                    flush=True,
+                )
+
+    if train_count == 0 or val_count == 0:
+        raise RuntimeError("empty train or validation sample")
+    print(f"reservoir_seen train={train_seen} val={val_seen}")
+    return train_x[:train_count], train_y[:train_count], val_x[:val_count], val_y[:val_count]
+
+
+def parse_training_row(row: list[str]) -> tuple[np.ndarray, np.ndarray]:
+    timestamp = row[3]
+    latitude = float(row[4])
+    longitude = float(row[5])
+    elevation = float(row[6] or 0.0)
+    target = np.array([float(row[7]), float(row[8]), float(row[9]), float(row[10]), float(row[11])], dtype=np.float32)
+    day_of_year, hour = parse_timestamp(timestamp)
+    features = encode_features(latitude, longitude, elevation, day_of_year, hour)
+    return features, target
 
 
 def parse_grid_number(location_id: str) -> int | None:
