@@ -115,7 +115,19 @@ python3 experiments/ml-weather/scripts/download_nasa_power.py \
   --end 20241231
 ```
 
-Normalize downloaded JSON into a gzipped CSV:
+Normalize downloaded JSON into a gzipped CSV. Use the Rust xtask normalizer
+for large datasets; it writes parallel gzip shards and concatenates them into a
+valid `.csv.gz`:
+
+```sh
+cargo run --release -p xtask -- normalize-nasa-power \
+  --raw-dir experiments/ml-weather/runs/global_grid_7056/raw/nasa_power_hourly \
+  --out experiments/ml-weather/runs/global_grid_7056/normalized/nasa_power_hourly.csv.gz \
+  --workers 16 \
+  --pigz-threads 1
+```
+
+The Python normalizer remains useful for small smoke datasets:
 
 ```sh
 python3 experiments/ml-weather/scripts/normalize_nasa_power.py \

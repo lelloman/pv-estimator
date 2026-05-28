@@ -2,9 +2,13 @@ use std::env;
 use std::error::Error;
 use std::f32::consts::PI;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde_json::{Map, Value, json};
 
 const INPUTS: usize = 64;
 const TARGETS: usize = 5;
@@ -36,6 +40,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some("weather-climatology-baseline") => {
             weather_climatology_baseline(RunConfig::from_args(args.collect())?)
         }
+        Some("normalize-nasa-power") => {
+            normalize_nasa_power(NormalizeConfig::from_args(args.collect())?)
+        }
         Some("help") | None => {
             print_help();
             Ok(())
@@ -48,6 +55,7 @@ fn print_help() {
     println!("xtask commands:");
     println!("  train-weather-mlp --data <csv.gz> --out-dir <dir> [options]");
     println!("  weather-climatology-baseline --data <csv.gz> --out-dir <dir> [options]");
+    println!("  normalize-nasa-power --raw-dir <dir> --out <csv.gz> [--workers <n>]");
 }
 
 #[derive(Debug)]
@@ -939,4 +947,472 @@ fn json_string_array(values: &[&str]) -> String {
     }
     output.push(']');
     output
+}
+
+const NASA_SOURCE_ID: &str = "nasa_power_hourly";
+const NASA_SOURCE_RECORD_TYPE: &str = "historical";
+const NASA_CSV_HEADER: &str = "source_id,source_record_type,location_id,timestamp_utc,latitude,longitude,elevation_m,ghi_w_m2,dni_w_m2,dhi_w_m2,ambient_temperature_c,wind_speed_m_s,wind_speed_height_m,quality_flags\n";
+const NASA_FIELDS: [(&str, &str); 5] = [
+    ("ALLSKY_SFC_SW_DWN", "ghi_w_m2"),
+    ("ALLSKY_SFC_SW_DNI", "dni_w_m2"),
+    ("ALLSKY_SFC_SW_DIFF", "dhi_w_m2"),
+    ("T2M", "ambient_temperature_c"),
+    ("WS2M", "wind_speed_m_s"),
+];
+
+#[derive(Debug)]
+struct NormalizeConfig {
+    raw_dir: PathBuf,
+    out: PathBuf,
+    workers: usize,
+    pigz_threads: usize,
+    keep_shards: bool,
+}
+
+impl NormalizeConfig {
+    fn from_args(args: Vec<String>) -> Result<Self, Box<dyn Error>> {
+        let default_workers = thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(4)
+            .clamp(1, 16);
+        let mut config = Self {
+            raw_dir: PathBuf::from(
+                "experiments/ml-weather/runs/global_grid_7056/raw/nasa_power_hourly",
+            ),
+            out: PathBuf::from(
+                "experiments/ml-weather/runs/global_grid_7056/normalized/nasa_power_hourly.csv.gz",
+            ),
+            workers: default_workers,
+            pigz_threads: 1,
+            keep_shards: true,
+        };
+
+        let mut index = 0;
+        while index < args.len() {
+            let key = &args[index];
+            match key.as_str() {
+                "--keep-shards" => {
+                    config.keep_shards = true;
+                    index += 1;
+                }
+                "--discard-shards" => {
+                    config.keep_shards = false;
+                    index += 1;
+                }
+                "--raw-dir" | "--out" | "--workers" | "--pigz-threads" => {
+                    let value = args
+                        .get(index + 1)
+                        .ok_or_else(|| format!("missing value for {key}"))?;
+                    match key.as_str() {
+                        "--raw-dir" => config.raw_dir = PathBuf::from(value),
+                        "--out" => config.out = PathBuf::from(value),
+                        "--workers" => config.workers = value.parse()?,
+                        "--pigz-threads" => config.pigz_threads = value.parse()?,
+                        _ => unreachable!(),
+                    }
+                    index += 2;
+                }
+                _ => return Err(format!("unknown normalize-nasa-power option: {key}").into()),
+            }
+        }
+
+        if config.workers == 0 {
+            return Err("--workers must be positive".into());
+        }
+        if config.pigz_threads == 0 {
+            return Err("--pigz-threads must be positive".into());
+        }
+        Ok(config)
+    }
+}
+
+#[derive(Debug)]
+struct NormalizeShardSummary {
+    index: usize,
+    path: PathBuf,
+    files: usize,
+    rows: usize,
+    missing_values: usize,
+    bytes: u64,
+}
+
+#[derive(Debug, Default)]
+struct NormalizeFileSummary {
+    rows: usize,
+    missing_values: usize,
+}
+
+fn normalize_nasa_power(config: NormalizeConfig) -> Result<(), Box<dyn Error>> {
+    ensure_pigz_available()?;
+    let mut raw_files = fs::read_dir(&config.raw_dir)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<Vec<_>, _>>()?;
+    raw_files.retain(|path| {
+        path.extension()
+            .is_some_and(|extension| extension == "json")
+            && path.file_name().is_none_or(|name| name != "manifest.json")
+    });
+    raw_files.sort();
+    if raw_files.is_empty() {
+        return Err(format!(
+            "no NASA POWER JSON files found in {}",
+            config.raw_dir.display()
+        )
+        .into());
+    }
+
+    if let Some(parent) = config.out.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    if config.out.exists() {
+        let backup = interrupted_output_path(&config.out);
+        fs::rename(&config.out, &backup)?;
+        println!(
+            "moved existing {} to {}",
+            config.out.display(),
+            backup.display()
+        );
+    }
+
+    let stamp = unix_timestamp();
+    let out_name = config
+        .out
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("--out must have a UTF-8 file name")?;
+    let shard_dir = config
+        .out
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!(".{out_name}.shards-{stamp}"));
+    fs::create_dir_all(&shard_dir)?;
+
+    let workers = config.workers.min(raw_files.len()).max(1);
+    let mut assignments = vec![Vec::new(); workers];
+    for (index, path) in raw_files.into_iter().enumerate() {
+        assignments[index % workers].push(path);
+    }
+
+    println!(
+        "normalizing {} files with workers={} pigz_threads={} shard_dir={}",
+        assignments.iter().map(Vec::len).sum::<usize>(),
+        workers,
+        config.pigz_threads,
+        shard_dir.display()
+    );
+
+    let mut handles = Vec::with_capacity(workers);
+    for (index, files) in assignments.into_iter().enumerate() {
+        let shard_path = shard_dir.join(format!("part_{index:04}.csv.gz"));
+        let pigz_threads = config.pigz_threads;
+        handles.push(thread::spawn(move || {
+            normalize_shard(index, files, shard_path, index == 0, pigz_threads)
+                .map_err(|error| error.to_string())
+        }));
+    }
+
+    let mut summaries = Vec::with_capacity(workers);
+    for handle in handles {
+        let summary = handle.join().map_err(|_| "normalizer worker panicked")??;
+        println!(
+            "shard={} files={} rows={} missing_values={} bytes={}",
+            summary.index, summary.files, summary.rows, summary.missing_values, summary.bytes
+        );
+        summaries.push(summary);
+    }
+    summaries.sort_by_key(|summary| summary.index);
+
+    let tmp_out = config.out.with_file_name(format!("{out_name}.tmp"));
+    concatenate_shards(&summaries, &tmp_out)?;
+    fs::rename(&tmp_out, &config.out)?;
+
+    let rows = summaries.iter().map(|summary| summary.rows).sum::<usize>();
+    let missing_values = summaries
+        .iter()
+        .map(|summary| summary.missing_values)
+        .sum::<usize>();
+    let files = summaries.iter().map(|summary| summary.files).sum::<usize>();
+    let summary_path = config
+        .out
+        .with_file_name(format!("{out_name}.summary.json"));
+    write_normalize_summary(
+        &config,
+        &summaries,
+        rows,
+        missing_values,
+        files,
+        &summary_path,
+    )?;
+
+    if !config.keep_shards {
+        fs::remove_dir_all(&shard_dir)?;
+    }
+
+    println!("wrote {}", config.out.display());
+    println!("wrote {}", summary_path.display());
+    println!("files={files} rows={rows} missing_values={missing_values}");
+    Ok(())
+}
+
+fn normalize_shard(
+    index: usize,
+    files: Vec<PathBuf>,
+    shard_path: PathBuf,
+    include_header: bool,
+    pigz_threads: usize,
+) -> Result<NormalizeShardSummary, Box<dyn Error>> {
+    let shard_file = File::create(&shard_path)?;
+    let mut child = Command::new("pigz")
+        .arg("-c")
+        .arg("-p")
+        .arg(pigz_threads.to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::from(shard_file))
+        .spawn()?;
+    let stdin = child.stdin.take().ok_or("failed to open pigz stdin")?;
+    let mut writer = BufWriter::with_capacity(1024 * 1024, stdin);
+
+    if include_header {
+        writer.write_all(NASA_CSV_HEADER.as_bytes())?;
+    }
+
+    let mut rows = 0usize;
+    let mut missing_values = 0usize;
+    for path in &files {
+        let summary = normalize_nasa_power_file(path, &mut writer)?;
+        rows += summary.rows;
+        missing_values += summary.missing_values;
+    }
+    writer.flush()?;
+    drop(writer);
+
+    let status = child.wait()?;
+    if !status.success() {
+        return Err(format!("pigz exited with status {status} for shard {index}").into());
+    }
+    let bytes = shard_path.metadata()?.len();
+    Ok(NormalizeShardSummary {
+        index,
+        path: shard_path,
+        files: files.len(),
+        rows,
+        missing_values,
+        bytes,
+    })
+}
+
+fn normalize_nasa_power_file(
+    path: &Path,
+    writer: &mut impl Write,
+) -> Result<NormalizeFileSummary, Box<dyn Error>> {
+    let file = File::open(path)?;
+    let data: Value = serde_json::from_reader(BufReader::new(file))?;
+    let parameters = data
+        .get("properties")
+        .and_then(|properties| properties.get("parameter"))
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("missing properties.parameter in {}", path.display()))?;
+    let coordinates = data
+        .get("geometry")
+        .and_then(|geometry| geometry.get("coordinates"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("missing geometry.coordinates in {}", path.display()))?;
+    let longitude = coordinates
+        .first()
+        .map(json_value_to_csv)
+        .ok_or_else(|| format!("missing longitude in {}", path.display()))?;
+    let latitude = coordinates
+        .get(1)
+        .map(json_value_to_csv)
+        .ok_or_else(|| format!("missing latitude in {}", path.display()))?;
+    let elevation = coordinates
+        .get(2)
+        .map(json_value_to_csv)
+        .unwrap_or_default();
+    let location_id = location_id_from_json_path(path);
+
+    let field_maps = NASA_FIELDS
+        .iter()
+        .map(|(source_field, _)| {
+            parameters
+                .get(*source_field)
+                .and_then(Value::as_object)
+                .ok_or_else(|| format!("missing parameter {source_field} in {}", path.display()))
+        })
+        .collect::<Result<Vec<&Map<String, Value>>, _>>()?;
+
+    let mut keys = field_maps[0].keys().collect::<Vec<_>>();
+    keys.sort_unstable();
+
+    let prefix = format!("{NASA_SOURCE_ID},{NASA_SOURCE_RECORD_TYPE},{location_id},");
+    let suffix_before_targets = format!(",{latitude},{longitude},{elevation}");
+    let mut line = String::with_capacity(256);
+    let mut rows = 0usize;
+    let mut missing_values = 0usize;
+
+    for key in keys {
+        line.clear();
+        line.push_str(&prefix);
+        push_timestamp_utc(key, &mut line)?;
+        line.push_str(&suffix_before_targets);
+
+        let mut flags = Vec::new();
+        for ((_, target_field), field_map) in NASA_FIELDS.iter().zip(&field_maps) {
+            line.push(',');
+            let value = field_map.get(key);
+            if is_missing_value(value) {
+                missing_values += 1;
+                flags.push(*target_field);
+            } else if let Some(value) = value {
+                line.push_str(&json_value_to_csv(value));
+            }
+        }
+        line.push_str(",2,");
+        for (index, flag) in flags.iter().enumerate() {
+            if index > 0 {
+                line.push(';');
+            }
+            line.push_str("missing:");
+            line.push_str(flag);
+        }
+        line.push('\n');
+        writer.write_all(line.as_bytes())?;
+        rows += 1;
+    }
+
+    Ok(NormalizeFileSummary {
+        rows,
+        missing_values,
+    })
+}
+
+fn json_value_to_csv(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::Number(number) => number.to_string(),
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn is_missing_value(value: Option<&Value>) -> bool {
+    match value {
+        None | Some(Value::Null) => true,
+        Some(Value::Number(number)) => number
+            .as_f64()
+            .is_some_and(|value| matches!(value as i64, -999 | -9999)),
+        _ => false,
+    }
+}
+
+fn push_timestamp_utc(key: &str, out: &mut String) -> Result<(), Box<dyn Error>> {
+    if key.len() != 10 {
+        return Err(format!("invalid NASA POWER timestamp key: {key}").into());
+    }
+    out.push_str(&key[0..4]);
+    out.push('-');
+    out.push_str(&key[4..6]);
+    out.push('-');
+    out.push_str(&key[6..8]);
+    out.push('T');
+    out.push_str(&key[8..10]);
+    out.push_str(":00:00Z");
+    Ok(())
+}
+
+fn location_id_from_json_path(path: &Path) -> String {
+    let name = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default();
+    let mut parts = name.rsplitn(3, '_').collect::<Vec<_>>();
+    if parts.len() == 3
+        && parts[0].chars().all(|char| char.is_ascii_digit())
+        && parts[1].chars().all(|char| char.is_ascii_digit())
+    {
+        parts.reverse();
+        parts[0].to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+fn concatenate_shards(
+    summaries: &[NormalizeShardSummary],
+    out: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let mut writer = BufWriter::with_capacity(1024 * 1024, File::create(out)?);
+    for summary in summaries {
+        let mut reader = BufReader::with_capacity(1024 * 1024, File::open(&summary.path)?);
+        io::copy(&mut reader, &mut writer)?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+fn write_normalize_summary(
+    config: &NormalizeConfig,
+    summaries: &[NormalizeShardSummary],
+    rows: usize,
+    missing_values: usize,
+    files: usize,
+    summary_path: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let shards = summaries
+        .iter()
+        .map(|summary| {
+            json!({
+                "index": summary.index,
+                "path": summary.path,
+                "files": summary.files,
+                "rows": summary.rows,
+                "missing_values": summary.missing_values,
+                "bytes": summary.bytes,
+            })
+        })
+        .collect::<Vec<_>>();
+    let summary = json!({
+        "source_id": NASA_SOURCE_ID,
+        "created_at_unix_seconds": unix_timestamp(),
+        "raw_dir": config.raw_dir,
+        "output_path": config.out,
+        "workers": config.workers,
+        "pigz_threads": config.pigz_threads,
+        "files": files,
+        "rows": rows,
+        "missing_values": missing_values,
+        "shards": shards,
+    });
+    fs::write(summary_path, serde_json::to_string_pretty(&summary)? + "\n")?;
+    Ok(())
+}
+
+fn ensure_pigz_available() -> Result<(), Box<dyn Error>> {
+    let status = Command::new("pigz")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("pigz is not available or returned an error".into())
+    }
+}
+
+fn interrupted_output_path(out: &Path) -> PathBuf {
+    let stamp = unix_timestamp();
+    let name = out
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("output");
+    out.with_file_name(format!("{name}.interrupted_{stamp}"))
+}
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
