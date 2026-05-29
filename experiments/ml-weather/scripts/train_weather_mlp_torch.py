@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import gzip
+import hashlib
 import json
 import math
 import time
@@ -16,7 +17,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-INPUTS = 64
+BASE_INPUTS = 64
 TARGETS = 5
 QUANTILES = torch.tensor([0.1, 0.5, 0.9], dtype=torch.float32)
 TARGET_NAMES = [
@@ -38,11 +39,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-stride", type=int, default=7)
     parser.add_argument("--hidden-width", type=int, default=256)
     parser.add_argument("--hidden-layers", default=None, help="comma-separated hidden layer widths, e.g. 256,256,128")
+    parser.add_argument("--architecture", choices=["mlp", "residual-mlp"], default="mlp")
+    parser.add_argument("--residual-width", type=int, default=512)
+    parser.add_argument("--residual-blocks", type=int, default=6)
+    parser.add_argument("--residual-scale", type=float, default=0.5)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=8192)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cache-dir", type=Path, default=None)
+    parser.add_argument("--aux-features", type=Path, default=None, help="location-level auxiliary feature CSV keyed by location_id")
+    parser.add_argument(
+        "--aux-exclude-columns",
+        default="location_id,name,latitude,longitude,region,cci_point_class",
+        help="comma-separated auxiliary CSV columns to exclude from model inputs",
+    )
     parser.add_argument("--rebuild-cache", action="store_true")
     parser.add_argument("--resident-device", action="store_true")
     parser.add_argument(
@@ -67,6 +78,7 @@ def main() -> int:
     args = parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
     hidden_layers = parse_hidden_layers(args)
+    validate_architecture_args(args)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
@@ -75,8 +87,12 @@ def main() -> int:
     if device.type == "cuda":
         print(f"gpu={torch.cuda.get_device_name(0)}")
 
+    aux_features = load_aux_features(args.aux_features, args.aux_exclude_columns)
+    input_features = BASE_INPUTS + aux_features.width
+    print(f"input_features={input_features} base_features={BASE_INPUTS} aux_features={aux_features.width}")
+
     started = time.time()
-    train_x, train_y, val_x, val_y = load_or_build_samples(args)
+    train_x, train_y, val_x, val_y = load_or_build_samples(args, aux_features, input_features)
     print(f"loaded train_rows={len(train_x)} val_rows={len(val_x)} in {time.time() - started:.1f}s")
 
     target_mean = train_y.mean(axis=0).astype(np.float32)
@@ -84,7 +100,7 @@ def main() -> int:
     target_std = np.maximum(target_std, 1.0).astype(np.float32)
     train_y_norm = (train_y - target_mean) / target_std
 
-    model = WeatherMlp(hidden_layers).to(device)
+    model = build_model(args, hidden_layers, input_features).to(device)
     parameters = sum(parameter.numel() for parameter in model.parameters())
     print(f"parameters={parameters}")
 
@@ -152,9 +168,17 @@ def main() -> int:
     final_metrics = history[-1]
     output = {
         "model": "weather_mlp_torch",
-        "input_features": INPUTS,
+        "architecture": args.architecture,
+        "input_features": input_features,
+        "base_input_features": BASE_INPUTS,
+        "aux_features_path": str(args.aux_features) if args.aux_features else None,
+        "aux_feature_count": aux_features.width,
+        "aux_feature_columns": aux_features.columns,
         "hidden_width": args.hidden_width,
         "hidden_layers": hidden_layers,
+        "residual_width": args.residual_width,
+        "residual_blocks": args.residual_blocks,
+        "residual_scale": args.residual_scale,
         "outputs": TARGETS * 3,
         "parameters": parameters,
         "epochs": args.epochs,
@@ -181,8 +205,16 @@ def main() -> int:
             "target_mean": target_mean,
             "target_std": target_std,
             "target_names": TARGET_NAMES,
+            "architecture": args.architecture,
             "hidden_layers": hidden_layers,
-            "input_features": INPUTS,
+            "residual_width": args.residual_width,
+            "residual_blocks": args.residual_blocks,
+            "residual_scale": args.residual_scale,
+            "input_features": input_features,
+            "base_input_features": BASE_INPUTS,
+            "aux_features_path": str(args.aux_features) if args.aux_features else None,
+            "aux_feature_count": aux_features.width,
+            "aux_feature_columns": aux_features.columns,
         },
         args.out_dir / "model.pt",
     )
@@ -191,11 +223,26 @@ def main() -> int:
     return 0
 
 
+def validate_architecture_args(args: argparse.Namespace) -> None:
+    if args.residual_width <= 0:
+        raise ValueError("--residual-width must be positive")
+    if args.residual_blocks <= 0:
+        raise ValueError("--residual-blocks must be positive")
+    if args.residual_scale <= 0:
+        raise ValueError("--residual-scale must be positive")
+
+
+def build_model(args: argparse.Namespace, hidden_layers: list[int], input_features: int) -> nn.Module:
+    if args.architecture == "residual-mlp":
+        return ResidualWeatherMlp(input_features, args.residual_width, args.residual_blocks, args.residual_scale)
+    return WeatherMlp(input_features, hidden_layers)
+
+
 class WeatherMlp(nn.Module):
-    def __init__(self, hidden_layers: list[int]) -> None:
+    def __init__(self, input_features: int, hidden_layers: list[int]) -> None:
         super().__init__()
         layers: list[nn.Module] = []
-        previous_width = INPUTS
+        previous_width = input_features
         for hidden_width in hidden_layers:
             layers.append(nn.Linear(previous_width, hidden_width))
             layers.append(nn.SiLU())
@@ -207,27 +254,62 @@ class WeatherMlp(nn.Module):
         return self.net(values)
 
 
+class ResidualBlock(nn.Module):
+    def __init__(self, width: int, residual_scale: float) -> None:
+        super().__init__()
+        self.residual_scale = residual_scale
+        self.net = nn.Sequential(
+            nn.LayerNorm(width),
+            nn.Linear(width, width),
+            nn.SiLU(),
+            nn.Linear(width, width),
+        )
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        return values + self.residual_scale * self.net(values)
+
+
+class ResidualWeatherMlp(nn.Module):
+    def __init__(self, input_features: int, width: int, blocks: int, residual_scale: float) -> None:
+        super().__init__()
+        self.input = nn.Linear(input_features, width)
+        self.blocks = nn.Sequential(*(ResidualBlock(width, residual_scale) for _ in range(blocks)))
+        self.output = nn.Sequential(
+            nn.LayerNorm(width),
+            nn.SiLU(),
+            nn.Linear(width, TARGETS * 3),
+        )
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        hidden = self.input(values)
+        hidden = self.blocks(hidden)
+        return self.output(hidden)
+
+
 def pinball_loss(predictions: torch.Tensor, targets: torch.Tensor, quantiles: torch.Tensor) -> torch.Tensor:
     errors = targets.unsqueeze(-1) - predictions
     losses = torch.maximum(quantiles * errors, (quantiles - 1.0) * errors)
     return losses.mean()
 
 
-def load_or_build_samples(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def load_or_build_samples(
+    args: argparse.Namespace, aux_features: "AuxFeatureSet", input_features: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     if args.cache_dir is None:
-        return load_samples(args)
+        return load_samples(args, aux_features, input_features)
 
     args.cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_version = "v2" if aux_features.width == 0 else f"aux{aux_features.cache_key}_v3"
     cache_path = args.cache_dir / (
         f"samples_{args.sample_mode}_train{args.train_limit}_val{args.val_limit}_"
-        f"ts{args.train_stride}_vs{args.val_stride}_v2.npz"
+        f"ts{args.train_stride}_vs{args.val_stride}_{cache_version}.npz"
     )
     if cache_path.exists() and not args.rebuild_cache:
         print(f"loading cached tensors from {cache_path}")
         cached = np.load(cache_path)
         return cached["train_x"], cached["train_y"], cached["val_x"], cached["val_y"]
 
-    train_x, train_y, val_x, val_y = load_samples(args)
+    train_x, train_y, val_x, val_y = load_samples(args, aux_features, input_features)
     print(f"writing cached tensors to {cache_path}")
     np.savez(
         cache_path,
@@ -239,16 +321,20 @@ def load_or_build_samples(args: argparse.Namespace) -> tuple[np.ndarray, np.ndar
     return train_x, train_y, val_x, val_y
 
 
-def load_samples(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def load_samples(
+    args: argparse.Namespace, aux_features: "AuxFeatureSet", input_features: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     if args.sample_mode == "reservoir":
-        return load_samples_reservoir(args)
-    return load_samples_prefix(args)
+        return load_samples_reservoir(args, aux_features, input_features)
+    return load_samples_prefix(args, aux_features, input_features)
 
 
-def load_samples_prefix(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    train_x = np.empty((args.train_limit, INPUTS), dtype=np.float32)
+def load_samples_prefix(
+    args: argparse.Namespace, aux_features: "AuxFeatureSet", input_features: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    train_x = np.empty((args.train_limit, input_features), dtype=np.float32)
     train_y = np.empty((args.train_limit, TARGETS), dtype=np.float32)
-    val_x = np.empty((args.val_limit, INPUTS), dtype=np.float32)
+    val_x = np.empty((args.val_limit, input_features), dtype=np.float32)
     val_y = np.empty((args.val_limit, TARGETS), dtype=np.float32)
 
     train_count = 0
@@ -268,7 +354,7 @@ def load_samples_prefix(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarra
             elif train_count >= args.train_limit or row_index % args.train_stride != 0:
                 continue
 
-            features, target = parse_training_row(row)
+            features, target = parse_training_row(row, aux_features)
 
             if is_validation:
                 val_x[val_count] = features
@@ -284,10 +370,12 @@ def load_samples_prefix(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarra
     return train_x[:train_count], train_y[:train_count], val_x[:val_count], val_y[:val_count]
 
 
-def load_samples_reservoir(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    train_x = np.empty((args.train_limit, INPUTS), dtype=np.float32)
+def load_samples_reservoir(
+    args: argparse.Namespace, aux_features: "AuxFeatureSet", input_features: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    train_x = np.empty((args.train_limit, input_features), dtype=np.float32)
     train_y = np.empty((args.train_limit, TARGETS), dtype=np.float32)
-    val_x = np.empty((args.val_limit, INPUTS), dtype=np.float32)
+    val_x = np.empty((args.val_limit, input_features), dtype=np.float32)
     val_y = np.empty((args.val_limit, TARGETS), dtype=np.float32)
     rng = np.random.default_rng(args.seed)
 
@@ -315,7 +403,7 @@ def load_samples_reservoir(args: argparse.Namespace) -> tuple[np.ndarray, np.nda
                     if replacement >= args.val_limit:
                         continue
                     target_index = replacement
-                features, target = parse_training_row(row)
+                features, target = parse_training_row(row, aux_features)
                 val_x[target_index] = features
                 val_y[target_index] = target
             else:
@@ -330,7 +418,7 @@ def load_samples_reservoir(args: argparse.Namespace) -> tuple[np.ndarray, np.nda
                     if replacement >= args.train_limit:
                         continue
                     target_index = replacement
-                features, target = parse_training_row(row)
+                features, target = parse_training_row(row, aux_features)
                 train_x[target_index] = features
                 train_y[target_index] = target
 
@@ -348,7 +436,7 @@ def load_samples_reservoir(args: argparse.Namespace) -> tuple[np.ndarray, np.nda
     return train_x[:train_count], train_y[:train_count], val_x[:val_count], val_y[:val_count]
 
 
-def parse_training_row(row: list[str]) -> tuple[np.ndarray, np.ndarray]:
+def parse_training_row(row: list[str], aux_features: "AuxFeatureSet") -> tuple[np.ndarray, np.ndarray]:
     timestamp = row[3]
     latitude = float(row[4])
     longitude = float(row[5])
@@ -356,7 +444,58 @@ def parse_training_row(row: list[str]) -> tuple[np.ndarray, np.ndarray]:
     target = np.array([float(row[7]), float(row[8]), float(row[9]), float(row[10]), float(row[11])], dtype=np.float32)
     day_of_year, hour = parse_timestamp(timestamp)
     features = encode_features(latitude, longitude, elevation, day_of_year, hour)
+    if aux_features.width:
+        features = np.concatenate([features, aux_features.for_location(row[2])]).astype(np.float32)
     return features, target
+
+
+class AuxFeatureSet:
+    def __init__(self, columns: list[str], by_location: dict[str, np.ndarray], cache_key: str) -> None:
+        self.columns = columns
+        self.by_location = by_location
+        self.cache_key = cache_key
+        self.width = len(columns)
+        self._empty = np.empty((0,), dtype=np.float32)
+
+    def for_location(self, location_id: str) -> np.ndarray:
+        if self.width == 0:
+            return self._empty
+        try:
+            return self.by_location[location_id]
+        except KeyError as exc:
+            raise KeyError(f"aux features missing location_id={location_id}") from exc
+
+
+def load_aux_features(path: Path | None, exclude_columns: str) -> AuxFeatureSet:
+    if path is None:
+        return AuxFeatureSet([], {}, "none")
+
+    excluded = {column.strip() for column in exclude_columns.split(",") if column.strip()}
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None or "location_id" not in reader.fieldnames:
+            raise ValueError("aux feature CSV must contain a location_id column")
+        columns = [column for column in reader.fieldnames if column not in excluded]
+        if not columns:
+            raise ValueError("aux feature CSV has no usable columns after exclusions")
+        location_ids: list[str] = []
+        matrix_rows: list[list[float]] = []
+        for row in reader:
+            location_ids.append(row["location_id"])
+            matrix_rows.append([float(row[column]) for column in columns])
+
+    matrix = np.array(matrix_rows, dtype=np.float32)
+    mean = matrix.mean(axis=0).astype(np.float32)
+    std = matrix.std(axis=0).astype(np.float32)
+    std = np.maximum(std, 1e-6).astype(np.float32)
+    normalized = (matrix - mean) / std
+    by_location = {location_id: normalized[index] for index, location_id in enumerate(location_ids)}
+    digest = hashlib.sha256()
+    digest.update(path.read_bytes())
+    digest.update(",".join(columns).encode("utf-8"))
+    cache_key = digest.hexdigest()[:12]
+    print(f"loaded aux_features path={path} rows={len(location_ids)} columns={len(columns)} cache_key={cache_key}")
+    return AuxFeatureSet(columns, by_location, cache_key)
 
 
 def parse_grid_number(location_id: str) -> int | None:
@@ -419,8 +558,8 @@ def encode_features(latitude: float, longitude: float, elevation: float, day_of_
             elev_norm * base_day_sin,
         ]
     )
-    if len(features) != INPUTS:
-        raise RuntimeError(f"expected {INPUTS} features, got {len(features)}")
+    if len(features) != BASE_INPUTS:
+        raise RuntimeError(f"expected {BASE_INPUTS} features, got {len(features)}")
     return np.array(features, dtype=np.float32)
 
 
