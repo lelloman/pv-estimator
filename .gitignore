@@ -4,3 +4,4 @@ experiments/ml-weather/runs/*
 **/*.rs.bk
 __pycache__/
 *.py[cod]
+experiments/ml-weather/.venv-geo/

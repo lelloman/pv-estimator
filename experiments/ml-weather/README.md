@@ -25,6 +25,82 @@ The checked-in location lists are:
 Generated raw and normalized data goes under `runs/`, which is ignored by git.
 Run summaries that are small enough for review go under `results/`.
 
+## Auxiliary Geography
+
+Auxiliary geography data is collected separately from hourly weather records and
+keyed by `location_id`. The first generated artifact is a compact spatial
+feature table for the 7,056-location grid:
+
+```text
+experiments/ml-weather/runs/global_grid_7056/aux_geography/location_features_v1.csv
+```
+
+It is generated from global coarse rasters:
+
+- NOAA ETOPO 2022 60 arc-second relief for elevation, bathymetry, and a
+  water/land proxy
+- ESA CCI/C3S 2020 300 m land cover for land-cover fractions
+
+The derived table contains point features plus aggregate features over 25 km,
+100 km, and 250 km radii, including eight compass sectors. This keeps the first
+model input shape tabular while still preserving spatial context such as coasts,
+islands, and mountain asymmetry.
+
+Install the geospatial experiment dependencies:
+
+```sh
+python3 -m venv experiments/ml-weather/.venv-geo
+experiments/ml-weather/.venv-geo/bin/pip install -r experiments/ml-weather/requirements-geo.txt
+```
+
+Download source rasters and build location features:
+
+```sh
+experiments/ml-weather/.venv-geo/bin/python \
+  experiments/ml-weather/scripts/collect_aux_geography.py download
+
+experiments/ml-weather/.venv-geo/bin/python \
+  experiments/ml-weather/scripts/collect_aux_geography.py features \
+  --out experiments/ml-weather/runs/global_grid_7056/aux_geography/location_features_v1.csv \
+  --progress-every 250
+```
+
+Append auxiliary geography features to an existing reservoir cache without
+rescanning the full normalized NASA CSV:
+
+```sh
+python3 experiments/ml-weather/scripts/augment_weather_cache_with_aux.py \
+  --base-cache experiments/ml-weather/runs/global_grid_7056/cache/samples_reservoir_train16000000_val1000000_ts2_vs2_v2.npz \
+  --aux-features experiments/ml-weather/runs/global_grid_7056/aux_geography/location_features_v1.csv \
+  --out experiments/ml-weather/runs/global_grid_7056/cache_geo/samples_reservoir_train16000000_val1000000_ts2_vs2_aux87a6a86840e4_v3.npz \
+  --train-limit 16000000 \
+  --val-limit 1000000 \
+  --chunk-size 500000
+```
+
+Train the dense residual MLP with auxiliary geography features:
+
+```sh
+python3 experiments/ml-weather/scripts/train_weather_mlp_torch.py \
+  --data experiments/ml-weather/runs/global_grid_7056/normalized/nasa_power_hourly.csv.gz \
+  --out-dir experiments/ml-weather/runs/global_grid_7056/models/weather_residual_geo_384x6 \
+  --cache-dir experiments/ml-weather/runs/global_grid_7056/cache_geo \
+  --sample-mode reservoir \
+  --train-limit 16000000 \
+  --val-limit 1000000 \
+  --train-stride 2 \
+  --val-stride 2 \
+  --aux-features experiments/ml-weather/runs/global_grid_7056/aux_geography/location_features_v1.csv \
+  --architecture residual-mlp \
+  --residual-width 384 \
+  --residual-blocks 6 \
+  --residual-scale 0.5 \
+  --epochs 20 \
+  --batch-size 32768 \
+  --learning-rate 0.001 \
+  --resident-device
+```
+
 ## Commands
 
 Download a small smoke sample:
