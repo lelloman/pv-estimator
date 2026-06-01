@@ -110,13 +110,27 @@ Rules:
 - Source-backed datasets remain the evaluation reference during the research
   spike.
 
-Potential future core-facing contract:
+Current core-facing contract:
 
-- receives coordinates, elevation when available, and time features
-- returns weather quantiles or canonical PV production quantiles
-- reports model id, training data manifest, and evaluation metadata
-- can be swapped with source-backed weather repositories through a named
-  boundary
+- `SourceModelRegistry` records model family, input/output shape, active source
+  models, checkpoint URI, training data size, validation MAE, and coverage rule.
+- `SourceAnnualPvEstimate` records one source model's annual PV estimate plus
+  optional monthly estimates.
+- `AnnualPvEnsembleEstimate` aggregates applicable source estimates into mean,
+  low, high, half-spread, and spread-fraction bands for annual and monthly
+  energy and irradiation values.
+- `SourceModelCoverage` keeps global, PVGIS-gateway, and empirical mask coverage
+  explicit.
+
+Rules:
+
+- Torch checkpoint execution remains outside production crates until packaging is
+  decided.
+- Runtime adapters may consume model outputs through the typed core contract, but
+  training scripts remain in `experiments/ml-weather`.
+- Annual and monthly estimates are the product-level target for this model
+  family; hourly climate-normal values are intermediate data unless later
+  validation proves a finer-grained use case.
 
 ## Equipment Catalog Boundary
 

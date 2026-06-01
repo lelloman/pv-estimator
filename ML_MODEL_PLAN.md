@@ -67,7 +67,10 @@ weather fields:
 - ambient temperature
 - wind speed
 
-This gives 15 outputs per hourly sample.
+This gives 15 outputs per hourly sample in the original weather-model design.
+For the current estimator direction, hourly or month-hour outputs are intermediate
+features; annual and monthly PV energy accuracy are the primary acceptance
+metrics.
 
 The simulator can then derive PV production from predicted weather fields. This
 keeps physical PV behavior reusable and makes the model easier to inspect.
@@ -81,8 +84,8 @@ The first version should stay narrow:
 
 - standard residential panel assumptions
 - a small number of tilt and azimuth combinations
-- hourly production first
-- daily, monthly, and yearly aggregations derived during evaluation
+- annual and monthly production first
+- hourly or month-hour values only as intermediate features for aggregation
 
 This model may be less general than the weather model, but it is useful as a
 baseline for whether direct production prediction is simpler or more accurate.

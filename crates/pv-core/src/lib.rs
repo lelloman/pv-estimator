@@ -4,6 +4,7 @@ pub mod catalog;
 pub mod ids;
 pub mod issues;
 pub mod project;
+pub mod source_model;
 pub mod units;
 pub mod weather;
 
@@ -25,6 +26,11 @@ pub mod prelude {
         LoadProfileReference, MountingGroup, ProjectLoadError, PvSystemProject, SchemaVersion,
         SimulationSettings, StringDefinition, SystemLocation, TopologyConnection,
         load_project_json, save_project_json,
+    };
+    pub use crate::source_model::{
+        AnnualPvEnsembleEstimate, ClimateNormalTarget, EnergyEstimateBand, Irradiation,
+        IrradiationEstimateBand, MonthOfYear, MonthlyPvEnsembleEstimate, SourceAnnualPvEstimate,
+        SourceModelCoverage, SourceModelMetadata, SourceModelRegistry, SourceMonthlyPvEstimate,
     };
     pub use crate::units::{
         Angle, Area, Current, Energy, Length, Power, Temperature, TimeSpan, Voltage,

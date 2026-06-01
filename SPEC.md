@@ -186,6 +186,11 @@ This is a research spike, not a production requirement. The experiment should
 test global non-polar coordinate-based predictions, uncertainty bands, and
 compression potential before the production weather-data strategy is finalized.
 
+For this product, the ML surrogate target is annual and monthly PV estimation.
+Hourly climate-normal outputs may be used internally to derive those aggregates,
+but the tool must not present them as precise forecasts for specific hours or
+specific weather days.
+
 The research plan lives in `ML_EXPERIMENT_PLAN.md`.
 
 Known source documentation:
