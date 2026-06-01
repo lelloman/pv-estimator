@@ -1,0 +1,43 @@
+{
+  "source": "PVGIS-SARAH3",
+  "basis": "Empirical bounding boxes from the 2,000-location PVGIS one-year coverage probe. These boxes are a coarse prefilter, not an official coverage polygon.",
+  "total_covered_locations": 787,
+  "boxes": {
+    "all_probe_hits": {
+      "count": 787,
+      "lat_min": -35.0,
+      "lat_max": 60.0,
+      "lon_min": -63.75,
+      "lon_max": 63.75
+    },
+    "africa_middle_east": {
+      "count": 412,
+      "lat_min": -32.5,
+      "lat_max": 27.5,
+      "lon_min": -16.25,
+      "lon_max": 58.75
+    },
+    "americas": {
+      "count": 137,
+      "lat_min": -35.0,
+      "lat_max": 10.0,
+      "lon_min": -63.75,
+      "lon_max": -36.25
+    },
+    "asia_probe_hits": {
+      "count": 4,
+      "lat_min": 25.0,
+      "lat_max": 30.0,
+      "lon_min": 61.25,
+      "lon_max": 63.75
+    },
+    "europe_mediterranean": {
+      "count": 234,
+      "lat_min": 30.0,
+      "lat_max": 60.0,
+      "lon_min": -8.75,
+      "lon_max": 58.75
+    }
+  },
+  "recommended_use": "Use the source_coverage/pvgis_sarah3_locations.csv list for collection. Use these boxes only to guide future sampling or avoid obviously unsupported regions."
+}

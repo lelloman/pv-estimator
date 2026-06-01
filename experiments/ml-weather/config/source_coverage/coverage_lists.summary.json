@@ -1,0 +1,21 @@
+{
+  "covered_counts": {
+    "PVGIS-ERA5": 1972,
+    "PVGIS-SARAH3": 787
+  },
+  "locations": 2000,
+  "nsrdb_direct_americas_count": 601,
+  "status_counts": {
+    "PVGIS-ERA5": {
+      "coverage_miss": 28,
+      "downloaded": 1972
+    },
+    "PVGIS-NSRDB": {
+      "coverage_miss": 2000
+    },
+    "PVGIS-SARAH3": {
+      "coverage_miss": 1213,
+      "downloaded": 787
+    }
+  }
+}
