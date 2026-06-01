@@ -10,8 +10,11 @@
 - Phase 6: Catalog Model - complete.
 - Phase 7: Location And Weather Data Format - complete.
 - Phase 8: Data Import Tooling - paused/reframed by ML research spike.
-- ML Research Spike - planned in `ML_EXPERIMENT_PLAN.md`,
+- ML Research Spike - active in `ML_EXPERIMENT_PLAN.md`,
   `SOURCE_HARMONIZATION.md`, and `ML_MODEL_PLAN.md`.
+- Source Ensemble Rust Contract - initial implementation complete: `pv-core` has
+  typed source-model metadata and annual/monthly uncertainty bands; `pv-data`
+  exposes the NASA POWER, PVGIS-ERA5, and PVGIS-SARAH3 registry.
 
 ## 1. Documentation Baseline
 
@@ -188,8 +191,8 @@ Acceptance criteria:
 ## ML Research Spike
 
 Goal: test whether a compact coordinate/time-based model can approximate global
-solar/weather and PV production behavior with uncertainty bands before committing
-to a large embedded weather-data strategy.
+annual/monthly PV production behavior with uncertainty bands before committing to
+a large embedded weather-data strategy.
 
 Tasks:
 
@@ -202,8 +205,8 @@ Tasks:
 - Build small checked-in raw and normalized fixtures for parser tests.
 - Design a global non-polar sampling strategy based on coordinates, not city
   IDs.
-- Train and compare two baselines: weather quantiles and canonical PV output
-  quantiles.
+- Train and compare baselines for monthly climate normals and canonical annual
+  and monthly PV output bands.
 - Evaluate against held-out regions, held-out years, and simple climatology or
   nearest-neighbor baselines.
 
@@ -216,6 +219,33 @@ Acceptance criteria:
 - Production crates remain independent from training frameworks.
 - The spike ends with a clear recommendation to continue, narrow, or abandon the
   ML-compression direction.
+
+## Source Ensemble Integration
+
+Goal: make the validated ML source-ensemble experiment consumable by application
+code without coupling production crates to PyTorch or training artifacts.
+
+Status: initial Rust contract complete.
+
+Tasks:
+
+- Define typed source-model registry and coverage rules in `pv-core`.
+- Define typed annual/monthly source estimates and ensemble disagreement bands in
+  `pv-core`.
+- Expose the current NASA POWER, PVGIS-ERA5, and PVGIS-SARAH3 model metadata
+  from `pv-data`.
+- Keep checkpoint execution in experiment tooling until runtime packaging is
+  decided.
+- Next: add an application-facing inference adapter that converts experiment
+  script output into `AnnualPvEnsembleEstimate`.
+
+Acceptance criteria:
+
+- Rust code can represent source-model metadata and annual/monthly error bars
+  without depending on ML frameworks.
+- `cargo test --workspace` covers registry shape and uncertainty aggregation.
+- The current source ensemble validation remains linked from the ML experiment
+  results.
 
 ## 9. Validation Engine
 

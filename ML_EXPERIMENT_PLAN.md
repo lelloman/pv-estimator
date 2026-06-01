@@ -14,8 +14,8 @@ small, useful estimator for arbitrary non-polar locations.
 
 Train and evaluate models that can estimate:
 
-- hourly solar/weather behavior
-- daily, monthly, and yearly PV production behavior
+- monthly climate-normal solar/weather behavior
+- annual and monthly PV production behavior
 - uncertainty bands, such as P10/P50/P90 estimates
 - geographic interpolation for arbitrary coordinates
 - variability differences between predictable and less predictable climates
@@ -140,7 +140,7 @@ configurations:
 
 - common tilt/azimuth combinations
 - common residential panel/inverter assumptions
-- hourly, daily, monthly, and yearly production views
+- annual and monthly production views first; finer views remain secondary
 
 This may be less general, but it provides a useful baseline for whether direct
 production modeling is simpler or more accurate.
@@ -161,10 +161,10 @@ Compare against:
 
 Evaluate at multiple levels:
 
-- hourly MAE/RMSE for weather fields
-- daily energy error
 - monthly energy error
 - yearly energy error
+- source-disagreement calibration for error bars
+- hourly MAE/RMSE for weather fields only as diagnostics
 - P10/P90 calibration
 - seasonal bias
 - regional holdout performance
