@@ -1,0 +1,31 @@
+location_id,name,latitude,longitude,region
+it_potenza,Potenza area,40.650000,15.643000,europe_mediterranean
+it_tuscany_apennines,Tuscany Apennines,43.707000,11.916000,europe_mediterranean
+it_milan,Milan,45.464200,9.190000,europe_mediterranean
+it_rome,Rome,41.902800,12.496400,europe_mediterranean
+it_palermo,Palermo,38.115700,13.361500,europe_mediterranean
+es_madrid,Madrid,40.416800,-3.703800,europe_mediterranean
+gr_athens,Athens,37.983800,23.727500,europe_mediterranean
+tr_istanbul,Istanbul,41.008200,28.978400,europe_mediterranean
+fr_paris,Paris,48.856600,2.352200,europe_temperate
+gb_london,London,51.507400,-0.127800,europe_temperate
+de_berlin,Berlin,52.520000,13.405000,europe_temperate
+at_vienna,Vienna,48.208200,16.373800,europe_temperate
+pl_warsaw,Warsaw,52.229700,21.012200,europe_temperate
+se_stockholm,Stockholm,59.329300,18.068600,europe_north
+eg_cairo,Cairo,30.044400,31.235700,africa_north
+tn_tunis,Tunis,36.806500,10.181500,africa_north
+ma_marrakech,Marrakech,31.629500,-7.981100,africa_north
+ke_nairobi,Nairobi,-1.292100,36.821900,africa_east
+za_cape_town,Cape Town,-33.924900,18.424100,africa_south
+ae_dubai,Dubai,25.204800,55.270800,middle_east
+sa_riyadh,Riyadh,24.713600,46.675300,middle_east
+il_tel_aviv,Tel Aviv,32.085300,34.781800,middle_east
+in_delhi,Delhi,28.613900,77.209000,asia_south
+in_mumbai,Mumbai,19.076000,72.877700,asia_south
+th_bangkok,Bangkok,13.756300,100.501800,asia_southeast
+vn_hanoi,Hanoi,21.027800,105.834200,asia_southeast
+jp_tokyo,Tokyo,35.676200,139.650300,asia_east
+kr_seoul,Seoul,37.566500,126.978000,asia_east
+cn_beijing,Beijing,39.904200,116.407400,asia_east
+sg_singapore,Singapore,1.352100,103.819800,asia_southeast

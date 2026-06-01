@@ -25,6 +25,40 @@ pub struct SourceModelMetadata {
     pub parameters: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceEnsembleEstimateDocument {
+    pub schema_version: u32,
+    pub location: EstimateLocation,
+    pub system: EstimateSystem,
+    pub coverage: EstimateCoverage,
+    pub ensemble_estimate: AnnualPvEnsembleEstimate,
+    #[serde(default)]
+    pub references: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EstimateLocation {
+    pub location_id: String,
+    pub name: String,
+    pub region: String,
+    pub latitude: f64,
+    pub longitude: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EstimateSystem {
+    pub peak_power_kwp: f64,
+    pub loss_pct: f64,
+    pub tilt_deg: f64,
+    pub aspect_deg: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EstimateCoverage {
+    pub pvgis_sarah3_applicable: bool,
+    pub applicable_sources: Vec<WeatherSourceId>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClimateNormalTarget {
@@ -342,6 +376,114 @@ mod tests {
         assert!(MonthOfYear::new(0).is_none());
         assert!(MonthOfYear::new(13).is_none());
         assert_eq!(MonthOfYear::new(12).expect("valid month").value(), 12);
+    }
+
+    #[test]
+    fn estimate_document_deserializes_from_inference_json_shape() {
+        let json = r#"
+        {
+          "schema_version": 1,
+          "location": {
+            "location_id": "it_potenza_user",
+            "name": "Potenza",
+            "region": "Italy",
+            "latitude": 40.65,
+            "longitude": 15.643
+          },
+          "system": {
+            "peak_power_kwp": 1.0,
+            "loss_pct": 14.0,
+            "tilt_deg": 30.0,
+            "aspect_deg": 0.0
+          },
+          "coverage": {
+            "pvgis_sarah3_applicable": true,
+            "applicable_sources": ["nasa_power", "pvgis_era5", "pvgis_sarah3"]
+          },
+          "ensemble_estimate": {
+            "source_estimates": [
+              {
+                "weather_source_id": "nasa_power",
+                "annual_energy": {"watt_hours": 1450000.0},
+                "annual_in_plane_irradiation": {"kilowatt_hours_per_square_meter": 1700.0},
+                "annual_global_horizontal_irradiation": {"kilowatt_hours_per_square_meter": 1500.0},
+                "monthly_estimates": [
+                  {
+                    "month": 1,
+                    "energy": {"watt_hours": 100000.0},
+                    "in_plane_irradiation": {"kilowatt_hours_per_square_meter": 120.0},
+                    "global_horizontal_irradiation": {"kilowatt_hours_per_square_meter": 100.0}
+                  }
+                ]
+              }
+            ],
+            "annual_energy": {
+              "mean": {"watt_hours": 1450000.0},
+              "low": {"watt_hours": 1450000.0},
+              "high": {"watt_hours": 1450000.0},
+              "half_spread": {"watt_hours": 0.0},
+              "spread_fraction": 0.0
+            },
+            "annual_in_plane_irradiation": {
+              "mean": {"kilowatt_hours_per_square_meter": 1700.0},
+              "low": {"kilowatt_hours_per_square_meter": 1700.0},
+              "high": {"kilowatt_hours_per_square_meter": 1700.0},
+              "half_spread": {"kilowatt_hours_per_square_meter": 0.0},
+              "spread_fraction": 0.0
+            },
+            "annual_global_horizontal_irradiation": {
+              "mean": {"kilowatt_hours_per_square_meter": 1500.0},
+              "low": {"kilowatt_hours_per_square_meter": 1500.0},
+              "high": {"kilowatt_hours_per_square_meter": 1500.0},
+              "half_spread": {"kilowatt_hours_per_square_meter": 0.0},
+              "spread_fraction": 0.0
+            },
+            "monthly_estimates": [
+              {
+                "month": 1,
+                "energy": {
+                  "mean": {"watt_hours": 100000.0},
+                  "low": {"watt_hours": 100000.0},
+                  "high": {"watt_hours": 100000.0},
+                  "half_spread": {"watt_hours": 0.0},
+                  "spread_fraction": 0.0
+                },
+                "in_plane_irradiation": {
+                  "mean": {"kilowatt_hours_per_square_meter": 120.0},
+                  "low": {"kilowatt_hours_per_square_meter": 120.0},
+                  "high": {"kilowatt_hours_per_square_meter": 120.0},
+                  "half_spread": {"kilowatt_hours_per_square_meter": 0.0},
+                  "spread_fraction": 0.0
+                },
+                "global_horizontal_irradiation": {
+                  "mean": {"kilowatt_hours_per_square_meter": 100.0},
+                  "low": {"kilowatt_hours_per_square_meter": 100.0},
+                  "high": {"kilowatt_hours_per_square_meter": 100.0},
+                  "half_spread": {"kilowatt_hours_per_square_meter": 0.0},
+                  "spread_fraction": 0.0
+                }
+              }
+            ]
+          },
+          "references": {}
+        }
+        "#;
+
+        let document: SourceEnsembleEstimateDocument =
+            serde_json::from_str(json).expect("estimate JSON matches core contract");
+
+        assert_eq!(document.schema_version, 1);
+        assert_eq!(document.location.location_id, "it_potenza_user");
+        assert_eq!(document.coverage.applicable_sources.len(), 3);
+        assert_eq!(document.ensemble_estimate.monthly_estimates.len(), 1);
+        assert_eq!(
+            document
+                .ensemble_estimate
+                .annual_energy
+                .mean
+                .as_kilowatt_hours(),
+            1450.0
+        );
     }
 
     #[test]

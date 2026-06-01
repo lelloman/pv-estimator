@@ -25,6 +25,12 @@ The checked-in location lists are:
 Generated raw and normalized data goes under `runs/`, which is ignored by git.
 Run summaries that are small enough for review go under `results/`.
 
+The current three source models can be rebuilt from the documented process in:
+
+```text
+experiments/ml-weather/SOURCE_MODEL_REPRODUCTION.md
+```
+
 ## Auxiliary Geography
 
 Auxiliary geography data is collected separately from hourly weather records and
@@ -100,6 +106,184 @@ python3 experiments/ml-weather/scripts/train_weather_mlp_torch.py \
   --learning-rate 0.001 \
   --resident-device
 ```
+
+
+## PVGIS Source Ensemble Data
+
+PVGIS is used as a data gateway for additional source models, not as a single
+source. The first configured PVGIS radiation databases are listed in
+`config/pvgis_source_databases.json`:
+
+- `PVGIS-ERA5`: global reanalysis source
+- `PVGIS-SARAH3`: satellite-derived source where PVGIS coverage exists
+
+NSRDB is parked for now. The direct downloader/normalizer scaffolding remains in
+the repository, but NSRDB is not part of the active source-ensemble collection.
+
+Use the `seriescalc` endpoint for hourly data. The collector requests a
+horizontal plane with radiation components (`angle=0`, `components=1`) so the
+normalizer can map PVGIS output into the same canonical schema used for NASA:
+
+- `G(i)` -> `ghi_w_m2`
+- `Gd(i)` -> `dhi_w_m2`
+- `Gb(i) / sin(H_sun)` -> `dni_w_m2`
+- `T2m` -> `ambient_temperature_c`
+- `WS10m` -> `wind_speed_m_s` with `wind_speed_height_m = 10`
+
+PVGIS publishes a high request-per-second limit, but full hourly downloads are
+large. Keep source-model pulls polite and resumable: one worker, a delay, and
+per-file caching. Coverage misses such as SARAH3 outside its supported area are
+stored as `.error.json` records and do not stop the run.
+
+Smoke download one location/year for ERA5:
+
+```sh
+python3 experiments/ml-weather/scripts/download_pvgis_series.py \
+  --locations experiments/ml-weather/config/pvgis_benchmark_locations.csv \
+  --out-dir experiments/ml-weather/runs/pvgis_series_smoke/raw \
+  --databases PVGIS-ERA5 \
+  --start-year 2023 \
+  --end-year 2023 \
+  --limit 1 \
+  --workers 1 \
+  --request-delay-seconds 2 \
+  --request-jitter-seconds 1
+```
+
+Normalize downloaded PVGIS JSON into canonical CSV:
+
+```sh
+python3 experiments/ml-weather/scripts/normalize_pvgis_series.py \
+  --raw-dir experiments/ml-weather/runs/pvgis_series_smoke/raw \
+  --out experiments/ml-weather/runs/pvgis_series_smoke/normalized/pvgis_series.csv.gz
+```
+
+
+Generate the first land/near-coast source-ensemble location set from the existing
+auxiliary geography table:
+
+```sh
+python3 experiments/ml-weather/scripts/generate_source_ensemble_locations.py   --target 2000   --out experiments/ml-weather/config/source_ensemble_locations_2000.csv
+```
+
+The generated CSV is intended for PVGIS source coverage probes and later full
+source-model collection. It keeps open-ocean points out of the PVGIS workload and
+adds `region`, `split_hint`, and `land_context` metadata.
+
+A one-year coverage probe can use the same downloader with `--start-year 2023`
+and `--end-year 2023`; this is much smaller than the full 2005-2023 collection
+and should be run before the full pull.
+
+A small multi-source run over the benchmark locations can use:
+
+```sh
+python3 experiments/ml-weather/scripts/download_pvgis_series.py \
+  --locations experiments/ml-weather/config/pvgis_benchmark_locations.csv \
+  --out-dir experiments/ml-weather/runs/pvgis_series_benchmark/raw \
+  --databases PVGIS-ERA5,PVGIS-SARAH3 \
+  --start-year 2005 \
+  --end-year 2023 \
+  --workers 1 \
+  --request-delay-seconds 2 \
+  --request-jitter-seconds 1
+```
+
+
+Build source-specific coverage lists from PVGIS coverage manifests:
+
+```sh
+python3 experiments/ml-weather/scripts/build_source_coverage_lists.py   --locations experiments/ml-weather/config/source_ensemble_locations_2000.csv   --manifest experiments/ml-weather/runs/source_ensemble_2000_coverage_2023/vps-eu/manifest.json   --manifest experiments/ml-weather/runs/source_ensemble_2000_coverage_2023/vps-us/manifest.json   --out-dir experiments/ml-weather/config/source_coverage
+```
+
+The generated lists avoid known PVGIS coverage misses during full collection:
+
+- `source_coverage/pvgis_era5_locations.csv`
+- `source_coverage/pvgis_sarah3_locations.csv`
+
+PVGIS-NSRDB did not return coverage in the probe. Direct NSRDB PSM3 support is
+parked for now; if it is resumed later, direct NSRDB access requires an API key
+and contact metadata:
+
+```sh
+export NSRDB_API_KEY=...
+export NSRDB_EMAIL=you@example.com
+export NSRDB_FULL_NAME="Your Name"
+export NSRDB_AFFILIATION="pv-estimator"
+
+python3 experiments/ml-weather/scripts/download_nsrdb_psm3.py   --locations experiments/ml-weather/config/source_coverage/nsrdb_direct_americas_locations.csv   --out-dir experiments/ml-weather/runs/nsrdb_psm3/raw   --start-year 2023   --end-year 2023   --workers 1   --request-delay-seconds 1   --request-jitter-seconds 0.5
+
+python3 experiments/ml-weather/scripts/normalize_nsrdb_psm3.py   --raw-dir experiments/ml-weather/runs/nsrdb_psm3/raw   --out experiments/ml-weather/runs/nsrdb_psm3/normalized/nsrdb_psm3.csv.gz
+```
+
+Direct NSRDB API limits are lower than PVGIS for the general API. Keep one worker
+and cache every point/year response. The direct CSV endpoint is appropriate for the
+first Americas-only source model; a future multipoint POST downloader can reduce
+request count if needed.
+
+The SARAH3 coverage probe also generated empirical coverage metadata:
+
+- `source_coverage/pvgis_sarah3_locations.csv`: covered sampled locations
+- `source_coverage/pvgis_sarah3_empirical_boxes.json`: coarse region boxes
+- `source_coverage/pvgis_sarah3_empirical_grid_mask.json`: row-interval applicability mask
+
+Use the grid mask as the first deterministic applicability check for prediction.
+It is project-defined and based on the coverage probe, not an official SARAH3
+polygon. For new production regions near the boundary, query PVGIS once and cache
+the result before expanding the mask.
+
+Generated PVGIS raw and normalized data stays under `runs/` and is not committed.
+Commit only small manifests, summaries, and result notes when they are useful for
+review.
+
+
+## Source Ensemble Inference
+
+The first trained source-model registry is:
+
+```text
+experiments/ml-weather/config/source_model_registry.json
+```
+
+It records the active source models, external checkpoint paths, coverage rules,
+and validation metrics. The current active inference sources are NASA POWER,
+PVGIS-ERA5, and PVGIS-SARAH3. SARAH3 must be gated by:
+
+```text
+experiments/ml-weather/config/source_coverage/pvgis_sarah3_empirical_grid_mask.json
+```
+
+Run the source ensemble on `rtx.homelab`, where the checkpoints live:
+
+```sh
+cd ~/pv-estimator-gpu
+.venv/bin/python scripts/infer_source_ensemble.py \
+  --locations config/pvgis_benchmark_locations.csv \
+  --fetch-pvgis \
+  --sarah3-mask config/source_coverage/pvgis_sarah3_empirical_grid_mask.json \
+  --nasa-checkpoint results/full_climate_normals_compressor_holdout_768x8/best_model.pt \
+  --era5-checkpoint results/pvgis_era5_climate_normals_compressor_768x8/best_model.pt \
+  --sarah3-checkpoint results/pvgis_sarah3_climate_normals_compressor_768x8/best_model.pt \
+  --out-csv runs/source_ensemble_validation/pvgis_benchmark_30.csv \
+  --out-json runs/source_ensemble_validation/pvgis_benchmark_30.summary.json
+```
+
+The first benchmark result is summarized in:
+
+```text
+experiments/ml-weather/results/2026-06-01_source_ensemble_validation.md
+```
+
+For a one-off annual/monthly estimate, pass coordinates directly and request the
+Rust-compatible estimate JSON payload:
+
+```sh
+cd ~/pv-estimator-gpu
+.venv/bin/python scripts/infer_source_ensemble.py   --lat 40.650   --lon 15.643   --location-id it_potenza_user   --name Potenza   --region Italy   --fetch-pvgis   --sarah3-mask config/source_coverage/pvgis_sarah3_empirical_grid_mask.json   --nasa-checkpoint results/full_climate_normals_compressor_holdout_768x8/best_model.pt   --era5-checkpoint results/pvgis_era5_climate_normals_compressor_768x8/best_model.pt   --sarah3-checkpoint results/pvgis_sarah3_climate_normals_compressor_768x8/best_model.pt   --out-csv runs/source_ensemble_single/potenza.csv   --out-json runs/source_ensemble_single/potenza.summary.json   --out-estimate-json runs/source_ensemble_single/potenza.estimate.json
+```
+
+The `--out-estimate-json` payload uses the `SourceEnsembleEstimateDocument`
+shape from `pv-core`, with annual and monthly mean/low/high bands plus the source
+models used for the estimate.
 
 ## Commands
 
