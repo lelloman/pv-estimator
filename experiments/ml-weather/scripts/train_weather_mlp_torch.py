@@ -48,7 +48,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cache-dir", type=Path, default=None)
+    parser.add_argument("--input-cache", type=Path, default=None, help="explicit cached tensor .npz to load instead of resolving cache-dir")
+    parser.add_argument("--zero-aux-width", type=int, default=0, help="append this many zero-valued auxiliary features to an explicit input cache")
     parser.add_argument("--aux-features", type=Path, default=None, help="location-level auxiliary feature CSV keyed by location_id")
+    parser.add_argument("--aux-include-prefixes", default=None, help="comma-separated aux column prefixes to keep, e.g. etopo_,cci_")
+    parser.add_argument("--aux-clip-abs", type=float, default=None, help="clip auxiliary input columns to +/- this value after normalization")
     parser.add_argument(
         "--aux-exclude-columns",
         default="location_id,name,latitude,longitude,region,cci_point_class",
@@ -79,6 +83,7 @@ def main() -> int:
     args.out_dir.mkdir(parents=True, exist_ok=True)
     hidden_layers = parse_hidden_layers(args)
     validate_architecture_args(args)
+    validate_feature_args(args)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
@@ -87,12 +92,21 @@ def main() -> int:
     if device.type == "cuda":
         print(f"gpu={torch.cuda.get_device_name(0)}")
 
-    aux_features = load_aux_features(args.aux_features, args.aux_exclude_columns)
-    input_features = BASE_INPUTS + aux_features.width
-    print(f"input_features={input_features} base_features={BASE_INPUTS} aux_features={aux_features.width}")
+    aux_features = load_aux_features(args.aux_features, args.aux_exclude_columns, args.aux_include_prefixes)
+    input_features = BASE_INPUTS + aux_features.width + args.zero_aux_width
+    print(
+        f"input_features={input_features} base_features={BASE_INPUTS} "
+        f"aux_features={aux_features.width} zero_aux_width={args.zero_aux_width}"
+    )
 
     started = time.time()
     train_x, train_y, val_x, val_y = load_or_build_samples(args, aux_features, input_features)
+    if train_x.shape[1] != input_features:
+        if args.input_cache is None or aux_features.width or args.zero_aux_width:
+            raise RuntimeError(f"loaded feature width {train_x.shape[1]} does not match expected {input_features}")
+        input_features = int(train_x.shape[1])
+        print(f"using explicit cache feature width={input_features}", flush=True)
+    apply_aux_clip(train_x, val_x, args.aux_clip_abs)
     print(f"loaded train_rows={len(train_x)} val_rows={len(val_x)} in {time.time() - started:.1f}s")
 
     target_mean = train_y.mean(axis=0).astype(np.float32)
@@ -174,6 +188,10 @@ def main() -> int:
         "aux_features_path": str(args.aux_features) if args.aux_features else None,
         "aux_feature_count": aux_features.width,
         "aux_feature_columns": aux_features.columns,
+        "aux_include_prefixes": args.aux_include_prefixes,
+        "aux_clip_abs": args.aux_clip_abs,
+        "zero_aux_width": args.zero_aux_width,
+        "input_cache": str(args.input_cache) if args.input_cache else None,
         "hidden_width": args.hidden_width,
         "hidden_layers": hidden_layers,
         "residual_width": args.residual_width,
@@ -215,6 +233,10 @@ def main() -> int:
             "aux_features_path": str(args.aux_features) if args.aux_features else None,
             "aux_feature_count": aux_features.width,
             "aux_feature_columns": aux_features.columns,
+            "aux_include_prefixes": args.aux_include_prefixes,
+            "aux_clip_abs": args.aux_clip_abs,
+            "zero_aux_width": args.zero_aux_width,
+            "input_cache": str(args.input_cache) if args.input_cache else None,
         },
         args.out_dir / "model.pt",
     )
@@ -230,6 +252,17 @@ def validate_architecture_args(args: argparse.Namespace) -> None:
         raise ValueError("--residual-blocks must be positive")
     if args.residual_scale <= 0:
         raise ValueError("--residual-scale must be positive")
+
+
+def validate_feature_args(args: argparse.Namespace) -> None:
+    if args.zero_aux_width < 0:
+        raise ValueError("--zero-aux-width must be non-negative")
+    if args.zero_aux_width and args.aux_features is not None:
+        raise ValueError("--zero-aux-width and --aux-features are mutually exclusive")
+    if args.aux_clip_abs is not None and args.aux_clip_abs <= 0:
+        raise ValueError("--aux-clip-abs must be positive")
+    if args.zero_aux_width and args.input_cache is None:
+        raise ValueError("--zero-aux-width requires --input-cache")
 
 
 def build_model(args: argparse.Namespace, hidden_layers: list[int], input_features: int) -> nn.Module:
@@ -295,6 +328,9 @@ def pinball_loss(predictions: torch.Tensor, targets: torch.Tensor, quantiles: to
 def load_or_build_samples(
     args: argparse.Namespace, aux_features: "AuxFeatureSet", input_features: int
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    if args.input_cache is not None:
+        return load_explicit_cache(args, input_features)
+
     if args.cache_dir is None:
         return load_samples(args, aux_features, input_features)
 
@@ -319,6 +355,60 @@ def load_or_build_samples(
         val_y=val_y,
     )
     return train_x, train_y, val_x, val_y
+
+
+def load_explicit_cache(args: argparse.Namespace, input_features: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    print(f"loading explicit tensor cache from {args.input_cache}")
+    cached = np.load(args.input_cache)
+    train_x = cached["train_x"][: args.train_limit]
+    train_y = cached["train_y"][: args.train_limit]
+    val_x = cached["val_x"][: args.val_limit]
+    val_y = cached["val_y"][: args.val_limit]
+    if args.aux_features is not None:
+        aux_features = load_aux_features(args.aux_features, args.aux_exclude_columns, args.aux_include_prefixes)
+        print(f"appending auxiliary features width={aux_features.width}", flush=True)
+        train_x = append_aux_by_coordinate(train_x, aux_features, "train_x")
+        val_x = append_aux_by_coordinate(val_x, aux_features, "val_x")
+    if args.zero_aux_width:
+        print(f"appending zero auxiliary features width={args.zero_aux_width}", flush=True)
+        train_x = append_zero_features(train_x, args.zero_aux_width)
+        val_x = append_zero_features(val_x, args.zero_aux_width)
+    if train_x.shape[1] != val_x.shape[1]:
+        raise RuntimeError(f"cache feature width mismatch: train={train_x.shape[1]} val={val_x.shape[1]}")
+    if train_x.shape[1] != input_features:
+        if args.aux_features is None and args.zero_aux_width == 0:
+            print(f"explicit cache provides feature width={train_x.shape[1]} expected={input_features}", flush=True)
+        else:
+            raise RuntimeError(
+                f"cache feature width mismatch: train={train_x.shape[1]} val={val_x.shape[1]} expected={input_features}"
+            )
+    return train_x, train_y, val_x, val_y
+
+
+def append_zero_features(values: np.ndarray, width: int) -> np.ndarray:
+    output = np.zeros((values.shape[0], values.shape[1] + width), dtype=np.float32)
+    output[:, : values.shape[1]] = values
+    return output
+
+
+def append_aux_by_coordinate(values: np.ndarray, aux_features: "AuxFeatureSet", name: str) -> np.ndarray:
+    output = np.empty((values.shape[0], values.shape[1] + aux_features.width), dtype=np.float32)
+    output[:, : values.shape[1]] = values
+    for index, row in enumerate(values):
+        lat = float(row[0]) * 90.0
+        lon = float(row[1]) * 180.0
+        output[index, values.shape[1] :] = aux_features.for_lat_lon(lat, lon)
+        if (index + 1) % 1_000_000 == 0 or index + 1 == values.shape[0]:
+            print(f"{name} append_aux {index + 1}/{values.shape[0]}", flush=True)
+    return output
+
+
+def apply_aux_clip(train_x: np.ndarray, val_x: np.ndarray, clip_abs: float | None) -> None:
+    if clip_abs is None or train_x.shape[1] <= BASE_INPUTS:
+        return
+    print(f"clipping auxiliary inputs to +/-{clip_abs}", flush=True)
+    np.clip(train_x[:, BASE_INPUTS:], -clip_abs, clip_abs, out=train_x[:, BASE_INPUTS:])
+    np.clip(val_x[:, BASE_INPUTS:], -clip_abs, clip_abs, out=val_x[:, BASE_INPUTS:])
 
 
 def load_samples(
@@ -450,9 +540,16 @@ def parse_training_row(row: list[str], aux_features: "AuxFeatureSet") -> tuple[n
 
 
 class AuxFeatureSet:
-    def __init__(self, columns: list[str], by_location: dict[str, np.ndarray], cache_key: str) -> None:
+    def __init__(
+        self,
+        columns: list[str],
+        by_location: dict[str, np.ndarray],
+        by_coord: dict[tuple[int, int], np.ndarray],
+        cache_key: str,
+    ) -> None:
         self.columns = columns
         self.by_location = by_location
+        self.by_coord = by_coord
         self.cache_key = cache_key
         self.width = len(columns)
         self._empty = np.empty((0,), dtype=np.float32)
@@ -465,23 +562,37 @@ class AuxFeatureSet:
         except KeyError as exc:
             raise KeyError(f"aux features missing location_id={location_id}") from exc
 
+    def for_lat_lon(self, lat: float, lon: float) -> np.ndarray:
+        if self.width == 0:
+            return self._empty
+        key = coord_key(lat, lon)
+        try:
+            return self.by_coord[key]
+        except KeyError as exc:
+            raise KeyError(f"aux features missing lat={lat:.6f} lon={lon:.6f} key={key}") from exc
 
-def load_aux_features(path: Path | None, exclude_columns: str) -> AuxFeatureSet:
+
+def load_aux_features(path: Path | None, exclude_columns: str, include_prefixes: str | None) -> AuxFeatureSet:
     if path is None:
-        return AuxFeatureSet([], {}, "none")
+        return AuxFeatureSet([], {}, {}, "none")
 
     excluded = {column.strip() for column in exclude_columns.split(",") if column.strip()}
+    prefixes = tuple(prefix.strip() for prefix in include_prefixes.split(",") if prefix.strip()) if include_prefixes else ()
     with path.open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         if reader.fieldnames is None or "location_id" not in reader.fieldnames:
             raise ValueError("aux feature CSV must contain a location_id column")
         columns = [column for column in reader.fieldnames if column not in excluded]
+        if prefixes:
+            columns = [column for column in columns if column.startswith(prefixes)]
         if not columns:
             raise ValueError("aux feature CSV has no usable columns after exclusions")
         location_ids: list[str] = []
+        coords: list[tuple[int, int]] = []
         matrix_rows: list[list[float]] = []
         for row in reader:
             location_ids.append(row["location_id"])
+            coords.append(coord_key(float(row["latitude"]), float(row["longitude"])))
             matrix_rows.append([float(row[column]) for column in columns])
 
     matrix = np.array(matrix_rows, dtype=np.float32)
@@ -490,12 +601,17 @@ def load_aux_features(path: Path | None, exclude_columns: str) -> AuxFeatureSet:
     std = np.maximum(std, 1e-6).astype(np.float32)
     normalized = (matrix - mean) / std
     by_location = {location_id: normalized[index] for index, location_id in enumerate(location_ids)}
+    by_coord = {coord: normalized[index] for index, coord in enumerate(coords)}
     digest = hashlib.sha256()
     digest.update(path.read_bytes())
     digest.update(",".join(columns).encode("utf-8"))
     cache_key = digest.hexdigest()[:12]
     print(f"loaded aux_features path={path} rows={len(location_ids)} columns={len(columns)} cache_key={cache_key}")
-    return AuxFeatureSet(columns, by_location, cache_key)
+    return AuxFeatureSet(columns, by_location, by_coord, cache_key)
+
+
+def coord_key(lat: float, lon: float) -> tuple[int, int]:
+    return int(round(lat * 1000.0)), int(round(lon * 1000.0))
 
 
 def parse_grid_number(location_id: str) -> int | None:
