@@ -21,6 +21,7 @@ EARTH_RADIUS_KM = 6371.0088
 DEFAULT_SOURCES = Path("experiments/ml-weather/config/aux_geography_sources.json")
 DEFAULT_SOURCES_DIR = Path("experiments/ml-weather/runs/aux_geography/sources")
 DEFAULT_FEATURE_OUT = Path("experiments/ml-weather/runs/global_grid_7056/aux_geography/location_features_v1.csv")
+DEFAULT_PATCH_OUT = Path("experiments/ml-weather/runs/global_grid_7056/aux_geography/location_patches_r250km_64px_v1.npz")
 
 SECTOR_NAMES = ["n", "ne", "e", "se", "s", "sw", "w", "nw"]
 CCI_GROUPS: dict[str, set[int]] = {
@@ -55,6 +56,16 @@ def parse_args() -> argparse.Namespace:
     features.add_argument("--patch-pixels", type=int, default=128)
     features.add_argument("--sectors", type=int, default=8)
     features.add_argument("--progress-every", type=int, default=100)
+
+    patches = subparsers.add_parser("patches")
+    patches.add_argument("--locations", type=Path, default=Path("experiments/ml-weather/config/global_grid_7056_locations.csv"))
+    patches.add_argument("--sources", type=Path, default=DEFAULT_SOURCES)
+    patches.add_argument("--sources-dir", type=Path, default=DEFAULT_SOURCES_DIR)
+    patches.add_argument("--out", type=Path, default=DEFAULT_PATCH_OUT)
+    patches.add_argument("--limit", type=int, default=None)
+    patches.add_argument("--radius-km", type=float, default=250.0)
+    patches.add_argument("--patch-pixels", type=int, default=64)
+    patches.add_argument("--progress-every", type=int, default=100)
     return parser.parse_args()
 
 
@@ -64,6 +75,8 @@ def main() -> int:
         download_sources(args)
     elif args.command == "features":
         build_features(args)
+    elif args.command == "patches":
+        build_patches(args)
     else:
         raise ValueError(f"unknown command: {args.command}")
     return 0
@@ -142,6 +155,73 @@ def build_features(args: argparse.Namespace) -> None:
                     rate = index / max(elapsed, 0.001)
                     remaining = (len(locations) - index) / max(rate, 0.001)
                     print(f"features {index}/{len(locations)} rate={rate:.2f}/s eta={remaining/60:.1f}m", flush=True)
+    tmp_out.replace(args.out)
+    print(f"wrote {args.out}")
+
+
+def build_patches(args: argparse.Namespace) -> None:
+    if args.radius_km <= 0:
+        raise ValueError("--radius-km must be positive")
+    if args.patch_pixels <= 0:
+        raise ValueError("--patch-pixels must be positive")
+
+    sources = {str(source["id"]): args.sources_dir / str(source["filename"]) for source in load_sources(args.sources)}
+    locations = read_locations(args.locations)
+    if args.limit is not None:
+        locations = locations[: args.limit]
+
+    missing = [path for path in sources.values() if not path.exists()]
+    if missing:
+        missing_text = "\n".join(str(path) for path in missing)
+        raise FileNotFoundError(f"missing source rasters; run download first:\n{missing_text}")
+
+    count = len(locations)
+    size = args.patch_pixels
+    elevation_patches = np.empty((count, size, size), dtype=np.float32)
+    terrain_patches = np.empty((count, size, size), dtype=np.uint8)
+    latitude = np.empty((count,), dtype=np.float32)
+    longitude = np.empty((count,), dtype=np.float32)
+    location_ids: list[str] = []
+    names: list[str] = []
+    regions: list[str] = []
+
+    started = time.time()
+    with rasterio.open(sources["noaa_etopo_2022_60s_bedrock"]) as etopo, rasterio.open(sources["esa_cci_lulc_2020_300m"]) as cci:
+        for index, location in enumerate(locations):
+            lat = float(location["latitude"])
+            lon = float(location["longitude"])
+            elevation, _, _ = read_radius_patch(etopo, lon, lat, args.radius_km, size, Resampling.bilinear)
+            terrain, _, _ = read_radius_patch(cci, lon, lat, args.radius_km, size, Resampling.nearest)
+            elevation_patches[index] = np.nan_to_num(elevation.astype(np.float32), nan=0.0)
+            terrain_patches[index] = np.clip(np.rint(terrain), 0, 255).astype(np.uint8)
+            latitude[index] = lat
+            longitude[index] = lon
+            location_ids.append(str(location["location_id"]))
+            names.append(str(location.get("name", "")))
+            regions.append(str(location.get("region", "")))
+
+            completed = index + 1
+            if completed == 1 or completed % args.progress_every == 0 or completed == count:
+                elapsed = time.time() - started
+                rate = completed / max(elapsed, 0.001)
+                remaining = (count - completed) / max(rate, 0.001)
+                print(f"patches {completed}/{count} rate={rate:.2f}/s eta={remaining/60:.1f}m", flush=True)
+
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    tmp_out = args.out.with_suffix(args.out.suffix + ".tmp")
+    with tmp_out.open("wb") as handle:
+        np.savez_compressed(
+            handle,
+            location_ids=np.array(location_ids),
+            names=np.array(names),
+            regions=np.array(regions),
+            latitude=latitude,
+            longitude=longitude,
+            radius_km=np.array(args.radius_km, dtype=np.float32),
+            patch_pixels=np.array(args.patch_pixels, dtype=np.int32),
+            elevation_m=elevation_patches,
+            terrain_class=terrain_patches,
+        )
     tmp_out.replace(args.out)
     print(f"wrote {args.out}")
 
@@ -251,14 +331,12 @@ def read_radius_patch(
     east = lon + lon_delta
 
     if west < -180.0:
-        left_width = int(round(patch_pixels * (-180.0 - west) / (east - west)))
-        right_width = patch_pixels - left_width
+        left_width, right_width = split_wrapped_widths(patch_pixels, (-180.0 - west) / (east - west))
         left = read_window(dataset, west + 360.0, 180.0, south, north, left_width, patch_pixels, resampling)
         right = read_window(dataset, -180.0, east, south, north, right_width, patch_pixels, resampling)
         values = np.concatenate([left, right], axis=1)
     elif east > 180.0:
-        left_width = int(round(patch_pixels * (180.0 - west) / (east - west)))
-        right_width = patch_pixels - left_width
+        left_width, right_width = split_wrapped_widths(patch_pixels, (180.0 - west) / (east - west))
         left = read_window(dataset, west, 180.0, south, north, left_width, patch_pixels, resampling)
         right = read_window(dataset, -180.0, east - 360.0, south, north, right_width, patch_pixels, resampling)
         values = np.concatenate([left, right], axis=1)
@@ -270,6 +348,12 @@ def read_radius_patch(
     lon_grid, lat_grid = np.meshgrid(lons, lats)
     lon_grid = wrap_lon_array(lon_grid)
     return values, lat_grid, lon_grid
+
+
+def split_wrapped_widths(patch_pixels: int, left_fraction: float) -> tuple[int, int]:
+    left_width = int(round(patch_pixels * left_fraction))
+    left_width = min(max(left_width, 1), patch_pixels - 1)
+    return left_width, patch_pixels - left_width
 
 
 def read_window(
