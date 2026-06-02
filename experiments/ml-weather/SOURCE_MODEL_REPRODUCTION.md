@@ -43,6 +43,7 @@ experiments/ml-weather/scripts/normalize_pvgis_series.py
 experiments/ml-weather/scripts/build_climate_normals.rs
 experiments/ml-weather/scripts/train_climate_normals_stream_torch.py
 experiments/ml-weather/scripts/infer_source_ensemble.py
+experiments/ml-weather/scripts/export_source_models_onnx.py
 experiments/ml-weather/scripts/build_source_coverage_lists.py
 experiments/ml-weather/scripts/generate_source_ensemble_locations.py
 ```
@@ -257,6 +258,80 @@ if a different PyTorch/CUDA version changes deterministic behavior, or if the
 random seed changes. The important acceptance target is that the rebuilt ensemble
 stays in the same error range and remains better than the single-source models.
 
+## ONNX Runtime Artifacts
+
+Production inference uses ONNX Runtime on CPU. PyTorch remains an experiment and
+export dependency only. The default runtime artifacts are dynamically quantized
+QInt8 ONNX models using per-tensor weight quantization for `MatMul`/`Gemm` ops.
+Do not use per-channel quantization for this model family; the SARAH3 model loses
+several percent of annual PV precision with that setting.
+
+After the three `best_model.pt` checkpoints exist, export the runtime artifact
+directory with:
+
+```sh
+.venv/bin/python scripts/export_source_models_onnx.py \
+  --nasa-checkpoint results/full_climate_normals_compressor_holdout_768x8/best_model.pt \
+  --era5-checkpoint results/pvgis_era5_climate_normals_compressor_768x8/best_model.pt \
+  --sarah3-checkpoint results/pvgis_sarah3_climate_normals_compressor_768x8/best_model.pt \
+  --sarah3-mask config/source_coverage/pvgis_sarah3_empirical_grid_mask.json \
+  --out-dir artifacts/source-models-768x8-int8
+```
+
+The output directory contains:
+
+```text
+source-model-artifacts.json
+nasa_power.onnx
+pvgis_era5.onnx
+pvgis_sarah3.onnx
+coverage/pvgis_sarah3_empirical_grid_mask.json
+```
+
+`source-model-artifacts.json` records source ids, ONNX paths, SHA-256 checksums,
+coverage rules, target normalization stats, quantization settings,
+PyTorch-vs-FP32-ONNX parity, and FP32-ONNX-vs-INT8 reference deltas. Do not
+commit this directory unless a separate artifact policy changes.
+
+The current exported INT8 bundle is about 28 MiB. Each INT8 ONNX model is about
+9.65 MiB, roughly 25.3% of the FP32 ONNX size.
+
+Measured FP32 ONNX vs INT8 ONNX PV-output deltas:
+
+```text
+Italy 50:
+  annual ensemble MAE:   0.054%
+  annual max abs error:  0.127%
+  monthly ensemble MAE:  0.117%
+  monthly p95 abs:       0.385%
+
+Regional 120:
+  annual ensemble MAE:   0.092%
+  annual max abs error:  0.404%
+  monthly ensemble MAE:  0.150%
+  monthly p95 abs:       0.422%
+```
+
+Run the production CLI against the exported directory:
+
+```sh
+cargo run -p pv-cli -- estimate \
+  --lat 40.650 \
+  --lon 15.643 \
+  --location-id it_potenza_user \
+  --name Potenza \
+  --region Italy \
+  --kwp 1 \
+  --loss-pct 14 \
+  --tilt-deg 30 \
+  --azimuth-deg 0 \
+  --model-dir artifacts/source-models-768x8-int8 \
+  --format table
+```
+
+The CLI emits annual/monthly estimates only. The month-hour climate-normal model
+outputs are internal inputs to the annual/monthly PV aggregation layer.
+
 ## Artifact Policy
 
 Commit:
@@ -276,6 +351,7 @@ raw source JSON
 normalized hourly CSV.gz
 climate-normal `.npy` tables
 PyTorch `.pt` checkpoints
+ONNX runtime artifacts unless explicitly published as release artifacts
 large benchmark output under runs/
 ```
 

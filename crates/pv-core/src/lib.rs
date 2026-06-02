@@ -28,8 +28,9 @@ pub mod prelude {
         load_project_json, save_project_json,
     };
     pub use crate::source_model::{
-        AnnualPvEnsembleEstimate, ClimateNormalTarget, EnergyEstimateBand, EstimateCoverage,
-        EstimateLocation, EstimateSystem, Irradiation, IrradiationEstimateBand, MonthOfYear,
+        AnnualPvEnsembleEstimate, CalibratedEnergyBand, CalibratedIrradiationBand,
+        ClimateNormalTarget, EnergyEstimateBand, EstimateCoverage, EstimateLocation,
+        EstimateSystem, EstimateUncertainty, Irradiation, IrradiationEstimateBand, MonthOfYear,
         MonthlyPvEnsembleEstimate, SourceAnnualPvEstimate, SourceEnsembleEstimateDocument,
         SourceModelCoverage, SourceModelMetadata, SourceModelRegistry, SourceMonthlyPvEstimate,
     };
