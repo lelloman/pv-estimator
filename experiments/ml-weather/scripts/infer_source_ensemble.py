@@ -28,6 +28,8 @@ MONTH_DAYS = np.array([31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31], dtype=np
 MID_MONTH_DOY = np.array([15, 46, 74, 105, 135, 166, 196, 227, 258, 288, 319, 349], dtype=np.float64)
 PVGIS_API = "https://re.jrc.ec.europa.eu/api/v5_3/PVcalc"
 DEFAULT_DATABASES = ["PVGIS-SARAH3", "PVGIS-ERA5"]
+UNCERTAINTY_MULTIPLIER = 2.0
+
 TARGET_NAMES = [
     "ghi_mean_w_m2",
     "dni_mean_w_m2",
@@ -489,6 +491,10 @@ def build_estimate_document(
     sarah3_applicable: bool,
 ) -> dict[str, Any]:
     source_estimates = [source_estimate_document(source_id, prediction) for source_id, prediction in predictions.items()]
+    source_count = len(predictions)
+    annual_energy = energy_band(prediction["energy_kwh"] for prediction in predictions.values())
+    annual_poa = irradiation_band(prediction["poa_kwh_m2"] for prediction in predictions.values())
+    annual_ghi = irradiation_band(prediction["ghi_kwh_m2"] for prediction in predictions.values())
     monthly_estimates = []
     for month in range(1, 13):
         monthly_source_estimates = [
@@ -498,12 +504,16 @@ def build_estimate_document(
             if int(monthly["month"]) == month
         ]
         if monthly_source_estimates:
+            monthly_energy = energy_band(monthly["energy_kwh"] for monthly in monthly_source_estimates)
+            monthly_poa = irradiation_band(monthly["poa_kwh_m2"] for monthly in monthly_source_estimates)
+            monthly_ghi = irradiation_band(monthly["ghi_kwh_m2"] for monthly in monthly_source_estimates)
             monthly_estimates.append(
                 {
                     "month": month,
-                    "energy": energy_band(monthly["energy_kwh"] for monthly in monthly_source_estimates),
-                    "in_plane_irradiation": irradiation_band(monthly["poa_kwh_m2"] for monthly in monthly_source_estimates),
-                    "global_horizontal_irradiation": irradiation_band(monthly["ghi_kwh_m2"] for monthly in monthly_source_estimates),
+                    "energy": monthly_energy,
+                    "in_plane_irradiation": monthly_poa,
+                    "global_horizontal_irradiation": monthly_ghi,
+                    "uncertainty": uncertainty_document(len(monthly_source_estimates), monthly_energy, monthly_poa, monthly_ghi),
                 }
             )
 
@@ -528,9 +538,10 @@ def build_estimate_document(
         },
         "ensemble_estimate": {
             "source_estimates": source_estimates,
-            "annual_energy": energy_band(prediction["energy_kwh"] for prediction in predictions.values()),
-            "annual_in_plane_irradiation": irradiation_band(prediction["poa_kwh_m2"] for prediction in predictions.values()),
-            "annual_global_horizontal_irradiation": irradiation_band(prediction["ghi_kwh_m2"] for prediction in predictions.values()),
+            "annual_energy": annual_energy,
+            "annual_in_plane_irradiation": annual_poa,
+            "annual_global_horizontal_irradiation": annual_ghi,
+            "uncertainty": uncertainty_document(source_count, annual_energy, annual_poa, annual_ghi),
             "monthly_estimates": monthly_estimates,
         },
         "references": reference_document(references),
@@ -596,6 +607,39 @@ def irradiation_band(values: Any) -> dict[str, Any]:
         "high": irradiation(band["high"]),
         "half_spread": irradiation(band["half_spread"]),
         "spread_fraction": band["spread_fraction"],
+    }
+
+
+def uncertainty_document(source_count: int, energy_raw: dict[str, Any], poa_raw: dict[str, Any], ghi_raw: dict[str, Any]) -> dict[str, Any]:
+    calibrated = source_count >= 2
+    return {
+        "method": "source_spread_multiplier" if calibrated else "insufficient_sources",
+        "multiplier": UNCERTAINTY_MULTIPLIER,
+        "source_count": source_count,
+        "calibrated": calibrated,
+        "annual_energy": calibrated_energy_band(energy_raw) if calibrated else None,
+        "annual_in_plane_irradiation": calibrated_irradiation_band(poa_raw) if calibrated else None,
+        "annual_global_horizontal_irradiation": calibrated_irradiation_band(ghi_raw) if calibrated else None,
+    }
+
+
+def calibrated_energy_band(raw: dict[str, Any]) -> dict[str, Any]:
+    mean = raw["mean"]["watt_hours"]
+    half_width = raw["half_spread"]["watt_hours"] * UNCERTAINTY_MULTIPLIER
+    return {
+        "low": {"watt_hours": max(0.0, mean - half_width)},
+        "high": {"watt_hours": mean + half_width},
+        "half_width": {"watt_hours": half_width},
+    }
+
+
+def calibrated_irradiation_band(raw: dict[str, Any]) -> dict[str, Any]:
+    mean = raw["mean"]["kilowatt_hours_per_square_meter"]
+    half_width = raw["half_spread"]["kilowatt_hours_per_square_meter"] * UNCERTAINTY_MULTIPLIER
+    return {
+        "low": {"kilowatt_hours_per_square_meter": max(0.0, mean - half_width)},
+        "high": {"kilowatt_hours_per_square_meter": mean + half_width},
+        "half_width": {"kilowatt_hours_per_square_meter": half_width},
     }
 
 

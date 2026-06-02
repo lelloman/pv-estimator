@@ -12,9 +12,10 @@
 - Phase 8: Data Import Tooling - paused/reframed by ML research spike.
 - ML Research Spike - active in `ML_EXPERIMENT_PLAN.md`,
   `SOURCE_HARMONIZATION.md`, and `ML_MODEL_PLAN.md`.
-- Source Ensemble Rust Contract - initial implementation complete: `pv-core` has
-  typed source-model metadata and annual/monthly uncertainty bands; `pv-data`
-  exposes the NASA POWER, PVGIS-ERA5, and PVGIS-SARAH3 registry.
+- Source Ensemble Runtime Integration - initial implementation complete: `pv-core`
+  has typed source-model metadata and calibrated annual/monthly uncertainty
+  bands; `pv-data` exposes the NASA POWER, PVGIS-ERA5, and PVGIS-SARAH3
+  registry; `pv-cli estimate` consumes exported INT8 ONNX source-model artifacts.
 
 ## 1. Documentation Baseline
 
@@ -225,25 +226,30 @@ Acceptance criteria:
 Goal: make the validated ML source-ensemble experiment consumable by application
 code without coupling production crates to PyTorch or training artifacts.
 
-Status: initial Rust contract complete.
+Status: initial INT8 ONNX CLI integration complete; real artifacts were exported
+from the current `.pt` checkpoints and backed up outside git.
 
 Tasks:
 
 - Define typed source-model registry and coverage rules in `pv-core`.
-- Define typed annual/monthly source estimates and ensemble disagreement bands in
-  `pv-core`.
+- Define typed annual/monthly source estimates, raw disagreement bands, and
+  calibrated displayed uncertainty bands in `pv-core`.
 - Expose the current NASA POWER, PVGIS-ERA5, and PVGIS-SARAH3 model metadata
   from `pv-data`.
-- Keep checkpoint execution in experiment tooling until runtime packaging is
-  decided.
-- Next: add an application-facing inference adapter that converts experiment
-  script output into `AnnualPvEnsembleEstimate`.
+- Keep checkpoint execution in experiment tooling; production inference uses ONNX
+  Runtime CPU execution through `pv-cli`.
+- Export `.pt` checkpoints to an external per-tensor QInt8 ONNX artifact
+  directory with checksums and parity metrics using
+  `export_source_models_onnx.py`.
 
 Acceptance criteria:
 
 - Rust code can represent source-model metadata and annual/monthly error bars
-  without depending on ML frameworks.
-- `cargo test --workspace` covers registry shape and uncertainty aggregation.
+  without depending on PyTorch.
+- `cargo test --workspace` covers registry shape, uncertainty aggregation, and
+  CLI feature/mask helpers.
+- `pv-cli estimate` reads `source-model-artifacts.json`, runs applicable INT8
+  ONNX source models on CPU, and emits table or Rust-compatible JSON output.
 - The current source ensemble validation remains linked from the ML experiment
   results.
 

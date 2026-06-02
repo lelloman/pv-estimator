@@ -138,6 +138,7 @@ pub struct AnnualPvEnsembleEstimate {
     pub annual_energy: EnergyEstimateBand,
     pub annual_in_plane_irradiation: IrradiationEstimateBand,
     pub annual_global_horizontal_irradiation: IrradiationEstimateBand,
+    pub uncertainty: EstimateUncertainty,
     pub monthly_estimates: Vec<MonthlyPvEnsembleEstimate>,
 }
 
@@ -147,6 +148,7 @@ pub struct MonthlyPvEnsembleEstimate {
     pub energy: EnergyEstimateBand,
     pub in_plane_irradiation: IrradiationEstimateBand,
     pub global_horizontal_irradiation: IrradiationEstimateBand,
+    pub uncertainty: EstimateUncertainty,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -167,33 +169,81 @@ pub struct IrradiationEstimateBand {
     pub spread_fraction: f64,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EstimateUncertainty {
+    pub method: UncertaintyMethod,
+    pub multiplier: f64,
+    pub source_count: u16,
+    pub calibrated: bool,
+    pub annual_energy: Option<CalibratedEnergyBand>,
+    pub annual_in_plane_irradiation: Option<CalibratedIrradiationBand>,
+    pub annual_global_horizontal_irradiation: Option<CalibratedIrradiationBand>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UncertaintyMethod {
+    SourceSpreadMultiplier,
+    InsufficientSources,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CalibratedEnergyBand {
+    pub low: Energy,
+    pub high: Energy,
+    pub half_width: Energy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CalibratedIrradiationBand {
+    pub low: Irradiation,
+    pub high: Irradiation,
+    pub half_width: Irradiation,
+}
+
 impl AnnualPvEnsembleEstimate {
     pub fn from_source_estimates(source_estimates: Vec<SourceAnnualPvEstimate>) -> Option<Self> {
+        Self::from_source_estimates_with_uncertainty(source_estimates, 2.0)
+    }
+
+    pub fn from_source_estimates_with_uncertainty(
+        source_estimates: Vec<SourceAnnualPvEstimate>,
+        uncertainty_multiplier: f64,
+    ) -> Option<Self> {
         if source_estimates.is_empty() {
             return None;
         }
 
+        let annual_energy = EnergyEstimateBand::from_values(
+            source_estimates
+                .iter()
+                .map(|estimate| estimate.annual_energy.as_kilowatt_hours()),
+        );
+        let annual_in_plane_irradiation =
+            IrradiationEstimateBand::from_values(source_estimates.iter().map(|estimate| {
+                estimate
+                    .annual_in_plane_irradiation
+                    .as_kilowatt_hours_per_square_meter()
+            }));
+        let annual_global_horizontal_irradiation =
+            IrradiationEstimateBand::from_values(source_estimates.iter().map(|estimate| {
+                estimate
+                    .annual_global_horizontal_irradiation
+                    .as_kilowatt_hours_per_square_meter()
+            }));
+
         Some(Self {
-            annual_energy: EnergyEstimateBand::from_values(
-                source_estimates
-                    .iter()
-                    .map(|estimate| estimate.annual_energy.as_kilowatt_hours()),
+            uncertainty: EstimateUncertainty::from_bands(
+                source_estimates.len(),
+                uncertainty_multiplier,
+                annual_energy,
+                annual_in_plane_irradiation,
+                annual_global_horizontal_irradiation,
             ),
-            annual_in_plane_irradiation: IrradiationEstimateBand::from_values(
-                source_estimates.iter().map(|estimate| {
-                    estimate
-                        .annual_in_plane_irradiation
-                        .as_kilowatt_hours_per_square_meter()
-                }),
-            ),
-            annual_global_horizontal_irradiation: IrradiationEstimateBand::from_values(
-                source_estimates.iter().map(|estimate| {
-                    estimate
-                        .annual_global_horizontal_irradiation
-                        .as_kilowatt_hours_per_square_meter()
-                }),
-            ),
-            monthly_estimates: monthly_estimate_bands(&source_estimates),
+            annual_energy,
+            annual_in_plane_irradiation,
+            annual_global_horizontal_irradiation,
+            monthly_estimates: monthly_estimate_bands(&source_estimates, uncertainty_multiplier),
             source_estimates,
         })
     }
@@ -205,6 +255,7 @@ impl AnnualPvEnsembleEstimate {
 
 fn monthly_estimate_bands(
     source_estimates: &[SourceAnnualPvEstimate],
+    uncertainty_multiplier: f64,
 ) -> Vec<MonthlyPvEnsembleEstimate> {
     (1..=12)
         .filter_map(|month| {
@@ -215,27 +266,37 @@ fn monthly_estimate_bands(
                 .filter(|estimate| estimate.month == month)
                 .collect();
 
-            (!estimates.is_empty()).then(|| MonthlyPvEnsembleEstimate {
-                month,
-                energy: EnergyEstimateBand::from_values(
+            (!estimates.is_empty()).then(|| {
+                let energy = EnergyEstimateBand::from_values(
                     estimates
                         .iter()
                         .map(|estimate| estimate.energy.as_kilowatt_hours()),
-                ),
-                in_plane_irradiation: IrradiationEstimateBand::from_values(estimates.iter().map(
-                    |estimate| {
+                );
+                let in_plane_irradiation =
+                    IrradiationEstimateBand::from_values(estimates.iter().map(|estimate| {
                         estimate
                             .in_plane_irradiation
                             .as_kilowatt_hours_per_square_meter()
-                    },
-                )),
-                global_horizontal_irradiation: IrradiationEstimateBand::from_values(
-                    estimates.iter().map(|estimate| {
+                    }));
+                let global_horizontal_irradiation =
+                    IrradiationEstimateBand::from_values(estimates.iter().map(|estimate| {
                         estimate
                             .global_horizontal_irradiation
                             .as_kilowatt_hours_per_square_meter()
-                    }),
-                ),
+                    }));
+                MonthlyPvEnsembleEstimate {
+                    month,
+                    uncertainty: EstimateUncertainty::from_bands(
+                        estimates.len(),
+                        uncertainty_multiplier,
+                        energy,
+                        in_plane_irradiation,
+                        global_horizontal_irradiation,
+                    ),
+                    energy,
+                    in_plane_irradiation,
+                    global_horizontal_irradiation,
+                }
             })
         })
         .collect()
@@ -263,6 +324,60 @@ impl IrradiationEstimateBand {
             high: Irradiation::from_kilowatt_hours_per_square_meter(band.high),
             half_spread: Irradiation::from_kilowatt_hours_per_square_meter(band.half_spread),
             spread_fraction: band.spread_fraction,
+        }
+    }
+}
+
+impl EstimateUncertainty {
+    pub fn from_bands(
+        source_count: usize,
+        multiplier: f64,
+        energy: EnergyEstimateBand,
+        in_plane_irradiation: IrradiationEstimateBand,
+        global_horizontal_irradiation: IrradiationEstimateBand,
+    ) -> Self {
+        let calibrated = source_count >= 2;
+        Self {
+            method: if calibrated {
+                UncertaintyMethod::SourceSpreadMultiplier
+            } else {
+                UncertaintyMethod::InsufficientSources
+            },
+            multiplier,
+            source_count: source_count as u16,
+            calibrated,
+            annual_energy: calibrated
+                .then(|| CalibratedEnergyBand::from_raw_band(energy, multiplier)),
+            annual_in_plane_irradiation: calibrated.then(|| {
+                CalibratedIrradiationBand::from_raw_band(in_plane_irradiation, multiplier)
+            }),
+            annual_global_horizontal_irradiation: calibrated.then(|| {
+                CalibratedIrradiationBand::from_raw_band(global_horizontal_irradiation, multiplier)
+            }),
+        }
+    }
+}
+
+impl CalibratedEnergyBand {
+    pub fn from_raw_band(raw: EnergyEstimateBand, multiplier: f64) -> Self {
+        let mean = raw.mean.as_kilowatt_hours();
+        let half_width = raw.half_spread.as_kilowatt_hours() * multiplier;
+        Self {
+            low: Energy::from_kilowatt_hours((mean - half_width).max(0.0)),
+            high: Energy::from_kilowatt_hours(mean + half_width),
+            half_width: Energy::from_kilowatt_hours(half_width),
+        }
+    }
+}
+
+impl CalibratedIrradiationBand {
+    pub fn from_raw_band(raw: IrradiationEstimateBand, multiplier: f64) -> Self {
+        let mean = raw.mean.as_kilowatt_hours_per_square_meter();
+        let half_width = raw.half_spread.as_kilowatt_hours_per_square_meter() * multiplier;
+        Self {
+            low: Irradiation::from_kilowatt_hours_per_square_meter((mean - half_width).max(0.0)),
+            high: Irradiation::from_kilowatt_hours_per_square_meter(mean + half_width),
+            half_width: Irradiation::from_kilowatt_hours_per_square_meter(half_width),
         }
     }
 }
@@ -353,6 +468,12 @@ mod tests {
         assert_eq!(ensemble.annual_energy.high.as_kilowatt_hours(), 1500.0);
         assert_eq!(ensemble.annual_energy.half_spread.as_kilowatt_hours(), 75.0);
         assert!((ensemble.annual_energy.spread_fraction - 0.10465116279069768).abs() < 1e-12);
+        assert!(ensemble.uncertainty.calibrated);
+        assert_eq!(ensemble.uncertainty.multiplier, 2.0);
+        let display_band = ensemble.uncertainty.annual_energy.expect("calibrated band");
+        assert_eq!(display_band.low.as_kilowatt_hours(), 1283.3333333333333);
+        assert_eq!(display_band.high.as_kilowatt_hours(), 1583.3333333333333);
+        assert_eq!(display_band.half_width.as_kilowatt_hours(), 150.0);
         assert_eq!(
             ensemble
                 .annual_in_plane_irradiation
@@ -438,6 +559,15 @@ mod tests {
               "half_spread": {"kilowatt_hours_per_square_meter": 0.0},
               "spread_fraction": 0.0
             },
+            "uncertainty": {
+              "method": "insufficient_sources",
+              "multiplier": 2.0,
+              "source_count": 1,
+              "calibrated": false,
+              "annual_energy": null,
+              "annual_in_plane_irradiation": null,
+              "annual_global_horizontal_irradiation": null
+            },
             "monthly_estimates": [
               {
                 "month": 1,
@@ -461,6 +591,15 @@ mod tests {
                   "high": {"kilowatt_hours_per_square_meter": 100.0},
                   "half_spread": {"kilowatt_hours_per_square_meter": 0.0},
                   "spread_fraction": 0.0
+                },
+                "uncertainty": {
+                  "method": "insufficient_sources",
+                  "multiplier": 2.0,
+                  "source_count": 1,
+                  "calibrated": false,
+                  "annual_energy": null,
+                  "annual_in_plane_irradiation": null,
+                  "annual_global_horizontal_irradiation": null
                 }
               }
             ]

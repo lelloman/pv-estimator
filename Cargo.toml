@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/pv-cli",
     "crates/pv-core",
     "crates/pv-data",
     "crates/pv-service",
