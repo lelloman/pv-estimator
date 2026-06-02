@@ -3,7 +3,9 @@ members = [
     "crates/pv-cli",
     "crates/pv-core",
     "crates/pv-data",
+    "crates/pv-model",
     "crates/pv-service",
+    "crates/pv-tui",
     "crates/pv-wasm",
     "xtask",
 ]

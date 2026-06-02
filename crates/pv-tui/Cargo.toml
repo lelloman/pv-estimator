@@ -1,5 +1,5 @@
 [package]
-name = "pv-cli"
+name = "pv-tui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,6 +11,8 @@ workspace = true
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.28"
 pv-core = { path = "../pv-core" }
+pv-data = { path = "../pv-data" }
 pv-model = { path = "../pv-model" }
-serde_json = "1.0"
+ratatui = "0.29"
