@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import hashlib
 import json
 import math
 import time
@@ -15,7 +17,8 @@ from torch import nn
 
 TARGETS = 10
 BASE_TARGETS = 5
-INPUT_FEATURES = 66
+BASE_INPUT_FEATURES = 66
+INPUT_FEATURES = BASE_INPUT_FEATURES
 TARGET_NAMES = [
     "ghi_mean_w_m2", "dni_mean_w_m2", "dhi_mean_w_m2", "temp_mean_c", "wind_mean_m_s",
     "ghi_std_w_m2", "dni_std_w_m2", "dhi_std_w_m2", "temp_std_c", "wind_std_m_s",
@@ -36,6 +39,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-location-stride", type=int, default=17)
     parser.add_argument("--eval-every", type=int, default=1)
     parser.add_argument("--eval-batch-size", type=int, default=262144)
+    parser.add_argument("--feature-contract", type=Path, default=None, help="runtime geography feature_contract.json")
+    parser.add_argument("--feature-grid", type=Path, default=None, help="runtime geography_feature_grid.csv")
     return parser.parse_args()
 
 
@@ -52,6 +57,8 @@ def main() -> int:
         print(f"gpu={torch.cuda.get_device_name(0)}", flush=True)
 
     table = NormalTable.load(args.normals_dir)
+    geography = GeographyFeatures.load(args.feature_contract, args.feature_grid)
+    input_features = BASE_INPUT_FEATURES + geography.width
     train_locations, val_locations = split_locations(table.location_count, args.val_location_stride)
     print(
         f"locations train={len(train_locations)} val={len(val_locations)} temporal_bins={table.temporal_bins} "
@@ -59,7 +66,7 @@ def main() -> int:
         flush=True,
     )
     target_mean, target_std = compute_target_stats(table, train_locations)
-    model = ClimateNormalMlp(INPUT_FEATURES, args.hidden_width, args.residual_blocks, args.residual_scale).to(device)
+    model = ClimateNormalMlp(input_features, args.hidden_width, args.residual_blocks, args.residual_scale).to(device)
     parameters = sum(parameter.numel() for parameter in model.parameters())
     print(f"parameters={parameters}", flush=True)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
@@ -75,7 +82,7 @@ def main() -> int:
         batches = 0
         location_order = np.array(train_locations, copy=True)
         rng.shuffle(location_order)
-        for batch_x, batch_y in iter_batches(table, location_order, args.batch_size, target_mean, target_std):
+        for batch_x, batch_y in iter_batches(table, location_order, args.batch_size, target_mean, target_std, geography):
             x_t = torch.from_numpy(batch_x).to(device)
             y_t = torch.from_numpy(batch_y).to(device)
             optimizer.zero_grad(set_to_none=True)
@@ -89,14 +96,14 @@ def main() -> int:
                 elapsed = time.time() - started
                 rate = batches / max(elapsed, 0.001)
                 print(f"epoch={epoch} batch={batches} rate={rate:.2f}/s", flush=True)
-        metrics = evaluate(model, table, val_locations, target_mean, target_std, args.eval_batch_size, device)
+        metrics = evaluate(model, table, val_locations, target_mean, target_std, args.eval_batch_size, device, geography)
         metrics["epoch"] = epoch
         metrics["train_mse_norm"] = epoch_loss / max(batches, 1)
         history.append(metrics)
         if metrics["mae_mean"] < best_mae_mean:
             best_mae_mean = float(metrics["mae_mean"])
             best_epoch = epoch
-            save_model(args.out_dir / "best_model.pt", model, args, table, target_mean, target_std, parameters, epoch, metrics)
+            save_model(args.out_dir / "best_model.pt", model, args, table, target_mean, target_std, parameters, epoch, metrics, input_features, geography)
         print(
             f"epoch={epoch} train_mse_norm={metrics['train_mse_norm']:.6f} "
             f"val_mae_mean={metrics['mae_mean']:.6f} val_mae={metrics['mae']} "
@@ -107,7 +114,13 @@ def main() -> int:
     final_metrics = history[-1]
     output = {
         "model": "climate_normals_stream_torch",
-        "input_features": INPUT_FEATURES,
+        "input_features": input_features,
+        "base_input_features": BASE_INPUT_FEATURES,
+        "geography_feature_count": geography.width,
+        "geography_feature_columns": geography.columns,
+        "feature_contract_path": str(args.feature_contract) if args.feature_contract else None,
+        "feature_grid_path": str(args.feature_grid) if args.feature_grid else None,
+        "feature_contract_sha256": geography.contract_sha256,
         "outputs": TARGETS,
         "target_names": TARGET_NAMES,
         "normals_dir": str(args.normals_dir),
@@ -135,7 +148,7 @@ def main() -> int:
     }
     metrics_path = args.out_dir / "metrics.json"
     metrics_path.write_text(json.dumps(output, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    save_model(args.out_dir / "model.pt", model, args, table, target_mean, target_std, parameters, args.epochs, final_metrics)
+    save_model(args.out_dir / "model.pt", model, args, table, target_mean, target_std, parameters, args.epochs, final_metrics, input_features, geography)
     print(f"wrote {metrics_path}", flush=True)
     print(f"wrote {args.out_dir / 'model.pt'}", flush=True)
     print(f"wrote {args.out_dir / 'best_model.pt'}", flush=True)
@@ -159,6 +172,80 @@ class NormalTable:
     def load(cls, root: Path) -> "NormalTable":
         return cls(root)
 
+
+
+class GeographyFeatures:
+    def __init__(
+        self,
+        columns: list[str],
+        mean: np.ndarray,
+        std: np.ndarray,
+        clip_abs: float | None,
+        by_coord: dict[tuple[int, int], np.ndarray],
+        contract_sha256: str | None,
+    ) -> None:
+        self.columns = columns
+        self.mean = mean
+        self.std = std
+        self.clip_abs = clip_abs
+        self.by_coord = by_coord
+        self.contract_sha256 = contract_sha256
+        self.width = len(columns)
+        self._empty = np.empty((0, 0), dtype=np.float32)
+
+    @classmethod
+    def load(cls, contract_path: Path | None, grid_path: Path | None) -> "GeographyFeatures":
+        if contract_path is None and grid_path is None:
+            return cls([], np.empty((0,), dtype=np.float32), np.empty((0,), dtype=np.float32), None, {}, None)
+        if contract_path is None or grid_path is None:
+            raise ValueError("--feature-contract and --feature-grid must be provided together")
+        contract = json.loads(contract_path.read_text(encoding="utf-8"))
+        columns = list(contract["columns"])
+        mean = np.asarray(contract["mean"], dtype=np.float32)
+        std = np.maximum(np.asarray(contract["std"], dtype=np.float32), 1.0e-6)
+        if len(columns) != len(mean) or len(columns) != len(std):
+            raise ValueError("feature contract column/stat length mismatch")
+        by_coord: dict[tuple[int, int], np.ndarray] = {}
+        with grid_path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            if reader.fieldnames is None:
+                raise ValueError("feature grid has no header")
+            for column in ["latitude", "longitude", *columns]:
+                if column not in reader.fieldnames:
+                    raise ValueError(f"feature grid missing column {column}")
+            for row in reader:
+                raw = np.asarray([float(row[column]) for column in columns], dtype=np.float32)
+                normalized = (raw - mean) / std
+                clip_abs = contract.get("clip_abs")
+                if clip_abs is not None:
+                    normalized = np.clip(normalized, -float(clip_abs), float(clip_abs)).astype(np.float32)
+                by_coord[coord_key(float(row["latitude"]), float(row["longitude"]))] = normalized
+        print(f"loaded geography features rows={len(by_coord)} columns={len(columns)}", flush=True)
+        return cls(columns, mean, std, contract.get("clip_abs"), by_coord, sha256_file(contract_path))
+
+    def for_lat_lon_batch(self, lat: np.ndarray, lon: np.ndarray) -> np.ndarray:
+        if self.width == 0:
+            return self._empty
+        output = np.empty((len(lat), self.width), dtype=np.float32)
+        for index, (row_lat, row_lon) in enumerate(zip(lat, lon)):
+            key = coord_key(float(row_lat), float(row_lon))
+            try:
+                output[index] = self.by_coord[key]
+            except KeyError as exc:
+                raise KeyError(f"geography features missing lat={row_lat:.6f} lon={row_lon:.6f} key={key}") from exc
+        return output
+
+
+def coord_key(lat: float, lon: float) -> tuple[int, int]:
+    return int(round(lat * 1000.0)), int(round(lon * 1000.0))
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 def split_locations(location_count: int, stride: int) -> tuple[np.ndarray, np.ndarray]:
     loc = np.arange(location_count, dtype=np.int64)
@@ -189,6 +276,7 @@ def iter_batches(
     batch_size: int,
     target_mean: np.ndarray,
     target_std: np.ndarray,
+    geography: "GeographyFeatures",
 ):
     temporal = table.temporal_bins
     rows_per_epoch = len(location_order) * temporal
@@ -197,7 +285,7 @@ def iter_batches(
         local_rows = np.arange(start, stop, dtype=np.int64)
         loc = location_order[local_rows // temporal]
         t = local_rows % temporal
-        yield make_batch(table, loc, t, target_mean, target_std)
+        yield make_batch(table, loc, t, target_mean, target_std, geography)
 
 
 def make_batch(
@@ -206,10 +294,13 @@ def make_batch(
     temporal_indices: np.ndarray,
     target_mean: np.ndarray,
     target_std: np.ndarray,
+    geography: "GeographyFeatures",
 ) -> tuple[np.ndarray, np.ndarray]:
     lat = table.lat_lon[locations, 0]
     lon = table.lat_lon[locations, 1]
     x = encode_features(lat, lon, temporal_indices, table.temporal_bins)
+    if geography.width:
+        x = np.concatenate([x, geography.for_lat_lon_batch(lat, lon)], axis=1).astype(np.float32)
     y = np.concatenate([table.mean[locations, temporal_indices], table.std[locations, temporal_indices]], axis=1).astype(np.float32)
     y = (y - target_mean.reshape(1, TARGETS)) / target_std.reshape(1, TARGETS)
     return x, y.astype(np.float32)
@@ -254,8 +345,8 @@ def encode_features(lat: np.ndarray, lon: np.ndarray, temporal_indices: np.ndarr
         season_cos * hour_cos,
     ])
     output = np.stack(columns, axis=1).astype(np.float32)
-    if output.shape[1] != INPUT_FEATURES:
-        raise RuntimeError(f"expected {INPUT_FEATURES} features, got {output.shape[1]}")
+    if output.shape[1] != BASE_INPUT_FEATURES:
+        raise RuntimeError(f"expected {BASE_INPUT_FEATURES} features, got {output.shape[1]}")
     return output
 
 
@@ -309,7 +400,7 @@ def evaluate(
             local_rows = np.arange(start, stop, dtype=np.int64)
             loc = val_locations[local_rows // temporal]
             t = local_rows % temporal
-            x, _ = make_batch(table, loc, t, target_mean, target_std)
+            x, _ = make_batch(table, loc, t, target_mean, target_std, geography)
             y = np.concatenate([table.mean[loc, t], table.std[loc, t]], axis=1).astype(np.float32)
             pred = model(torch.from_numpy(x).to(device)).detach().cpu().numpy()
             pred = pred * target_std.reshape(1, TARGETS) + target_mean.reshape(1, TARGETS)
@@ -327,10 +418,16 @@ def evaluate(
     }
 
 
-def save_model(path: Path, model: ClimateNormalMlp, args: argparse.Namespace, table: NormalTable, target_mean: np.ndarray, target_std: np.ndarray, parameters: int, epoch: int, metrics: dict[str, object]) -> None:
+def save_model(path: Path, model: ClimateNormalMlp, args: argparse.Namespace, table: NormalTable, target_mean: np.ndarray, target_std: np.ndarray, parameters: int, epoch: int, metrics: dict[str, object], input_features: int, geography: "GeographyFeatures") -> None:
     torch.save({
         "model_state_dict": model.state_dict(),
-        "input_features": INPUT_FEATURES,
+        "input_features": input_features,
+        "base_input_features": BASE_INPUT_FEATURES,
+        "geography_feature_count": geography.width,
+        "geography_feature_columns": geography.columns,
+        "feature_contract_path": str(args.feature_contract) if args.feature_contract else None,
+        "feature_grid_path": str(args.feature_grid) if args.feature_grid else None,
+        "feature_contract_sha256": geography.contract_sha256,
         "target_names": TARGET_NAMES,
         "target_mean": target_mean,
         "target_std": target_std,

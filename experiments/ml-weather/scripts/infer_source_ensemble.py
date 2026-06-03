@@ -22,7 +22,7 @@ import torch
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from train_climate_normals_stream_torch import ClimateNormalMlp, encode_features  # noqa: E402
+from train_climate_normals_stream_torch import BASE_INPUT_FEATURES, ClimateNormalMlp, encode_features  # noqa: E402
 
 MONTH_DAYS = np.array([31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31], dtype=np.float64)
 MID_MONTH_DOY = np.array([15, 46, 74, 105, 135, 166, 196, 227, 258, 288, 319, 349], dtype=np.float64)
@@ -121,6 +121,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--request-delay-seconds", type=float, default=0.75)
     parser.add_argument("--timeout-seconds", type=float, default=60.0)
     parser.add_argument("--retries", type=int, default=3)
+    parser.add_argument("--feature-contract", type=Path, default=None)
+    parser.add_argument("--feature-grid", type=Path, default=None)
     return parser.parse_args()
 
 
@@ -135,11 +137,12 @@ def main() -> int:
         args.out_estimate_json.parent.mkdir(parents=True, exist_ok=True)
     args.pvgis_cache.mkdir(parents=True, exist_ok=True)
     sarah3_mask = CoverageMask.load(args.sarah3_mask)
+    geography = RuntimeGeographyFeatures.load(args.feature_contract, args.feature_grid)
 
     sources = [
-        load_source(SourceSpec("nasa_power", "NASA POWER", args.nasa_checkpoint, "global")),
-        load_source(SourceSpec("pvgis_era5", "PVGIS-ERA5", args.era5_checkpoint, "global")),
-        load_source(SourceSpec("pvgis_sarah3", "PVGIS-SARAH3", args.sarah3_checkpoint, "sarah3_mask")),
+        load_source(SourceSpec("nasa_power", "NASA POWER", args.nasa_checkpoint, "global"), geography),
+        load_source(SourceSpec("pvgis_era5", "PVGIS-ERA5", args.era5_checkpoint, "global"), geography),
+        load_source(SourceSpec("pvgis_sarah3", "PVGIS-SARAH3", args.sarah3_checkpoint, "sarah3_mask"), geography),
     ]
     databases = [item.strip() for item in args.databases.split(",") if item.strip()]
     rows: list[dict[str, Any]] = []
@@ -151,7 +154,7 @@ def main() -> int:
         for source in sources:
             if not source_applies(source.spec, lat, lon, sarah3_mask):
                 continue
-            climate = predict_month_hour(source, lat, lon)
+            climate = predict_month_hour(source, lat, lon, geography)
             predictions[source.spec.source_id] = estimate_pv_from_climate(
                 climate,
                 lat,
@@ -198,6 +201,53 @@ def main() -> int:
     return 0
 
 
+
+class RuntimeGeographyFeatures:
+    def __init__(self, columns: list[str], mean: np.ndarray, std: np.ndarray, clip_abs: float | None, rows: list[tuple[float, float, np.ndarray]]) -> None:
+        self.columns = columns
+        self.mean = mean
+        self.std = std
+        self.clip_abs = clip_abs
+        self.rows = rows
+        self.width = len(columns)
+
+    @classmethod
+    def load(cls, contract_path: Path | None, grid_path: Path | None) -> "RuntimeGeographyFeatures":
+        if contract_path is None and grid_path is None:
+            return cls([], np.empty((0,), dtype=np.float32), np.empty((0,), dtype=np.float32), None, [])
+        if contract_path is None or grid_path is None:
+            raise ValueError("--feature-contract and --feature-grid must be provided together")
+        contract = json.loads(contract_path.expanduser().read_text(encoding="utf-8"))
+        columns = list(contract["columns"])
+        mean = np.asarray(contract["mean"], dtype=np.float32)
+        std = np.maximum(np.asarray(contract["std"], dtype=np.float32), 1.0e-6)
+        rows = []
+        with grid_path.expanduser().open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                values = np.asarray([float(row[column]) for column in columns], dtype=np.float32)
+                rows.append((float(row["latitude"]), float(row["longitude"]), values))
+        if not rows:
+            raise ValueError("feature grid has no rows")
+        return cls(columns, mean, std, contract.get("clip_abs"), rows)
+
+    def normalized_features(self, lat: float, lon: float) -> np.ndarray:
+        lat_scale = max(abs(np.cos(np.radians(lat))), 0.1)
+        nearest = sorted(
+            (((lat - row_lat) ** 2 + ((lon - row_lon) * lat_scale) ** 2, values) for row_lat, row_lon, values in self.rows),
+            key=lambda item: item[0],
+        )[:4]
+        if nearest[0][0] <= 1.0e-12:
+            raw = nearest[0][1]
+        else:
+            weights = np.asarray([1.0 / max(distance, 1.0e-12) ** 0.5 for distance, _values in nearest], dtype=np.float64)
+            values = np.stack([values for _distance, values in nearest]).astype(np.float64)
+            raw = np.average(values, axis=0, weights=weights).astype(np.float32)
+        normalized = (raw - self.mean) / self.std
+        if self.clip_abs is not None:
+            normalized = np.clip(normalized, -float(self.clip_abs), float(self.clip_abs))
+        return normalized.astype(np.float32)
+
 def load_requested_locations(args: argparse.Namespace) -> list[dict[str, str]]:
     if args.lat is None and args.lon is None:
         return read_locations(args.locations)
@@ -219,10 +269,13 @@ def read_locations(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
-def load_source(spec: SourceSpec) -> LoadedSource:
+def load_source(spec: SourceSpec, geography: "RuntimeGeographyFeatures") -> LoadedSource:
     checkpoint = torch.load(spec.checkpoint.expanduser(), map_location="cpu", weights_only=False)
+    input_features = int(checkpoint["input_features"])
+    if input_features != BASE_INPUT_FEATURES + geography.width:
+        raise RuntimeError(f"{spec.source_id} checkpoint input_features={input_features} does not match runtime features {BASE_INPUT_FEATURES + geography.width}")
     model = ClimateNormalMlp(
-        int(checkpoint["input_features"]),
+        input_features,
         int(checkpoint["hidden_width"]),
         int(checkpoint["residual_blocks"]),
         float(checkpoint["residual_scale"]),
@@ -245,7 +298,7 @@ def source_applies(spec: SourceSpec, lat: float, lon: float, sarah3_mask: "Cover
     raise ValueError(f"unsupported coverage rule: {spec.coverage}")
 
 
-def predict_month_hour(source: LoadedSource, lat: float, lon: float) -> np.ndarray:
+def predict_month_hour(source: LoadedSource, lat: float, lon: float, geography: "RuntimeGeographyFeatures") -> np.ndarray:
     temporal_bins = int(source.checkpoint.get("temporal_bins", 288))
     if temporal_bins != 288:
         raise RuntimeError(f"{source.spec.source_id} expected month-hour model, got temporal_bins={temporal_bins}")
@@ -256,6 +309,9 @@ def predict_month_hour(source: LoadedSource, lat: float, lon: float) -> np.ndarr
         temporal,
         temporal_bins,
     )
+    if geography.width:
+        aux = np.repeat(geography.normalized_features(lat, lon).reshape(1, geography.width), len(temporal), axis=0)
+        x = np.concatenate([x, aux], axis=1).astype(np.float32)
     with torch.no_grad():
         y = source.model(torch.from_numpy(x)).numpy()
     target_mean = np.asarray(source.checkpoint["target_mean"], dtype=np.float32).reshape(1, len(TARGET_NAMES))

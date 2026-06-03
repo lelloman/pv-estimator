@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 anyhow = "1.0"
+csv = "1.4"
 ndarray = "0.17"
 ort = "=2.0.0-rc.12"
 pv-core = { path = "../pv-core" }

@@ -16,7 +16,7 @@ use pv_core::units::Energy;
 use serde::Deserialize;
 use serde_json::json;
 
-const INPUT_FEATURES: usize = 66;
+const BASE_INPUT_FEATURES: usize = 66;
 const TARGETS: usize = 10;
 const TEMPORAL_BINS: usize = 288;
 const MONTH_DAYS: [f64; 12] = [
@@ -26,6 +26,8 @@ const MID_MONTH_DOY: [f64; 12] = [
     15.0, 46.0, 74.0, 105.0, 135.0, 166.0, 196.0, 227.0, 258.0, 288.0, 319.0, 349.0,
 ];
 const DEFAULT_UNCERTAINTY_MULTIPLIER: f64 = 2.0;
+const SUPPORTED_MANIFEST_SCHEMA_V1: u32 = 1;
+const SUPPORTED_MANIFEST_SCHEMA_V2: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct EstimateRequest {
@@ -63,6 +65,7 @@ pub struct SourceModelEstimator {
     temporal_bins: usize,
     target_names: Vec<String>,
     uncertainty_multiplier: f64,
+    geography_features: Option<GeographyFeatureGrid>,
     sources: Vec<LoadedSource>,
 }
 
@@ -76,6 +79,38 @@ struct ArtifactManifest {
     #[serde(default = "default_uncertainty_multiplier")]
     uncertainty_multiplier: f64,
     sources: Vec<ArtifactSource>,
+    geography_features: Option<ArtifactGeographyFeatures>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtifactGeographyFeatures {
+    contract_path: PathBuf,
+    grid_path: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeographyFeatureContract {
+    columns: Vec<String>,
+    mean: Vec<f32>,
+    std: Vec<f32>,
+    #[serde(default)]
+    clip_abs: Option<f32>,
+}
+
+#[derive(Debug, Clone)]
+struct GeographyFeatureGrid {
+    columns: Vec<String>,
+    mean: Vec<f32>,
+    std: Vec<f32>,
+    clip_abs: Option<f32>,
+    rows: Vec<GeographyFeatureRow>,
+}
+
+#[derive(Debug, Clone)]
+struct GeographyFeatureRow {
+    latitude: f64,
+    longitude: f64,
+    values: Vec<f32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -153,6 +188,9 @@ impl SourceModelEstimator {
         let model_dir = model_dir.as_ref();
         let manifest_path = model_dir.join(manifest_name);
         let manifest = load_manifest(&manifest_path)?;
+        let geography_features =
+            load_geography_features(model_dir, manifest.geography_features.as_ref())?;
+        validate_manifest(&manifest, geography_features.as_ref())?;
         let sources = load_sources(model_dir, manifest.sources)?;
         Ok(Self {
             model_family: manifest.model_family,
@@ -160,6 +198,7 @@ impl SourceModelEstimator {
             temporal_bins: manifest.temporal_bins,
             target_names: manifest.target_names,
             uncertainty_multiplier: manifest.uncertainty_multiplier,
+            geography_features,
             sources,
         })
     }
@@ -169,7 +208,12 @@ impl SourceModelEstimator {
         request: &EstimateRequest,
     ) -> Result<SourceEnsembleEstimateDocument> {
         validate_request(request)?;
-        let features = encode_features(request.latitude, request.longitude);
+        let features = encode_features(
+            request.latitude,
+            request.longitude,
+            self.input_features,
+            self.geography_features.as_ref(),
+        )?;
         let mut source_estimates = Vec::new();
         let mut applicable_sources = Vec::new();
         let mut sarah3_applicable = false;
@@ -381,16 +425,20 @@ fn load_manifest(path: &Path) -> Result<ArtifactManifest> {
             .with_context(|| format!("opening artifact manifest {}", path.display()))?,
     )
     .with_context(|| format!("parsing artifact manifest {}", path.display()))?;
-    if manifest.schema_version != 1 {
+    Ok(manifest)
+}
+
+fn validate_manifest(
+    manifest: &ArtifactManifest,
+    geography_features: Option<&GeographyFeatureGrid>,
+) -> Result<()> {
+    if !matches!(
+        manifest.schema_version,
+        SUPPORTED_MANIFEST_SCHEMA_V1 | SUPPORTED_MANIFEST_SCHEMA_V2
+    ) {
         bail!(
             "unsupported artifact manifest schema_version={}",
             manifest.schema_version
-        );
-    }
-    if manifest.input_features != INPUT_FEATURES {
-        bail!(
-            "artifact manifest input_features={} but runtime expects {INPUT_FEATURES}",
-            manifest.input_features
         );
     }
     if manifest.temporal_bins != TEMPORAL_BINS {
@@ -405,7 +453,182 @@ fn load_manifest(path: &Path) -> Result<ArtifactManifest> {
             manifest.target_names.len()
         );
     }
-    Ok(manifest)
+    match (manifest.schema_version, geography_features) {
+        (SUPPORTED_MANIFEST_SCHEMA_V1, None) if manifest.input_features == BASE_INPUT_FEATURES => {}
+        (SUPPORTED_MANIFEST_SCHEMA_V2, Some(grid))
+            if manifest.input_features == BASE_INPUT_FEATURES + grid.width() => {}
+        (SUPPORTED_MANIFEST_SCHEMA_V2, None) => {
+            bail!("schema v2 artifact requires geography_features")
+        }
+        _ => bail!(
+            "artifact manifest input_features={} is incompatible with schema_version={}",
+            manifest.input_features,
+            manifest.schema_version
+        ),
+    }
+    Ok(())
+}
+
+fn load_geography_features(
+    model_dir: &Path,
+    spec: Option<&ArtifactGeographyFeatures>,
+) -> Result<Option<GeographyFeatureGrid>> {
+    let Some(spec) = spec else {
+        return Ok(None);
+    };
+    let contract_path = model_dir.join(&spec.contract_path);
+    let grid_path = model_dir.join(&spec.grid_path);
+    let contract: GeographyFeatureContract =
+        serde_json::from_reader(File::open(&contract_path).with_context(|| {
+            format!(
+                "opening geography feature contract {}",
+                contract_path.display()
+            )
+        })?)
+        .with_context(|| {
+            format!(
+                "parsing geography feature contract {}",
+                contract_path.display()
+            )
+        })?;
+    GeographyFeatureGrid::load(contract, &grid_path).map(Some)
+}
+
+impl GeographyFeatureGrid {
+    fn load(contract: GeographyFeatureContract, grid_path: &Path) -> Result<Self> {
+        if contract.columns.is_empty() {
+            bail!("geography feature contract has no columns");
+        }
+        if contract.mean.len() != contract.columns.len()
+            || contract.std.len() != contract.columns.len()
+        {
+            bail!("geography feature contract stats do not match column count");
+        }
+        let mut reader = csv::Reader::from_path(grid_path)
+            .with_context(|| format!("opening geography feature grid {}", grid_path.display()))?;
+        let headers = reader.headers()?.clone();
+        let latitude_index = header_index(&headers, "latitude")?;
+        let longitude_index = header_index(&headers, "longitude")?;
+        let column_indexes = contract
+            .columns
+            .iter()
+            .map(|column| header_index(&headers, column))
+            .collect::<Result<Vec<_>>>()?;
+        let mut rows = Vec::new();
+        for record in reader.records() {
+            let record = record.with_context(|| {
+                format!("reading geography feature grid {}", grid_path.display())
+            })?;
+            let latitude = parse_csv_f64(&record, latitude_index, "latitude")?;
+            let longitude = parse_csv_f64(&record, longitude_index, "longitude")?;
+            let values = column_indexes
+                .iter()
+                .zip(contract.columns.iter())
+                .map(|(index, column)| parse_csv_f32(&record, *index, column))
+                .collect::<Result<Vec<_>>>()?;
+            rows.push(GeographyFeatureRow {
+                latitude,
+                longitude,
+                values,
+            });
+        }
+        if rows.is_empty() {
+            bail!("geography feature grid has no rows");
+        }
+        Ok(Self {
+            columns: contract.columns,
+            mean: contract.mean,
+            std: contract.std,
+            clip_abs: contract.clip_abs,
+            rows,
+        })
+    }
+
+    fn width(&self) -> usize {
+        self.columns.len()
+    }
+
+    fn normalized_features(&self, lat: f64, lon: f64) -> Result<Vec<f32>> {
+        let raw = self.interpolate_raw(lat, lon)?;
+        Ok(raw
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let std = self.std[index].max(1.0e-6);
+                let normalized = (*value - self.mean[index]) / std;
+                self.clip_abs
+                    .map(|clip| normalized.clamp(-clip, clip))
+                    .unwrap_or(normalized)
+            })
+            .collect())
+    }
+
+    fn interpolate_raw(&self, lat: f64, lon: f64) -> Result<Vec<f32>> {
+        let mut nearest: Vec<(f64, &GeographyFeatureRow)> = self
+            .rows
+            .iter()
+            .map(|row| {
+                (
+                    coordinate_distance_sq(lat, lon, row.latitude, row.longitude),
+                    row,
+                )
+            })
+            .collect();
+        nearest.sort_by(|left, right| left.0.total_cmp(&right.0));
+        let nearest = nearest.into_iter().take(4).collect::<Vec<_>>();
+        let Some((distance, row)) = nearest.first().copied() else {
+            bail!("geography feature grid has no rows");
+        };
+        if distance <= 1.0e-12 {
+            return Ok(row.values.clone());
+        }
+        if distance.sqrt() > 5.0 {
+            bail!("no geography features near coordinate {lat:.4},{lon:.4}");
+        }
+        let mut output = vec![0.0f64; self.width()];
+        let mut weight_sum = 0.0;
+        for (distance, row) in nearest {
+            let weight = 1.0 / distance.max(1.0e-12).sqrt();
+            weight_sum += weight;
+            for (index, value) in row.values.iter().enumerate() {
+                output[index] += f64::from(*value) * weight;
+            }
+        }
+        Ok(output
+            .into_iter()
+            .map(|value| (value / weight_sum) as f32)
+            .collect())
+    }
+}
+
+fn header_index(headers: &csv::StringRecord, column: &str) -> Result<usize> {
+    headers
+        .iter()
+        .position(|candidate| candidate == column)
+        .ok_or_else(|| anyhow!("geography feature grid missing column {column}"))
+}
+
+fn parse_csv_f64(record: &csv::StringRecord, index: usize, column: &str) -> Result<f64> {
+    record
+        .get(index)
+        .ok_or_else(|| anyhow!("missing {column}"))?
+        .parse::<f64>()
+        .with_context(|| format!("parsing {column}"))
+}
+
+fn parse_csv_f32(record: &csv::StringRecord, index: usize, column: &str) -> Result<f32> {
+    record
+        .get(index)
+        .ok_or_else(|| anyhow!("missing {column}"))?
+        .parse::<f32>()
+        .with_context(|| format!("parsing {column}"))
+}
+
+fn coordinate_distance_sq(lat: f64, lon: f64, row_lat: f64, row_lon: f64) -> f64 {
+    let lat_scale = lat.to_radians().cos().abs().max(0.1);
+    let d_lat = lat - row_lat;
+    let d_lon = (lon - row_lon) * lat_scale;
+    d_lat * d_lat + d_lon * d_lon
 }
 
 fn load_sources(model_dir: &Path, sources: Vec<ArtifactSource>) -> Result<Vec<LoadedSource>> {
@@ -513,8 +736,17 @@ impl CoverageMask {
     }
 }
 
-fn encode_features(lat: f64, lon: f64) -> Array2<f32> {
-    let mut output = Array2::<f32>::zeros((TEMPORAL_BINS, INPUT_FEATURES));
+fn encode_features(
+    lat: f64,
+    lon: f64,
+    input_features: usize,
+    geography_features: Option<&GeographyFeatureGrid>,
+) -> Result<Array2<f32>> {
+    let geography = match geography_features {
+        Some(grid) => grid.normalized_features(lat, lon)?,
+        None => Vec::new(),
+    };
+    let mut output = Array2::<f32>::zeros((TEMPORAL_BINS, input_features));
     for temporal_index in 0..TEMPORAL_BINS {
         let lat_norm = lat / 90.0;
         let lon_norm = lon / 180.0;
@@ -568,9 +800,13 @@ fn encode_features(lat: f64, lon: f64) -> Array2<f32> {
             output[[temporal_index, col]] = value as f32;
             col += 1;
         }
-        debug_assert_eq!(col, INPUT_FEATURES);
+        for value in &geography {
+            output[[temporal_index, col]] = *value;
+            col += 1;
+        }
+        debug_assert_eq!(col, input_features);
     }
-    output
+    Ok(output)
 }
 
 fn estimate_pv_from_climate(
@@ -728,8 +964,8 @@ mod tests {
 
     #[test]
     fn feature_encoder_matches_expected_shape_and_first_values() {
-        let features = encode_features(40.65, 15.643);
-        assert_eq!(features.shape(), [TEMPORAL_BINS, INPUT_FEATURES]);
+        let features = encode_features(40.65, 15.643, BASE_INPUT_FEATURES, None).unwrap();
+        assert_eq!(features.shape(), [TEMPORAL_BINS, BASE_INPUT_FEATURES]);
         assert!((features[[0, 0]] - (40.65 / 90.0) as f32).abs() < 1e-6);
         assert!((features[[0, 1]] - (15.643 / 180.0) as f32).abs() < 1e-6);
     }
@@ -746,5 +982,50 @@ mod tests {
         assert!(mask.contains(40.65, 15.643));
         assert!(!mask.contains(42.0, 15.643));
         assert!(!mask.contains(40.65, 17.0));
+    }
+
+    #[test]
+    fn geography_features_use_exact_coordinate_match() {
+        let grid = test_feature_grid();
+        let features = grid.normalized_features(40.0, 15.0).unwrap();
+        assert_eq!(features, vec![0.0, -1.0]);
+    }
+
+    #[test]
+    fn geography_features_interpolate_nearest_rows() {
+        let grid = test_feature_grid();
+        let features = grid.normalized_features(40.5, 15.0).unwrap();
+        assert!((features[0] - 0.5).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn v2_feature_encoder_appends_geography_columns() {
+        let grid = test_feature_grid();
+        let features =
+            encode_features(40.0, 15.0, BASE_INPUT_FEATURES + grid.width(), Some(&grid)).unwrap();
+        assert_eq!(features.shape(), [TEMPORAL_BINS, BASE_INPUT_FEATURES + 2]);
+        assert_eq!(features[[0, BASE_INPUT_FEATURES]], 0.0);
+        assert_eq!(features[[0, BASE_INPUT_FEATURES + 1]], -1.0);
+    }
+
+    fn test_feature_grid() -> GeographyFeatureGrid {
+        GeographyFeatureGrid {
+            columns: vec!["elevation".to_string(), "water".to_string()],
+            mean: vec![100.0, 0.5],
+            std: vec![100.0, 0.5],
+            clip_abs: Some(8.0),
+            rows: vec![
+                GeographyFeatureRow {
+                    latitude: 40.0,
+                    longitude: 15.0,
+                    values: vec![100.0, 0.0],
+                },
+                GeographyFeatureRow {
+                    latitude: 41.0,
+                    longitude: 15.0,
+                    values: vec![200.0, 1.0],
+                },
+            ],
+        }
     }
 }
