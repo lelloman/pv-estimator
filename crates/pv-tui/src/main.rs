@@ -557,13 +557,22 @@ fn render_fields(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             (true, Mode::Normal) => Style::default().fg(Color::Black).bg(Color::Cyan),
             _ => Style::default(),
         };
-        lines.push(Line::from(vec![
+        let mut spans = vec![
             Span::styled(
-                format!("{:<11}", field.label),
+                format!("{:<13}", field.label),
                 Style::default().fg(Color::DarkGray),
             ),
             Span::styled(field.value.as_str(), style),
-        ]));
+        ];
+        if field.label == "Azimuth deg"
+            && let Some(label) = azimuth_direction_label(field.value.as_str())
+        {
+            spans.push(Span::styled(
+                format!(" ({label})"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        lines.push(Line::from(spans));
     }
     lines.push(Line::from(""));
     let search_style = if app.mode == Mode::Location {
@@ -572,7 +581,7 @@ fn render_fields(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         Style::default().fg(Color::DarkGray)
     };
     lines.push(Line::from(vec![
-        Span::styled("Location   ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Location     ", Style::default().fg(Color::DarkGray)),
         Span::styled(app.location_query.value.as_str(), search_style),
     ]));
     for (row, location) in app.location_results.iter().take(6).enumerate() {
@@ -602,14 +611,14 @@ fn render_fields(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         let y = inner.y.saturating_add(app.selected as u16);
         let x = inner
             .x
-            .saturating_add(11)
+            .saturating_add(13)
             .saturating_add(field.cursor.min(u16::MAX as usize) as u16);
         frame.set_cursor_position(Position::new(x, y));
     } else if app.mode == Mode::Location {
         let y = inner.y.saturating_add(app.fields.len() as u16 + 1);
         let x = inner
             .x
-            .saturating_add(11)
+            .saturating_add(13)
             .saturating_add(app.location_query.cursor.min(u16::MAX as usize) as u16);
         frame.set_cursor_position(Position::new(x, y));
     }
@@ -723,6 +732,13 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(line), area);
 }
 
+fn azimuth_direction_label(value: &str) -> Option<&'static str> {
+    let degrees = value.parse::<f64>().ok()?;
+    let compass_degrees = (180.0 + degrees).rem_euclid(360.0);
+    let index = ((compass_degrees + 22.5) / 45.0).floor() as usize % 8;
+    Some(["N", "NE", "E", "SE", "S", "SW", "W", "NW"][index])
+}
+
 fn city_label(location: &CitySearchResult) -> String {
     format!(
         "  {:<16} {:>2} {:>8.3} {:>9.3}",
@@ -740,5 +756,22 @@ fn truncate(value: &str, max_chars: usize) -> String {
         truncated
     } else {
         value.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn azimuth_label_matches_pvgis_convention() {
+        assert_eq!(azimuth_direction_label("0"), Some("S"));
+        assert_eq!(azimuth_direction_label("-90"), Some("E"));
+        assert_eq!(azimuth_direction_label("90"), Some("W"));
+        assert_eq!(azimuth_direction_label("180"), Some("N"));
+        assert_eq!(azimuth_direction_label("-180"), Some("N"));
+        assert_eq!(azimuth_direction_label("45"), Some("SW"));
+        assert_eq!(azimuth_direction_label("-45"), Some("SE"));
+        assert_eq!(azimuth_direction_label("not-a-number"), None);
     }
 }
