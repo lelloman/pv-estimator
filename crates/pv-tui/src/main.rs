@@ -11,13 +11,13 @@ use crossterm::terminal::{
 };
 use pv_core::source_model::SourceEnsembleEstimateDocument;
 use pv_core::weather::Location;
-use pv_model::{EstimateRequest, SourceModelEstimator, days_in_month};
+use pv_model::{EstimateRequest, SourceModelEstimator, days_in_month, short_month_name};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 #[derive(Debug, Parser)]
 #[command(name = "pv-tui")]
@@ -564,55 +564,57 @@ fn render_estimate(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         .split(inner);
     frame.render_widget(header.wrap(Wrap { trim: true }), chunks[0]);
 
-    let rows = estimate.monthly_estimates.iter().map(|monthly| {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!("{:<5} | {:^16} | {:^14}", "", "Monthly kWh", "Daily kWh"),
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "{:<5} | {:>5} {:>4} {:>4} | {:>4} {:>4} {:>4}",
+                "Month", "mean", "min", "max", "mean", "min", "max"
+            ),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    for monthly in &estimate.monthly_estimates {
         let month = monthly.month.value();
         let days = days_in_month(month).expect("valid month has a day count");
+        let month_name = short_month_name(month).expect("valid month has a short name");
         let total_kwh = monthly.energy.mean.as_kilowatt_hours();
-        let total_band = monthly
+        let (total_min, total_max, daily_min, daily_max) = monthly
             .uncertainty
             .annual_energy
             .map(|band| {
-                format!(
-                    "{:.0}-{:.0}",
-                    band.low.as_kilowatt_hours(),
-                    band.high.as_kilowatt_hours()
+                let low = band.low.as_kilowatt_hours();
+                let high = band.high.as_kilowatt_hours();
+                (
+                    format!("{low:.0}"),
+                    format!("{high:.0}"),
+                    format!("{:.1}", low / days),
+                    format!("{:.1}", high / days),
                 )
             })
-            .unwrap_or_else(|| "-".to_string());
-        let daily_band = monthly
-            .uncertainty
-            .annual_energy
-            .map(|band| {
-                format!(
-                    "{:.1}-{:.1}",
-                    band.low.as_kilowatt_hours() / days,
-                    band.high.as_kilowatt_hours() / days
+            .unwrap_or_else(|| {
+                (
+                    "-".to_string(),
+                    "-".to_string(),
+                    "-".to_string(),
+                    "-".to_string(),
                 )
-            })
-            .unwrap_or_else(|| "-".to_string());
-        Row::new(vec![
-            Cell::from(month.to_string()),
-            Cell::from(format!("{:.1}", total_kwh)),
-            Cell::from(total_band),
-            Cell::from(format!("{:.1}", total_kwh / days)),
-            Cell::from(daily_band),
-        ])
-    });
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(3),
-            Constraint::Length(7),
-            Constraint::Length(10),
-            Constraint::Length(7),
-            Constraint::Min(9),
-        ],
-    )
-    .header(
-        Row::new(vec!["M", "kWh", "band", "kWh/d", "d band"])
-            .style(Style::default().fg(Color::DarkGray)),
-    );
-    frame.render_widget(table, chunks[1]);
+            });
+        lines.push(Line::from(format!(
+            "{:<5} | {:>5.1} {:>4} {:>4} | {:>4.1} {:>4} {:>4}",
+            month_name,
+            total_kwh,
+            total_min,
+            total_max,
+            total_kwh / days,
+            daily_min,
+            daily_max
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), chunks[1]);
 }
 
 fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {

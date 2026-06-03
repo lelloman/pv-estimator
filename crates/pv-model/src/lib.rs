@@ -237,6 +237,16 @@ pub fn days_in_month(month: u8) -> Option<f64> {
         .copied()
 }
 
+pub fn short_month_name(month: u8) -> Option<&'static str> {
+    const NAMES: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    month
+        .checked_sub(1)
+        .and_then(|index| NAMES.get(index as usize))
+        .copied()
+}
+
 pub fn validate_request(request: &EstimateRequest) -> Result<()> {
     if !(-90.0..=90.0).contains(&request.latitude) {
         bail!("latitude must be in [-90, 90]");
@@ -313,43 +323,52 @@ pub fn format_table(document: &SourceEnsembleEstimateDocument) -> String {
     writeln!(&mut output).expect("writing string");
     writeln!(
         &mut output,
-        "month  total_kwh  total_band_kwh  avg_daily_kwh  avg_daily_band_kwh"
+        "{:<5} | {:^40} | {:^44}",
+        "", "Monthly kWh", "Daily kWh"
+    )
+    .expect("writing string");
+    writeln!(
+        &mut output,
+        "{:<5} | {:>10}  {:>13}  {:>13} | {:>15}  {:>17}  {:>17}",
+        "Month", "mean", "min", "max", "mean", "min", "max"
     )
     .expect("writing string");
     for monthly in &estimate.monthly_estimates {
         let month = monthly.month.value();
         let days = days_in_month(month).expect("valid month has a day count");
+        let month_name = short_month_name(month).expect("valid month has a short name");
         let total_kwh = monthly.energy.mean.as_kilowatt_hours();
-        let total_band = monthly
+        let (total_min, total_max, daily_min, daily_max) = monthly
             .uncertainty
             .annual_energy
             .map(|band| {
-                format!(
-                    "{:.2}..{:.2}",
-                    band.low.as_kilowatt_hours(),
-                    band.high.as_kilowatt_hours()
+                let low = band.low.as_kilowatt_hours();
+                let high = band.high.as_kilowatt_hours();
+                (
+                    format!("{low:.2}"),
+                    format!("{high:.2}"),
+                    format!("{:.2}", low / days),
+                    format!("{:.2}", high / days),
                 )
             })
-            .unwrap_or_else(|| "insufficient".to_string());
-        let daily_band = monthly
-            .uncertainty
-            .annual_energy
-            .map(|band| {
-                format!(
-                    "{:.2}..{:.2}",
-                    band.low.as_kilowatt_hours() / days,
-                    band.high.as_kilowatt_hours() / days
+            .unwrap_or_else(|| {
+                (
+                    "insufficient".to_string(),
+                    "insufficient".to_string(),
+                    "insufficient".to_string(),
+                    "insufficient".to_string(),
                 )
-            })
-            .unwrap_or_else(|| "insufficient".to_string());
+            });
         writeln!(
             &mut output,
-            "{:>5}  {:>9.2}  {:>14}  {:>13.2}  {}",
-            month,
+            "{:<5} | {:>10.2}  {:>13}  {:>13} | {:>15.2}  {:>17}  {:>17}",
+            month_name,
             total_kwh,
-            total_band,
+            total_min,
+            total_max,
             total_kwh / days,
-            daily_band
+            daily_min,
+            daily_max
         )
         .expect("writing string");
     }
