@@ -387,6 +387,7 @@ def evaluate(
     target_std: np.ndarray,
     batch_size: int,
     device: torch.device,
+    geography: "GeographyFeatures",
 ) -> dict[str, object]:
     model.eval()
     abs_error = np.zeros(TARGETS, dtype=np.float64)
