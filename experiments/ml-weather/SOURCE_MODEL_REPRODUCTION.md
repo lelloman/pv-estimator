@@ -258,6 +258,93 @@ if a different PyTorch/CUDA version changes deterministic behavior, or if the
 random seed changes. The important acceptance target is that the rebuilt ensemble
 stays in the same error range and remains better than the single-source models.
 
+## Geography-Aware v2 Candidate Workflow
+
+The v2 candidate keeps runtime inference offline while testing two targeted
+improvements: a denser empirical SARAH3 mask and scalar geography features.
+Generate the SARAH3 coverage probe locations from the auxiliary geography table:
+
+```sh
+python3 experiments/ml-weather/scripts/generate_sarah3_probe_locations.py \
+  --out experiments/ml-weather/runs/sarah3_coverage_probe_v2/locations.csv
+```
+
+Probe SARAH3 availability with compact status records instead of storing hourly
+raw JSON:
+
+```sh
+python3 experiments/ml-weather/scripts/download_pvgis_series.py \
+  --locations experiments/ml-weather/runs/sarah3_coverage_probe_v2/locations.csv \
+  --out-dir experiments/ml-weather/runs/sarah3_coverage_probe_v2/raw \
+  --databases PVGIS-SARAH3 \
+  --start-year 2023 \
+  --end-year 2023 \
+  --coverage-only \
+  --workers 1 \
+  --request-delay-seconds 2 \
+  --request-jitter-seconds 1
+```
+
+Build the v2 mask from one or more probe manifests:
+
+```sh
+python3 experiments/ml-weather/scripts/build_sarah3_grid_mask.py \
+  --manifest experiments/ml-weather/runs/sarah3_coverage_probe_v2/raw/manifest.json \
+  --out experiments/ml-weather/config/source_coverage/pvgis_sarah3_empirical_grid_mask_v2.json \
+  --grid-step-degrees 1.0
+```
+
+Package the runtime geography feature contract and grid. The default excludes
+identifiers, duplicate coordinates, region/name, and the categorical
+`cci_point_class`, leaving the existing numeric auxiliary geography columns:
+
+```sh
+python3 experiments/ml-weather/scripts/build_geography_feature_artifact.py \
+  --features experiments/ml-weather/runs/global_grid_7056/aux_geography/location_features_v1.csv \
+  --out-dir artifacts/source-models-geo-v2/geography
+```
+
+Train each source model with the same feature contract and grid:
+
+```sh
+.venv/bin/python scripts/train_climate_normals_stream_torch.py \
+  --normals-dir data/full_climate_normals_7056 \
+  --out-dir results/full_climate_normals_compressor_holdout_768x8_geo_v2 \
+  --hidden-width 768 \
+  --residual-blocks 8 \
+  --residual-scale 0.5 \
+  --epochs 100 \
+  --batch-size 65536 \
+  --learning-rate 0.0007 \
+  --val-location-stride 17 \
+  --eval-every 1 \
+  --eval-batch-size 262144 \
+  --feature-contract artifacts/source-models-geo-v2/geography/feature_contract.json \
+  --feature-grid artifacts/source-models-geo-v2/geography/geography_feature_grid.csv
+```
+
+Repeat for PVGIS-ERA5 and PVGIS-SARAH3 using their existing source-specific
+normals directories and epoch/learning-rate settings. Then export schema v2 ONNX
+artifacts with:
+
+```sh
+.venv/bin/python scripts/export_source_models_onnx.py \
+  --nasa-checkpoint results/full_climate_normals_compressor_holdout_768x8_geo_v2/best_model.pt \
+  --era5-checkpoint results/pvgis_era5_climate_normals_compressor_768x8_geo_v2/best_model.pt \
+  --sarah3-checkpoint results/pvgis_sarah3_climate_normals_compressor_768x8_geo_v2/best_model.pt \
+  --sarah3-mask config/source_coverage/pvgis_sarah3_empirical_grid_mask_v2.json \
+  --feature-contract artifacts/source-models-geo-v2/geography/feature_contract.json \
+  --feature-grid artifacts/source-models-geo-v2/geography/geography_feature_grid.csv \
+  --out-dir artifacts/source-models-768x8-geo-v2-int8
+```
+
+Promotion gate: ship the v2 ONNX bundle only if the 120-city benchmark stays at
+or below 3.19% MAE vs PVGIS-ERA5 and 3.93% MAE vs PVGIS-SARAH3, improves at
+least one Europe/Mediterranean primary reference MAE by 0.25 percentage points,
+and has no benchmark-region regression above 0.50 percentage points. If the
+geography model fails but the v2 SARAH3 mask passes, publish a mask-only bundle
+with the current v1 ONNX models and the v2 mask.
+
 ## ONNX Runtime Artifacts
 
 Production inference uses ONNX Runtime on CPU. PyTorch remains an experiment and

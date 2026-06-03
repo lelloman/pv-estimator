@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import shutil
@@ -20,7 +21,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from infer_source_ensemble import estimate_pv_from_climate  # noqa: E402
-from train_climate_normals_stream_torch import ClimateNormalMlp, INPUT_FEATURES, TARGET_NAMES, encode_features  # noqa: E402
+from train_climate_normals_stream_torch import BASE_INPUT_FEATURES, ClimateNormalMlp, TARGET_NAMES, encode_features  # noqa: E402
 
 TEMPORAL_BINS = 288
 UNCERTAINTY_MULTIPLIER = 2.0
@@ -52,6 +53,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--int8-reference-mae-pct", type=float, default=0.25)
     parser.add_argument("--keep-fp32", action="store_true", help="keep intermediate FP32 ONNX files beside INT8 artifacts")
     parser.add_argument("--skip-parity", action="store_true")
+    parser.add_argument("--feature-contract", type=Path, default=None, help="copy this geography feature contract into schema v2 artifacts")
+    parser.add_argument("--feature-grid", type=Path, default=None, help="copy this geography feature grid into schema v2 artifacts")
     return parser.parse_args()
 
 
@@ -62,6 +65,19 @@ def main() -> int:
     coverage_dir.mkdir(parents=True, exist_ok=True)
     mask_target = coverage_dir / "pvgis_sarah3_empirical_grid_mask.json"
     shutil.copyfile(args.sarah3_mask.expanduser(), mask_target)
+    geography = RuntimeGeographyFeatures.load(args.feature_contract, args.feature_grid)
+    geography_manifest = None
+    if geography.width:
+        geo_dir = args.out_dir / "geography"
+        geo_dir.mkdir(parents=True, exist_ok=True)
+        contract_target = geo_dir / "feature_contract.json"
+        grid_target = geo_dir / "geography_feature_grid.csv"
+        shutil.copyfile(args.feature_contract.expanduser(), contract_target)
+        shutil.copyfile(args.feature_grid.expanduser(), grid_target)
+        geography_manifest = {
+            "contract_path": str(contract_target.relative_to(args.out_dir)),
+            "grid_path": str(grid_target.relative_to(args.out_dir)),
+        }
 
     sources = [
         SourceExport(
@@ -93,19 +109,23 @@ def main() -> int:
     parity = {}
     for source in sources:
         model, checkpoint = load_checkpoint(source.checkpoint)
+        input_features = int(checkpoint["input_features"])
+        if input_features != BASE_INPUT_FEATURES + geography.width:
+            raise RuntimeError(f"{source.source_id} checkpoint input_features={input_features} does not match export features {BASE_INPUT_FEATURES + geography.width}")
         fp32_path = fp32_dir / source.onnx_name.replace(".onnx", ".fp32.onnx")
         int8_path = args.out_dir / source.onnx_name
-        export_onnx(model, fp32_path, args.opset)
+        export_onnx(model, fp32_path, args.opset, input_features)
         quantize_int8(fp32_path, int8_path)
         if not args.skip_parity:
             parity[source.source_id] = {
-                "fp32": check_fp32_parity(model, fp32_path, args.fp32_parity_atol),
+                "fp32": check_fp32_parity(model, fp32_path, args.fp32_parity_atol, geography),
                 "int8": check_int8_delta(
                     model,
                     fp32_path,
                     int8_path,
                     checkpoint,
                     args.int8_reference_mae_pct,
+                    geography,
                 ),
             }
         source_manifest = {
@@ -137,9 +157,9 @@ def main() -> int:
         shutil.rmtree(fp32_dir)
 
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2 if geography_manifest else 1,
         "model_family": "monthly-hourly climate-normal residual MLP",
-        "input_features": INPUT_FEATURES,
+        "input_features": BASE_INPUT_FEATURES + geography.width,
         "temporal_bins": TEMPORAL_BINS,
         "target_names": TARGET_NAMES,
         "uncertainty_multiplier": UNCERTAINTY_MULTIPLIER,
@@ -152,11 +172,62 @@ def main() -> int:
         "sources": manifest_sources,
         "parity": parity,
     }
+    if geography_manifest is not None:
+        manifest["geography_features"] = geography_manifest
     manifest_path = args.out_dir / "source-model-artifacts.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(f"wrote {manifest_path}", flush=True)
     return 0
 
+
+
+class RuntimeGeographyFeatures:
+    def __init__(self, columns: list[str], mean: np.ndarray, std: np.ndarray, clip_abs: float | None, rows: list[tuple[float, float, np.ndarray]]) -> None:
+        self.columns = columns
+        self.mean = mean
+        self.std = std
+        self.clip_abs = clip_abs
+        self.rows = rows
+        self.width = len(columns)
+
+    @classmethod
+    def load(cls, contract_path: Path | None, grid_path: Path | None) -> "RuntimeGeographyFeatures":
+        if contract_path is None and grid_path is None:
+            return cls([], np.empty((0,), dtype=np.float32), np.empty((0,), dtype=np.float32), None, [])
+        if contract_path is None or grid_path is None:
+            raise ValueError("--feature-contract and --feature-grid must be provided together")
+        contract = json.loads(contract_path.expanduser().read_text(encoding="utf-8"))
+        columns = list(contract["columns"])
+        mean = np.asarray(contract["mean"], dtype=np.float32)
+        std = np.maximum(np.asarray(contract["std"], dtype=np.float32), 1.0e-6)
+        rows: list[tuple[float, float, np.ndarray]] = []
+        with grid_path.expanduser().open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                values = np.asarray([float(row[column]) for column in columns], dtype=np.float32)
+                rows.append((float(row["latitude"]), float(row["longitude"]), values))
+        if not rows:
+            raise ValueError("feature grid has no rows")
+        return cls(columns, mean, std, contract.get("clip_abs"), rows)
+
+    def normalized_features(self, lat: float, lon: float) -> np.ndarray:
+        raw = self.interpolate_raw(lat, lon)
+        normalized = (raw - self.mean) / self.std
+        if self.clip_abs is not None:
+            normalized = np.clip(normalized, -float(self.clip_abs), float(self.clip_abs))
+        return normalized.astype(np.float32)
+
+    def interpolate_raw(self, lat: float, lon: float) -> np.ndarray:
+        lat_scale = max(abs(np.cos(np.radians(lat))), 0.1)
+        nearest = sorted(
+            (((lat - row_lat) ** 2 + ((lon - row_lon) * lat_scale) ** 2, values) for row_lat, row_lon, values in self.rows),
+            key=lambda item: item[0],
+        )[:4]
+        if nearest[0][0] <= 1.0e-12:
+            return nearest[0][1]
+        weights = np.asarray([1.0 / max(distance, 1.0e-12) ** 0.5 for distance, _values in nearest], dtype=np.float64)
+        values = np.stack([values for _distance, values in nearest]).astype(np.float64)
+        return np.average(values, axis=0, weights=weights).astype(np.float32)
 
 def load_checkpoint(path: Path) -> tuple[ClimateNormalMlp, dict[str, Any]]:
     checkpoint = torch.load(path.expanduser(), map_location="cpu", weights_only=False)
@@ -171,8 +242,8 @@ def load_checkpoint(path: Path) -> tuple[ClimateNormalMlp, dict[str, Any]]:
     return model, checkpoint
 
 
-def export_onnx(model: ClimateNormalMlp, out: Path, opset: int) -> None:
-    dummy = torch.zeros((TEMPORAL_BINS, INPUT_FEATURES), dtype=torch.float32)
+def export_onnx(model: ClimateNormalMlp, out: Path, opset: int, input_features: int) -> None:
+    dummy = torch.zeros((TEMPORAL_BINS, input_features), dtype=torch.float32)
     torch.onnx.export(
         model,
         dummy,
@@ -196,7 +267,7 @@ def quantize_int8(fp32_path: Path, int8_path: Path) -> None:
     print(f"wrote {int8_path}", flush=True)
 
 
-def check_fp32_parity(model: ClimateNormalMlp, onnx_path: Path, atol: float) -> dict[str, float]:
+def check_fp32_parity(model: ClimateNormalMlp, onnx_path: Path, atol: float, geography: "RuntimeGeographyFeatures") -> dict[str, float]:
     import onnxruntime as ort
 
     session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
@@ -204,7 +275,7 @@ def check_fp32_parity(model: ClimateNormalMlp, onnx_path: Path, atol: float) -> 
     mean_abs = []
     with torch.no_grad():
         for _name, lat, lon in REFERENCE_POINTS:
-            features = reference_features(lat, lon)
+            features = reference_features(lat, lon, geography)
             torch_out = model(torch.from_numpy(features)).numpy()
             onnx_out = session.run(["normalized_targets"], {"features": features})[0]
             diff = np.abs(torch_out - onnx_out)
@@ -221,6 +292,7 @@ def check_int8_delta(
     int8_path: Path,
     checkpoint: dict[str, Any],
     annual_mae_limit_pct: float,
+    geography: "RuntimeGeographyFeatures",
 ) -> dict[str, float]:
     import onnxruntime as ort
 
@@ -229,7 +301,7 @@ def check_int8_delta(
     normalized_max_abs = 0.0
     annual_energy_deltas = []
     for _name, lat, lon in REFERENCE_POINTS:
-        features = reference_features(lat, lon)
+        features = reference_features(lat, lon, geography)
         fp32_out = fp32_session.run(["normalized_targets"], {"features": features})[0]
         int8_out = int8_session.run(["normalized_targets"], {"features": features})[0]
         normalized_max_abs = max(normalized_max_abs, float(np.max(np.abs(fp32_out - int8_out))))
@@ -251,14 +323,18 @@ def check_int8_delta(
     }
 
 
-def reference_features(lat: float, lon: float) -> np.ndarray:
+def reference_features(lat: float, lon: float, geography: "RuntimeGeographyFeatures") -> np.ndarray:
     temporal = np.arange(TEMPORAL_BINS, dtype=np.int64)
-    return encode_features(
+    base = encode_features(
         np.full(TEMPORAL_BINS, lat, dtype=np.float32),
         np.full(TEMPORAL_BINS, lon, dtype=np.float32),
         temporal,
         TEMPORAL_BINS,
     )
+    if geography.width == 0:
+        return base
+    aux = np.repeat(geography.normalized_features(lat, lon).reshape(1, geography.width), TEMPORAL_BINS, axis=0)
+    return np.concatenate([base, aux], axis=1).astype(np.float32)
 
 
 def denormalize(values: np.ndarray, checkpoint: dict[str, Any]) -> np.ndarray:

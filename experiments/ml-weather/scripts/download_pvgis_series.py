@@ -53,6 +53,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--request-delay-seconds", type=float, default=2.0)
     parser.add_argument("--request-jitter-seconds", type=float, default=1.0)
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--coverage-only", action="store_true", help="probe source/location availability and write small status records instead of raw hourly payloads")
     return parser.parse_args()
 
 
@@ -144,12 +145,14 @@ def download_one(
     timeout_seconds: float,
     request_delay_seconds: float,
     request_jitter_seconds: float,
+    coverage_only: bool,
 ) -> dict[str, Any]:
     location_id = location["location_id"]
     source_id = SOURCE_ID_BY_DATABASE.get(database, f"pvgis_{database.lower().replace('-', '_')}_hourly")
     source_dir = out_dir / database_dir_name(database)
     source_dir.mkdir(parents=True, exist_ok=True)
-    out_path = source_dir / f"{location_id}_{start_year}_{end_year}.json"
+    suffix = "coverage.json" if coverage_only else "json"
+    out_path = source_dir / f"{location_id}_{start_year}_{end_year}.{suffix}"
     error_path = source_dir / f"{location_id}_{start_year}_{end_year}.error.json"
     url = build_url(location, database, start_year, end_year)
 
@@ -186,6 +189,23 @@ def download_one(
         }
         error_path.write_text(json.dumps(error_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         return file_record(location, database, source_id, error_path, "coverage_miss", url)
+
+    if coverage_only:
+        coverage_payload = {
+            "status": "coverage_available",
+            "database": database,
+            "source_id": source_id,
+            "location_id": location_id,
+            "latitude": float(location["latitude"]),
+            "longitude": float(location["longitude"]),
+            "start_year": start_year,
+            "end_year": end_year,
+            "request_url": url,
+            "response_bytes": len(payload),
+            "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        }
+        out_path.write_text(json.dumps(coverage_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        return file_record(location, database, source_id, out_path, "coverage_available", url)
 
     out_path.write_bytes(payload)
     return file_record(location, database, source_id, out_path, "downloaded", url)
@@ -227,6 +247,7 @@ def main() -> int:
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "locations_file": str(args.locations),
         "workers": args.workers,
+        "coverage_only": args.coverage_only,
         "request_delay_seconds": args.request_delay_seconds,
         "request_jitter_seconds": args.request_jitter_seconds,
         "files": [],
@@ -254,6 +275,7 @@ def main() -> int:
             args.timeout_seconds,
             args.request_delay_seconds,
             args.request_jitter_seconds,
+            args.coverage_only,
         )
         pending[future] = None
         return True

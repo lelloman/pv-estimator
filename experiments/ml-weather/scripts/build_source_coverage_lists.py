@@ -40,7 +40,7 @@ def main() -> int:
             status = str(record["status"])
             location_id = str(record["location_id"])
             status_counts[database][status] += 1
-            if status in {"downloaded", "skipped_existing"}:
+            if status in {"downloaded", "skipped_existing", "coverage_available"}:
                 covered[database].add(location_id)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
