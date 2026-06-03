@@ -10,3 +10,8 @@ workspace = true
 
 [dependencies]
 pv-core = { path = "../pv-core" }
+zstd = "0.13"
+
+[build-dependencies]
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
+zstd = "0.13"
