@@ -12,7 +12,10 @@ workspace = true
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 crossterm = "0.28"
+directories = "6.0"
 pv-core = { path = "../pv-core" }
 pv-data = { path = "../pv-data" }
 pv-model = { path = "../pv-model" }
 ratatui = "0.29"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
