@@ -1,3 +1,4 @@
+use std::fs;
 use std::io;
 use std::path::PathBuf;
 use std::thread;
@@ -10,6 +11,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use directories::ProjectDirs;
 use pv_core::source_model::SourceEnsembleEstimateDocument;
 use pv_data::CitySearchResult;
 use pv_model::{EstimateRequest, SourceModelEstimator, days_in_month, short_month_name};
@@ -19,6 +21,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Parser)]
 #[command(name = "pv-tui")]
@@ -28,6 +31,22 @@ struct Args {
     model_dir: PathBuf,
     #[arg(long, default_value = "source-model-artifacts.json")]
     manifest: String,
+}
+
+const TUI_STATE_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TuiState {
+    schema_version: u32,
+    selected_location_id: String,
+    location_query: String,
+    fields: Vec<TuiFieldState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TuiFieldState {
+    label: String,
+    value: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,8 +106,10 @@ fn run() -> Result<()> {
     terminal.clear()?;
 
     let mut app = App::new();
+    app.load_saved_state();
     app.recompute(&mut estimator);
     run_app(&mut terminal, &mut app, &mut estimator)?;
+    app.save_state();
     terminal.show_cursor()?;
     Ok(())
 }
@@ -146,10 +167,68 @@ impl App {
             Ok(document) => {
                 self.status = "Estimate updated".to_string();
                 self.estimate = Some(document);
+                self.save_state();
             }
             Err(error) => {
                 self.status = format!("{error:#}");
             }
+        }
+    }
+
+    fn load_saved_state(&mut self) {
+        let Some(path) = tui_state_path() else {
+            return;
+        };
+        let Ok(bytes) = fs::read(&path) else {
+            return;
+        };
+        let Ok(state) = serde_json::from_slice::<TuiState>(&bytes) else {
+            self.status = format!("Ignored invalid state file: {}", path.display());
+            return;
+        };
+        if state.schema_version != TUI_STATE_SCHEMA_VERSION {
+            self.status = format!("Ignored old state file: {}", path.display());
+            return;
+        }
+        for field in &mut self.fields {
+            if let Some(saved) = state.fields.iter().find(|saved| saved.label == field.label) {
+                field.set_value(&saved.value);
+            }
+        }
+        self.selected_location_id = state.selected_location_id;
+        self.location_query.set_value(&state.location_query);
+        self.refresh_location_results();
+        self.status = format!("Loaded {}", path.display());
+    }
+
+    fn save_state(&mut self) {
+        let Some(path) = tui_state_path() else {
+            self.status = "Could not resolve local state path".to_string();
+            return;
+        };
+        let state = TuiState {
+            schema_version: TUI_STATE_SCHEMA_VERSION,
+            selected_location_id: self.selected_location_id.clone(),
+            location_query: self.location_query.value.clone(),
+            fields: self
+                .fields
+                .iter()
+                .map(|field| TuiFieldState {
+                    label: field.label.to_string(),
+                    value: field.value.clone(),
+                })
+                .collect(),
+        };
+        let result = (|| -> Result<()> {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let bytes = serde_json::to_vec_pretty(&state)?;
+            fs::write(&path, bytes)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.status = format!("Could not save state: {error:#}");
         }
     }
 
@@ -211,6 +290,11 @@ impl App {
         self.mode = Mode::Normal;
         self.recompute(estimator);
     }
+}
+
+fn tui_state_path() -> Option<PathBuf> {
+    ProjectDirs::from("dev", "lelloman", "pv-estimator")
+        .map(|dirs| dirs.config_dir().join("pv-tui-state.json"))
 }
 
 impl Field {
