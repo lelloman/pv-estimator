@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::error::Error;
 use std::f32::consts::PI;
@@ -43,6 +44,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some("normalize-nasa-power") => {
             normalize_nasa_power(NormalizeConfig::from_args(args.collect())?)
         }
+        Some("geonames") => geonames(args.collect()),
         Some("help") | None => {
             print_help();
             Ok(())
@@ -56,6 +58,7 @@ fn print_help() {
     println!("  train-weather-mlp --data <csv.gz> --out-dir <dir> [options]");
     println!("  weather-climatology-baseline --data <csv.gz> --out-dir <dir> [options]");
     println!("  normalize-nasa-power --raw-dir <dir> --out <csv.gz> [--workers <n>]");
+    println!("  geonames fetch|profile|report [options]");
 }
 
 #[derive(Debug)]
@@ -1415,4 +1418,776 @@ fn unix_timestamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+const GEONAMES_BASE_URL: &str = "https://download.geonames.org/export/dump";
+const GEONAMES_CITIES_FILE: &str = "cities1000.zip";
+const GEONAMES_CITIES_TXT: &str = "cities1000.txt";
+const GEONAMES_DEFAULT_RAW_DIR: &str = "artifacts/geonames/raw";
+const GEONAMES_DEFAULT_OUT_DIR: &str = "artifacts/geonames/curated";
+const GEONAMES_SAMPLE_QUERIES: [&str; 5] = ["Roma", "Milan", "Miln", "Springfield", "Paris"];
+
+fn geonames(args: Vec<String>) -> Result<(), Box<dyn Error>> {
+    let Some((command, rest)) = args.split_first() else {
+        print_geonames_help();
+        return Ok(());
+    };
+
+    match command.as_str() {
+        "fetch" => geonames_fetch(GeonamesFetchConfig::from_args(rest)?),
+        "profile" => geonames_profile(GeonamesProfileConfig::from_args(rest)?),
+        "report" => geonames_report(GeonamesReportConfig::from_args(rest)?),
+        "help" => {
+            print_geonames_help();
+            Ok(())
+        }
+        other => Err(format!("unknown geonames command: {other}").into()),
+    }
+}
+
+fn print_geonames_help() {
+    println!("xtask geonames commands:");
+    println!("  geonames fetch [--raw-dir <dir>] [--force]");
+    println!("  geonames profile [--raw-dir <dir>] [--out-dir <dir>] [--max-rows <n>]");
+    println!("  geonames report [--out-dir <dir>]");
+}
+
+#[derive(Debug)]
+struct GeonamesFetchConfig {
+    raw_dir: PathBuf,
+    force: bool,
+}
+
+impl GeonamesFetchConfig {
+    fn from_args(args: &[String]) -> Result<Self, Box<dyn Error>> {
+        let mut config = Self {
+            raw_dir: PathBuf::from(GEONAMES_DEFAULT_RAW_DIR),
+            force: false,
+        };
+        let mut index = 0;
+        while index < args.len() {
+            match args[index].as_str() {
+                "--raw-dir" => {
+                    let value = args.get(index + 1).ok_or("missing value for --raw-dir")?;
+                    config.raw_dir = PathBuf::from(value);
+                    index += 2;
+                }
+                "--force" => {
+                    config.force = true;
+                    index += 1;
+                }
+                key => return Err(format!("unknown geonames fetch option: {key}").into()),
+            }
+        }
+        Ok(config)
+    }
+}
+
+#[derive(Debug)]
+struct GeonamesProfileConfig {
+    raw_dir: PathBuf,
+    out_dir: PathBuf,
+    max_rows: Option<usize>,
+}
+
+impl GeonamesProfileConfig {
+    fn from_args(args: &[String]) -> Result<Self, Box<dyn Error>> {
+        let mut config = Self {
+            raw_dir: PathBuf::from(GEONAMES_DEFAULT_RAW_DIR),
+            out_dir: PathBuf::from(GEONAMES_DEFAULT_OUT_DIR),
+            max_rows: None,
+        };
+        let mut index = 0;
+        while index < args.len() {
+            let key = &args[index];
+            match key.as_str() {
+                "--raw-dir" | "--out-dir" | "--max-rows" => {
+                    let value = args
+                        .get(index + 1)
+                        .ok_or_else(|| format!("missing value for {key}"))?;
+                    match key.as_str() {
+                        "--raw-dir" => config.raw_dir = PathBuf::from(value),
+                        "--out-dir" => config.out_dir = PathBuf::from(value),
+                        "--max-rows" => config.max_rows = Some(value.parse()?),
+                        _ => unreachable!(),
+                    }
+                    index += 2;
+                }
+                _ => return Err(format!("unknown geonames profile option: {key}").into()),
+            }
+        }
+        Ok(config)
+    }
+}
+
+#[derive(Debug)]
+struct GeonamesReportConfig {
+    out_dir: PathBuf,
+}
+
+impl GeonamesReportConfig {
+    fn from_args(args: &[String]) -> Result<Self, Box<dyn Error>> {
+        let mut config = Self {
+            out_dir: PathBuf::from(GEONAMES_DEFAULT_OUT_DIR),
+        };
+        let mut index = 0;
+        while index < args.len() {
+            match args[index].as_str() {
+                "--out-dir" => {
+                    let value = args.get(index + 1).ok_or("missing value for --out-dir")?;
+                    config.out_dir = PathBuf::from(value);
+                    index += 2;
+                }
+                key => return Err(format!("unknown geonames report option: {key}").into()),
+            }
+        }
+        Ok(config)
+    }
+}
+
+fn geonames_fetch(config: GeonamesFetchConfig) -> Result<(), Box<dyn Error>> {
+    fs::create_dir_all(&config.raw_dir)?;
+    let out = config.raw_dir.join(GEONAMES_CITIES_FILE);
+    if out.exists() && !config.force {
+        println!(
+            "{} already exists; use --force to download again",
+            out.display()
+        );
+        return Ok(());
+    }
+
+    let tmp = out.with_extension("zip.tmp");
+    let url = format!("{GEONAMES_BASE_URL}/{GEONAMES_CITIES_FILE}");
+    println!("downloading {url}");
+    let status = Command::new("curl")
+        .arg("--fail")
+        .arg("--location")
+        .arg("--show-error")
+        .arg("--output")
+        .arg(&tmp)
+        .arg(&url)
+        .status()?;
+    if !status.success() {
+        return Err(format!("curl exited with status {status}").into());
+    }
+    fs::rename(&tmp, &out)?;
+    println!("wrote {}", out.display());
+    Ok(())
+}
+
+fn geonames_profile(config: GeonamesProfileConfig) -> Result<(), Box<dyn Error>> {
+    fs::create_dir_all(&config.out_dir)?;
+    let zip_path = config.raw_dir.join(GEONAMES_CITIES_FILE);
+    if !zip_path.exists() {
+        return Err(format!(
+            "missing {}; run `cargo run -p xtask -- geonames fetch` first",
+            zip_path.display()
+        )
+        .into());
+    }
+
+    println!("reading {}", zip_path.display());
+    let cities = load_geonames_cities(&zip_path, config.max_rows)?;
+    if cities.is_empty() {
+        return Err("GeoNames catalog is empty".into());
+    }
+    println!("loaded {} cities", cities.len());
+
+    let variants = geonames_variant_specs();
+    let mut variant_reports = Vec::with_capacity(variants.len());
+    for spec in &variants {
+        let encoded = encode_city_catalog(&cities, spec)?;
+        let compressed = zstd::stream::encode_all(encoded.as_slice(), 19)?;
+        let bin_path = config.out_dir.join(format!("{}.bin", spec.id));
+        let zst_path = config.out_dir.join(format!("{}.bin.zst", spec.id));
+        fs::write(&bin_path, &encoded)?;
+        fs::write(&zst_path, &compressed)?;
+        let search_results = GEONAMES_SAMPLE_QUERIES
+            .iter()
+            .map(|query| {
+                let results = search_geonames_cities(&cities, spec, query, 5)
+                    .into_iter()
+                    .map(|result| {
+                        json!({
+                            "name": result.name,
+                            "country_code": result.country_code,
+                            "latitude": result.latitude,
+                            "longitude": result.longitude,
+                            "population": result.population,
+                            "score": result.score,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                json!({ "query": query, "results": results })
+            })
+            .collect::<Vec<_>>();
+
+        variant_reports.push(json!({
+            "id": spec.id,
+            "description": spec.description,
+            "alias_cap": spec.alias_cap,
+            "include_ascii_name": spec.include_ascii_name,
+            "include_rank_fields": spec.include_rank_fields,
+            "records": cities.len(),
+            "uncompressed_bytes": encoded.len(),
+            "zstd_bytes": compressed.len(),
+            "search_samples": search_results,
+        }));
+        println!(
+            "variant={} uncompressed={} zstd={}",
+            spec.id,
+            encoded.len(),
+            compressed.len()
+        );
+    }
+
+    let summary = json!({
+        "source": "GeoNames cities1000.zip",
+        "source_url": format!("{GEONAMES_BASE_URL}/{GEONAMES_CITIES_FILE}"),
+        "created_at_unix_seconds": unix_timestamp(),
+        "city_count": cities.len(),
+        "variants": variant_reports,
+    });
+    let summary_path = config.out_dir.join("summary.json");
+    fs::write(
+        &summary_path,
+        serde_json::to_string_pretty(&summary)? + "\n",
+    )?;
+    write_geonames_markdown_report(&summary, &config.out_dir.join("report.md"))?;
+    println!("wrote {}", summary_path.display());
+    println!("wrote {}", config.out_dir.join("report.md").display());
+    Ok(())
+}
+
+fn geonames_report(config: GeonamesReportConfig) -> Result<(), Box<dyn Error>> {
+    let report_path = config.out_dir.join("report.md");
+    if report_path.exists() {
+        let report = fs::read_to_string(&report_path)?;
+        print!("{report}");
+        return Ok(());
+    }
+    let summary_path = config.out_dir.join("summary.json");
+    if !summary_path.exists() {
+        return Err(format!(
+            "missing {}; run `cargo run -p xtask -- geonames profile` first",
+            summary_path.display()
+        )
+        .into());
+    }
+    let summary: Value = serde_json::from_reader(BufReader::new(File::open(&summary_path)?))?;
+    write_geonames_markdown_report(&summary, &report_path)?;
+    let report = fs::read_to_string(&report_path)?;
+    print!("{report}");
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct GeonamesCity {
+    geoname_id: u32,
+    name: String,
+    ascii_name: String,
+    alternate_names: String,
+    latitude: f64,
+    longitude: f64,
+    feature_code: String,
+    country_code: String,
+    population: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CityCatalogVariantSpec {
+    id: &'static str,
+    description: &'static str,
+    include_ascii_name: bool,
+    include_rank_fields: bool,
+    alias_cap: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CitySearchResult {
+    name: String,
+    country_code: String,
+    latitude: f64,
+    longitude: f64,
+    population: u64,
+    score: usize,
+}
+
+fn geonames_variant_specs() -> Vec<CityCatalogVariantSpec> {
+    vec![
+        CityCatalogVariantSpec {
+            id: "name_lat_lon",
+            description: "display name and coordinates only",
+            include_ascii_name: false,
+            include_rank_fields: false,
+            alias_cap: 0,
+        },
+        CityCatalogVariantSpec {
+            id: "ascii_lat_lon",
+            description: "display name, ASCII name, and coordinates",
+            include_ascii_name: true,
+            include_rank_fields: false,
+            alias_cap: 0,
+        },
+        CityCatalogVariantSpec {
+            id: "ranked_no_aliases",
+            description: "ASCII name plus country, population, and feature code",
+            include_ascii_name: true,
+            include_rank_fields: true,
+            alias_cap: 0,
+        },
+        CityCatalogVariantSpec {
+            id: "ranked_aliases_3",
+            description: "ranking fields plus up to 3 built-in aliases per city",
+            include_ascii_name: true,
+            include_rank_fields: true,
+            alias_cap: 3,
+        },
+        CityCatalogVariantSpec {
+            id: "ranked_aliases_6",
+            description: "ranking fields plus up to 6 built-in aliases per city",
+            include_ascii_name: true,
+            include_rank_fields: true,
+            alias_cap: 6,
+        },
+        CityCatalogVariantSpec {
+            id: "ranked_aliases_10",
+            description: "ranking fields plus up to 10 built-in aliases per city",
+            include_ascii_name: true,
+            include_rank_fields: true,
+            alias_cap: 10,
+        },
+    ]
+}
+
+fn load_geonames_cities(
+    zip_path: &Path,
+    max_rows: Option<usize>,
+) -> Result<Vec<GeonamesCity>, Box<dyn Error>> {
+    let file = File::open(zip_path)?;
+    let mut archive = zip::ZipArchive::new(file)?;
+    let zip_file = archive.by_name(GEONAMES_CITIES_TXT)?;
+    let mut reader = BufReader::with_capacity(1024 * 1024, zip_file);
+    let mut line = String::new();
+    let mut cities = Vec::new();
+
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        if let Some(city) = parse_geonames_city(line.trim_end())? {
+            cities.push(city);
+            if max_rows.is_some_and(|limit| cities.len() >= limit) {
+                break;
+            }
+        }
+    }
+    Ok(cities)
+}
+
+fn parse_geonames_city(line: &str) -> Result<Option<GeonamesCity>, Box<dyn Error>> {
+    if line.trim().is_empty() {
+        return Ok(None);
+    }
+    let fields = line.split('\t').collect::<Vec<_>>();
+    if fields.len() < 19 {
+        return Err(format!("invalid GeoNames city row with {} fields", fields.len()).into());
+    }
+    Ok(Some(GeonamesCity {
+        geoname_id: fields[0].parse()?,
+        name: fields[1].to_string(),
+        ascii_name: fields[2].to_string(),
+        alternate_names: fields[3].to_string(),
+        latitude: fields[4].parse()?,
+        longitude: fields[5].parse()?,
+        feature_code: fields[7].to_string(),
+        country_code: fields[8].to_string(),
+        population: fields[14].parse().unwrap_or(0),
+    }))
+}
+
+fn encode_city_catalog(
+    cities: &[GeonamesCity],
+    spec: &CityCatalogVariantSpec,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let mut out = Vec::with_capacity(cities.len() * 48);
+    out.extend_from_slice(b"PVCITYCAT1\n");
+    out.extend_from_slice(spec.id.as_bytes());
+    out.push(0);
+    out.push(u8::from(spec.include_ascii_name));
+    out.push(u8::from(spec.include_rank_fields));
+    write_u16(spec.alias_cap.try_into()?, &mut out);
+    write_u32(cities.len().try_into()?, &mut out);
+
+    for city in cities {
+        write_u32(city.geoname_id, &mut out);
+        write_string(&city.name, &mut out)?;
+        if spec.include_ascii_name {
+            write_string(&city.ascii_name, &mut out)?;
+        }
+        write_i32((city.latitude * 1_000_000.0).round() as i32, &mut out);
+        write_i32((city.longitude * 1_000_000.0).round() as i32, &mut out);
+        if spec.include_rank_fields {
+            write_string(&city.country_code, &mut out)?;
+            write_u32(city.population.min(u64::from(u32::MAX)) as u32, &mut out);
+            write_string(&city.feature_code, &mut out)?;
+        }
+        let aliases = prune_city_aliases(city, spec.alias_cap);
+        write_u16(aliases.len().try_into()?, &mut out);
+        for alias in aliases {
+            write_string(&alias, &mut out)?;
+        }
+    }
+    Ok(out)
+}
+
+fn write_string(value: &str, out: &mut Vec<u8>) -> Result<(), Box<dyn Error>> {
+    let bytes = value.as_bytes();
+    let len: u16 = bytes
+        .len()
+        .try_into()
+        .map_err(|_| format!("string is too long for catalog field: {value}"))?;
+    write_u16(len, out);
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn write_u16(value: u16, out: &mut Vec<u8>) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn write_u32(value: u32, out: &mut Vec<u8>) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn write_i32(value: i32, out: &mut Vec<u8>) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn prune_city_aliases(city: &GeonamesCity, alias_cap: usize) -> Vec<String> {
+    if alias_cap == 0 || city.alternate_names.is_empty() {
+        return Vec::new();
+    }
+    let mut seen = HashSet::new();
+    seen.insert(normalize_search_text(&city.name));
+    seen.insert(normalize_search_text(&city.ascii_name));
+
+    let mut aliases = city
+        .alternate_names
+        .split(',')
+        .filter_map(|alias| {
+            let alias = alias.trim();
+            if !is_useful_city_alias(alias) {
+                return None;
+            }
+            let normalized = normalize_search_text(alias);
+            if normalized.is_empty() || !seen.insert(normalized) {
+                return None;
+            }
+            Some(alias.to_string())
+        })
+        .collect::<Vec<_>>();
+    aliases.sort_by(|left, right| left.len().cmp(&right.len()).then_with(|| left.cmp(right)));
+    aliases.truncate(alias_cap);
+    aliases
+}
+
+fn is_useful_city_alias(alias: &str) -> bool {
+    let chars = alias.chars().count();
+    (2..=48).contains(&chars)
+        && !alias.starts_with("http")
+        && alias.chars().any(char::is_alphabetic)
+        && alias
+            .chars()
+            .all(|char| !char.is_control() && char != '\t' && char != ',')
+}
+
+fn search_geonames_cities(
+    cities: &[GeonamesCity],
+    spec: &CityCatalogVariantSpec,
+    query: &str,
+    limit: usize,
+) -> Vec<CitySearchResult> {
+    let normalized_query = normalize_search_text(query);
+    if normalized_query.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+
+    let mut results = cities
+        .iter()
+        .filter_map(|city| {
+            let score = city_search_score(city, spec, &normalized_query)?;
+            Some(CitySearchResult {
+                name: city.name.clone(),
+                country_code: if spec.include_rank_fields {
+                    city.country_code.clone()
+                } else {
+                    String::new()
+                },
+                latitude: city.latitude,
+                longitude: city.longitude,
+                population: if spec.include_rank_fields {
+                    city.population
+                } else {
+                    0
+                },
+                score,
+            })
+        })
+        .collect::<Vec<_>>();
+    results.sort_by(|left, right| {
+        left.score
+            .cmp(&right.score)
+            .then_with(|| right.population.cmp(&left.population))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    results.truncate(limit);
+    results
+}
+
+fn city_search_score(
+    city: &GeonamesCity,
+    spec: &CityCatalogVariantSpec,
+    normalized_query: &str,
+) -> Option<usize> {
+    let mut names = vec![city.name.as_str()];
+    if spec.include_ascii_name {
+        names.push(city.ascii_name.as_str());
+    }
+    let aliases = prune_city_aliases(city, spec.alias_cap);
+    for alias in &aliases {
+        names.push(alias.as_str());
+    }
+    names
+        .into_iter()
+        .filter_map(|name| name_match_score(name, normalized_query))
+        .min()
+}
+
+fn name_match_score(name: &str, normalized_query: &str) -> Option<usize> {
+    let normalized_name = normalize_search_text(name);
+    if normalized_name == normalized_query {
+        Some(0)
+    } else if normalized_name.starts_with(normalized_query) {
+        Some(100 + normalized_name.len().saturating_sub(normalized_query.len()))
+    } else if normalized_name.contains(normalized_query) {
+        Some(200 + normalized_name.len().saturating_sub(normalized_query.len()))
+    } else {
+        let distance = levenshtein_bounded(&normalized_name, normalized_query, 2)?;
+        Some(300 + distance * 10 + normalized_name.len().abs_diff(normalized_query.len()))
+    }
+}
+
+fn normalize_search_text(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter(|char| char.is_alphanumeric())
+        .collect()
+}
+
+fn levenshtein_bounded(left: &str, right: &str, max_distance: usize) -> Option<usize> {
+    if left.len().abs_diff(right.len()) > max_distance {
+        return None;
+    }
+    let right_chars = right.chars().collect::<Vec<_>>();
+    let mut previous = (0..=right_chars.len()).collect::<Vec<_>>();
+    let mut current = vec![0; right_chars.len() + 1];
+
+    for (left_index, left_char) in left.chars().enumerate() {
+        current[0] = left_index + 1;
+        let mut row_min = current[0];
+        for (right_index, right_char) in right_chars.iter().enumerate() {
+            let substitution_cost = usize::from(left_char != *right_char);
+            current[right_index + 1] = (previous[right_index + 1] + 1)
+                .min(current[right_index] + 1)
+                .min(previous[right_index] + substitution_cost);
+            row_min = row_min.min(current[right_index + 1]);
+        }
+        if row_min > max_distance {
+            return None;
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    let distance = previous[right_chars.len()];
+    (distance <= max_distance).then_some(distance)
+}
+
+fn write_geonames_markdown_report(summary: &Value, path: &Path) -> Result<(), Box<dyn Error>> {
+    let mut writer = BufWriter::new(File::create(path)?);
+    writeln!(writer, "# GeoNames City Catalog Profile")?;
+    writeln!(writer)?;
+    writeln!(
+        writer,
+        "Source: {}",
+        summary
+            .get("source_url")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+    )?;
+    writeln!(
+        writer,
+        "Cities: {}",
+        summary
+            .get("city_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    )?;
+    writeln!(writer)?;
+    writeln!(writer, "| Variant | Records | Raw | zstd | Description |")?;
+    writeln!(writer, "| --- | ---: | ---: | ---: | --- |")?;
+    if let Some(variants) = summary.get("variants").and_then(Value::as_array) {
+        for variant in variants {
+            writeln!(
+                writer,
+                "| `{}` | {} | {} | {} | {} |",
+                variant
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+                variant.get("records").and_then(Value::as_u64).unwrap_or(0),
+                format_bytes(
+                    variant
+                        .get("uncompressed_bytes")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0)
+                ),
+                format_bytes(
+                    variant
+                        .get("zstd_bytes")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0)
+                ),
+                variant
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+            )?;
+        }
+    }
+    writeln!(writer)?;
+    writeln!(writer, "## Search Samples")?;
+    if let Some(variants) = summary.get("variants").and_then(Value::as_array) {
+        for variant in variants {
+            writeln!(
+                writer,
+                "\n### `{}`",
+                variant
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+            )?;
+            if let Some(samples) = variant.get("search_samples").and_then(Value::as_array) {
+                for sample in samples {
+                    let query = sample.get("query").and_then(Value::as_str).unwrap_or("");
+                    let names = sample
+                        .get("results")
+                        .and_then(Value::as_array)
+                        .map(|results| {
+                            results
+                                .iter()
+                                .map(|result| {
+                                    let name = result
+                                        .get("name")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("unknown");
+                                    let country = result
+                                        .get("country_code")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("");
+                                    if country.is_empty() {
+                                        name.to_string()
+                                    } else {
+                                        format!("{name} {country}")
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .unwrap_or_default();
+                    writeln!(writer, "- `{query}`: {names}")?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    if bytes >= 1024 * 1024 {
+        format!("{:.2} MiB", bytes as f64 / MIB)
+    } else if bytes >= 1024 {
+        format!("{:.1} KiB", bytes as f64 / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+#[cfg(test)]
+mod geonames_tests {
+    use super::*;
+
+    fn city_line() -> &'static str {
+        "3173435\tMilan\tMilan\tMilano,Mediolanum,Milan,MI\t45.46427\t9.18951\tP\tPPLA\tIT\t\t09\t015\t\t\t1236837\t122\t120\tEurope/Rome\t2025-01-01"
+    }
+
+    #[test]
+    fn parses_geonames_city_line() {
+        let city = parse_geonames_city(city_line())
+            .expect("valid row")
+            .expect("city row");
+        assert_eq!(city.geoname_id, 3_173_435);
+        assert_eq!(city.name, "Milan");
+        assert_eq!(city.country_code, "IT");
+        assert_eq!(city.feature_code, "PPLA");
+        assert_eq!(city.population, 1_236_837);
+        assert!((city.latitude - 45.46427).abs() < 0.000001);
+    }
+
+    #[test]
+    fn prunes_aliases_with_deduplication_and_cap() {
+        let city = parse_geonames_city(city_line())
+            .expect("valid row")
+            .expect("city row");
+        let aliases = prune_city_aliases(&city, 2);
+        assert_eq!(aliases, vec!["MI", "Milano"]);
+    }
+
+    #[test]
+    fn city_catalog_encoding_is_deterministic() {
+        let city = parse_geonames_city(city_line())
+            .expect("valid row")
+            .expect("city row");
+        let spec = geonames_variant_specs()
+            .into_iter()
+            .find(|spec| spec.id == "ranked_aliases_3")
+            .expect("variant exists");
+        let left = encode_city_catalog(std::slice::from_ref(&city), &spec).expect("encode");
+        let right = encode_city_catalog(&[city], &spec).expect("encode again");
+        assert_eq!(left, right);
+    }
+
+    #[test]
+    fn search_uses_aliases_and_fuzzy_matching() {
+        let milan = parse_geonames_city(city_line())
+            .expect("valid row")
+            .expect("city row");
+        let rome = parse_geonames_city(
+            "3169070\tRome\tRome\tRoma,Rome\t41.89193\t12.51133\tP\tPPLC\tIT\t\t07\t058\t\t\t2318895\t20\t52\tEurope/Rome\t2025-01-01",
+        )
+        .expect("valid row")
+        .expect("city row");
+        let spec = geonames_variant_specs()
+            .into_iter()
+            .find(|spec| spec.id == "ranked_aliases_3")
+            .expect("variant exists");
+        let cities = vec![milan, rome];
+        let roma = search_geonames_cities(&cities, &spec, "Roma", 1);
+        assert_eq!(roma[0].name, "Rome");
+        let miln = search_geonames_cities(&cities, &spec, "Miln", 1);
+        assert_eq!(miln[0].name, "Milan");
+    }
 }

@@ -1,5 +1,6 @@
 use std::io;
 use std::path::PathBuf;
+use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -10,7 +11,7 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use pv_core::source_model::SourceEnsembleEstimateDocument;
-use pv_core::weather::Location;
+use pv_data::CitySearchResult;
 use pv_model::{EstimateRequest, SourceModelEstimator, days_in_month, short_month_name};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -51,8 +52,8 @@ struct App {
     status: String,
     estimate: Option<SourceEnsembleEstimateDocument>,
     selected_location_id: String,
-    locations: Vec<Location>,
     location_query: Field,
+    location_results: Vec<CitySearchResult>,
     location_selected: usize,
 }
 
@@ -85,7 +86,7 @@ fn run() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    let mut app = App::new(pv_data::locations());
+    let mut app = App::new();
     app.recompute(&mut estimator);
     run_app(&mut terminal, &mut app, &mut estimator)?;
     terminal.show_cursor()?;
@@ -111,7 +112,10 @@ fn run_app(
 }
 
 impl App {
-    fn new(locations: Vec<Location>) -> Self {
+    fn new() -> Self {
+        let _ = thread::spawn(|| {
+            let _ = pv_data::city_catalog_metadata();
+        });
         Self {
             fields: vec![
                 Field::new("Name", "Custom location"),
@@ -128,8 +132,8 @@ impl App {
             status: "Ready".to_string(),
             estimate: None,
             selected_location_id: "custom".to_string(),
-            locations,
             location_query: Field::new("Find", ""),
+            location_results: Vec::new(),
             location_selected: 0,
         }
     }
@@ -173,43 +177,37 @@ impl App {
         }
     }
 
-    fn filtered_location_indexes(&self) -> Vec<usize> {
-        let query = self.location_query.value.to_lowercase();
-        self.locations
-            .iter()
-            .enumerate()
-            .filter_map(|(index, location)| {
-                if query.is_empty() || location_matches(location, &query) {
-                    Some(index)
-                } else {
-                    None
-                }
-            })
-            .collect()
+    fn refresh_location_results(&mut self) {
+        if self.location_query.value.chars().count() < 2 {
+            self.location_results.clear();
+        } else {
+            self.location_results = pv_data::search_cities(&self.location_query.value, 30);
+        }
+        self.clamp_location_selection();
     }
 
     fn clamp_location_selection(&mut self) {
-        let matches = self.filtered_location_indexes();
-        if matches.is_empty() {
+        if self.location_results.is_empty() {
             self.location_selected = 0;
         } else {
-            self.location_selected = self.location_selected.min(matches.len() - 1);
+            self.location_selected = self.location_selected.min(self.location_results.len() - 1);
         }
     }
 
     fn apply_selected_location(&mut self, estimator: &mut SourceModelEstimator) {
-        let matches = self.filtered_location_indexes();
-        let Some(location_index) = matches.get(self.location_selected).copied() else {
+        let Some(location) = self.location_results.get(self.location_selected).cloned() else {
             self.status = "No matching location".to_string();
             return;
         };
-        let location = self.locations[location_index].clone();
         self.fields[0].set_value(&location.display_name);
-        self.fields[1].set_value(location.region.as_deref().unwrap_or_default());
-        self.fields[2].set_value(&format!("{:.4}", location.latitude.as_degrees()));
-        self.fields[3].set_value(&format!("{:.4}", location.longitude.as_degrees()));
-        self.selected_location_id = location.location_id.as_str().to_string();
-        self.status = format!("Selected {}", location.display_name);
+        self.fields[1].set_value(&location.country_code);
+        self.fields[2].set_value(&format!("{:.4}", location.latitude_degrees));
+        self.fields[3].set_value(&format!("{:.4}", location.longitude_degrees));
+        self.selected_location_id = format!("geonames-{}", location.geoname_id);
+        self.status = format!(
+            "Selected {}, {}",
+            location.display_name, location.country_code
+        );
         self.mode = Mode::Normal;
         self.recompute(estimator);
     }
@@ -308,6 +306,7 @@ fn handle_normal_key(
         KeyCode::Char('l') => {
             app.mode = Mode::Location;
             app.location_selected = 0;
+            app.refresh_location_results();
             app.status = "Select location by name".to_string();
         }
         KeyCode::Char('e') => app.recompute(estimator),
@@ -371,18 +370,20 @@ fn handle_location_key(
         KeyCode::Enter => app.apply_selected_location(estimator),
         KeyCode::Up => app.location_selected = app.location_selected.saturating_sub(1),
         KeyCode::Down | KeyCode::Tab => {
-            let matches = app.filtered_location_indexes();
-            if !matches.is_empty() {
-                app.location_selected = (app.location_selected + 1).min(matches.len() - 1);
+            if !app.location_results.is_empty() {
+                app.location_selected =
+                    (app.location_selected + 1).min(app.location_results.len() - 1);
             }
         }
         KeyCode::Backspace => {
             app.location_query.backspace();
             app.location_selected = 0;
+            app.refresh_location_results();
         }
         KeyCode::Delete => {
             app.location_query.delete();
             app.location_selected = 0;
+            app.refresh_location_results();
         }
         KeyCode::Left => app.location_query.move_left(),
         KeyCode::Right => app.location_query.move_right(),
@@ -393,6 +394,7 @@ fn handle_location_key(
         {
             app.location_query.insert(character);
             app.location_selected = 0;
+            app.refresh_location_results();
         }
         _ => {}
     }
@@ -463,8 +465,7 @@ fn render_fields(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let matches = app.filtered_location_indexes();
-    let mut lines = Vec::with_capacity(app.fields.len() + matches.len().min(6) + 3);
+    let mut lines = Vec::with_capacity(app.fields.len() + app.location_results.len().min(6) + 3);
     for (index, field) in app.fields.iter().enumerate() {
         let selected = index == app.selected;
         let style = match (selected, app.mode) {
@@ -490,22 +491,23 @@ fn render_fields(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         Span::styled("Location   ", Style::default().fg(Color::DarkGray)),
         Span::styled(app.location_query.value.as_str(), search_style),
     ]));
-    for (row, location_index) in matches.iter().take(6).enumerate() {
-        let location = &app.locations[*location_index];
+    for (row, location) in app.location_results.iter().take(6).enumerate() {
         let selected = app.mode == Mode::Location && row == app.location_selected;
         let style = if selected {
             Style::default().fg(Color::Black).bg(Color::Cyan)
         } else {
             Style::default()
         };
-        lines.push(Line::from(vec![Span::styled(
-            location_label(location),
-            style,
-        )]));
+        lines.push(Line::from(vec![Span::styled(city_label(location), style)]));
     }
-    if matches.is_empty() {
+    if app.location_results.is_empty() {
+        let message = if app.location_query.value.is_empty() {
+            "Type at least 2 characters"
+        } else {
+            "No matching locations"
+        };
         lines.push(Line::from(Span::styled(
-            "No matching locations",
+            message,
             Style::default().fg(Color::DarkGray),
         )));
     }
@@ -637,29 +639,13 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(line), area);
 }
 
-fn location_matches(location: &Location, query: &str) -> bool {
-    location.display_name.to_lowercase().contains(query)
-        || location.country_code.to_lowercase().contains(query)
-        || location
-            .region
-            .as_deref()
-            .unwrap_or_default()
-            .to_lowercase()
-            .contains(query)
-        || location
-            .province
-            .as_deref()
-            .unwrap_or_default()
-            .to_lowercase()
-            .contains(query)
-}
-
-fn location_label(location: &Location) -> String {
+fn city_label(location: &CitySearchResult) -> String {
     format!(
-        "  {:<10} {:>6.2} {:>7.2}",
-        truncate(&location.display_name, 10),
-        location.latitude.as_degrees(),
-        location.longitude.as_degrees(),
+        "  {:<16} {:>2} {:>8.3} {:>9.3}",
+        truncate(&location.display_name, 16),
+        location.country_code,
+        location.latitude_degrees,
+        location.longitude_degrees,
     )
 }
 
