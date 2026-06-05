@@ -39,7 +39,7 @@ struct EstimateArgs {
     #[arg(long, default_value_t = 0.0)]
     azimuth_deg: f64,
     #[arg(long)]
-    model_dir: PathBuf,
+    model_dir: Option<PathBuf>,
     #[arg(long, default_value = "source-model-artifacts.json")]
     manifest: String,
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
@@ -77,7 +77,10 @@ fn estimate(args: EstimateArgs) -> Result<()> {
         tilt_deg: args.tilt_deg,
         azimuth_deg: args.azimuth_deg,
     };
-    let mut estimator = SourceModelEstimator::load(&args.model_dir, &args.manifest)?;
+    let mut estimator = match &args.model_dir {
+        Some(model_dir) => SourceModelEstimator::load(model_dir, &args.manifest)?,
+        None => SourceModelEstimator::load_embedded()?,
+    };
     let document = estimator.estimate(&request)?;
     match args.format {
         OutputFormat::Json => write_json(&document),
