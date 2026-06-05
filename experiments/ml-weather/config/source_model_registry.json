@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "created_at": "2026-06-01",
+  "created_at": "2026-06-05",
   "model_family": "monthly-hourly climate-normal residual MLP",
   "input_features": 66,
   "outputs": [
@@ -33,11 +33,11 @@
       "label": "PVGIS-ERA5",
       "active": true,
       "coverage_rule": "global_land_pvgis_gateway",
-      "checkpoint_path": "rtx.homelab:~/pv-estimator-gpu/results/pvgis_era5_climate_normals_compressor_768x8/best_model.pt",
-      "training_locations": 1972,
-      "training_rows": 328408996,
-      "best_epoch": 75,
-      "best_validation_mae_mean": 8.333486728010506,
+      "checkpoint_path": "rtx.homelab:~/pv-estimator-gpu/results/pvgis_era5_climate_normals_compressor_768x8_tight_v1/best_model.pt",
+      "training_locations": 2825,
+      "training_rows": 470464204,
+      "best_epoch": 77,
+      "best_validation_mae_mean": 7.124548,
       "parameters": 9522442
     },
     {
@@ -46,18 +46,18 @@
       "active": true,
       "coverage_rule": "empirical_grid_mask",
       "coverage_mask": "experiments/ml-weather/config/source_coverage/pvgis_sarah3_empirical_grid_mask.json",
-      "checkpoint_path": "rtx.homelab:~/pv-estimator-gpu/results/pvgis_sarah3_climate_normals_compressor_768x8/best_model.pt",
-      "training_locations": 787,
-      "training_rows": 131063835,
-      "best_epoch": 80,
-      "best_validation_mae_mean": 7.889469525492784,
+      "checkpoint_path": "rtx.homelab:~/pv-estimator-gpu/results/pvgis_sarah3_climate_normals_compressor_768x8_tight_v1/best_model.pt",
+      "training_locations": 1449,
+      "training_rows": 241310667,
+      "best_epoch": 73,
+      "best_validation_mae_mean": 6.651263,
       "parameters": 9522442
     }
   ],
   "validation": {
-    "benchmark_30": "experiments/ml-weather/results/2026-06-01_source_ensemble_validation.md",
-    "pvgis_era5_reference_energy_mae_pct": 3.47,
-    "pvgis_sarah3_reference_energy_mae_pct": 3.97,
-    "mean_source_disagreement_spread_pct": 7.11
+    "regional_benchmark_120_int8_comparison": "experiments/ml-weather/results/2026-06-05_tight_v1_int8_comparison.md",
+    "pvgis_era5_reference_energy_mae_pct": 2.469701824532703,
+    "pvgis_sarah3_reference_energy_mae_pct": 3.2175929960525007,
+    "mean_source_disagreement_spread_pct": 4.784828610161867
   }
 }

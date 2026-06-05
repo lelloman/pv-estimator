@@ -1,0 +1,204 @@
+{
+  "input_features": 66,
+  "model_family": "monthly-hourly climate-normal residual MLP",
+  "parity": {
+    "nasa_power": {
+      "fp32": {
+        "max_abs": 1.6689300537109375e-06,
+        "mean_abs": 1.9944380843147277e-07,
+        "points": 3
+      },
+      "int8": {
+        "annual_energy_mae_pct": 0.0458225760571394,
+        "annual_energy_max_abs_pct": 0.07691991215450253,
+        "normalized_max_abs": 0.04282882809638977,
+        "points": 3
+      }
+    },
+    "pvgis_era5": {
+      "fp32": {
+        "max_abs": 1.430511474609375e-06,
+        "mean_abs": 1.8528632968658107e-07,
+        "points": 3
+      },
+      "int8": {
+        "annual_energy_mae_pct": 0.16151885593474016,
+        "annual_energy_max_abs_pct": 0.2721628637219684,
+        "normalized_max_abs": 0.0988183319568634,
+        "points": 3
+      }
+    },
+    "pvgis_sarah3": {
+      "fp32": {
+        "max_abs": 1.9073486328125e-06,
+        "mean_abs": 1.7750507197433762e-07,
+        "points": 3
+      },
+      "int8": {
+        "annual_energy_mae_pct": 0.07671633924251837,
+        "annual_energy_max_abs_pct": 0.1531552553591318,
+        "normalized_max_abs": 0.06392422318458557,
+        "points": 3
+      }
+    }
+  },
+  "quantization": {
+    "format": "onnx_dynamic_qint8",
+    "op_types": [
+      "MatMul",
+      "Gemm"
+    ],
+    "per_channel": false,
+    "weight_type": "qint8"
+  },
+  "schema_version": 1,
+  "sources": [
+    {
+      "active": true,
+      "checkpoint_path": "results/full_climate_normals_compressor_holdout_768x8/best_model.pt",
+      "checkpoint_sha256": "3fd4df24e57d07a7f123297a7f73804a0a318528939ddeea486c55a8bedabc2c",
+      "coverage_rule": {
+        "type": "global"
+      },
+      "epoch": 77,
+      "fp32_onnx_bytes": 38103296,
+      "input_name": "features",
+      "int8_onnx_bytes": 9645510,
+      "int8_over_fp32": 0.2531410930959883,
+      "label": "NASA POWER",
+      "location_count": 0,
+      "onnx_path": "nasa_power.onnx",
+      "output_name": "normalized_targets",
+      "parameters": 9522442,
+      "sha256": "870c7e621c9ec7d589eb242eeb9b17bbc28a9861216f8261346404301a854403",
+      "source_id": "nasa_power",
+      "target_mean": [
+        188.82461547851562,
+        165.21241760253906,
+        82.46041870117188,
+        17.048599243164062,
+        5.132138252258301,
+        46.854251861572266,
+        102.15409851074219,
+        26.73721694946289,
+        1.7583781480789185,
+        1.8245292901992798
+      ],
+      "target_std": [
+        262.9292907714844,
+        209.63511657714844,
+        105.8980941772461,
+        11.035902976989746,
+        2.411294460296631,
+        62.30133819580078,
+        115.34814453125,
+        35.40577697753906,
+        1.438215732574463,
+        0.8544398546218872
+      ]
+    },
+    {
+      "active": true,
+      "checkpoint_path": "results/pvgis_era5_climate_normals_compressor_768x8_tight_v1/best_model.pt",
+      "checkpoint_sha256": "b7da1c65db4dd38bffc7e52d1f256d43e8203dbae9bea4750e89208d175d483a",
+      "coverage_rule": {
+        "type": "global_land_pvgis_gateway"
+      },
+      "epoch": 77,
+      "fp32_onnx_bytes": 38103296,
+      "input_name": "features",
+      "int8_onnx_bytes": 9645510,
+      "int8_over_fp32": 0.2531410930959883,
+      "label": "PVGIS-ERA5",
+      "location_count": 2825,
+      "onnx_path": "pvgis_era5.onnx",
+      "output_name": "normalized_targets",
+      "parameters": 9522442,
+      "sha256": "29eeeed5639dceb39103459f7c58358acf69959504cd13c6bb32409dcccf2afa",
+      "source_id": "pvgis_era5",
+      "target_mean": [
+        190.65084838867188,
+        216.94161987304688,
+        59.94042205810547,
+        14.82863998413086,
+        2.7501964569091797,
+        46.63382339477539,
+        96.33438873291016,
+        17.692228317260742,
+        3.236859083175659,
+        1.2414040565490723
+      ],
+      "target_std": [
+        263.70928955078125,
+        264.4060363769531,
+        74.56446838378906,
+        12.301745414733887,
+        1.437473177909851,
+        62.8386344909668,
+        111.11054229736328,
+        23.707311630249023,
+        1.5984984636306763,
+        0.800650954246521
+      ]
+    },
+    {
+      "active": true,
+      "checkpoint_path": "results/pvgis_sarah3_climate_normals_compressor_768x8_tight_v1/best_model.pt",
+      "checkpoint_sha256": "d7b55ebbefe3b88a0d0e579cffa40abd840f99d01b0cdf07e1ab9845dd01e07e",
+      "coverage_rule": {
+        "mask_path": "coverage/pvgis_sarah3_empirical_grid_mask.json",
+        "type": "empirical_grid_mask"
+      },
+      "epoch": 73,
+      "fp32_onnx_bytes": 38103296,
+      "input_name": "features",
+      "int8_onnx_bytes": 9645510,
+      "int8_over_fp32": 0.2531410930959883,
+      "label": "PVGIS-SARAH3",
+      "location_count": 1449,
+      "onnx_path": "pvgis_sarah3.onnx",
+      "output_name": "normalized_targets",
+      "parameters": 9522442,
+      "sha256": "c75ae7aa4141f1449ac23b8f792a7ab8ad3435db66bd4024bd021f45f1c3c00f",
+      "source_id": "pvgis_sarah3",
+      "target_mean": [
+        201.69862365722656,
+        200.83265686035156,
+        75.06079864501953,
+        17.982032775878906,
+        2.779393196105957,
+        61.3127555847168,
+        115.1122817993164,
+        26.165021896362305,
+        2.7911338806152344,
+        1.2419676780700684
+      ],
+      "target_std": [
+        279.9040222167969,
+        252.25967407226562,
+        94.90806579589844,
+        9.46982192993164,
+        1.4139952659606934,
+        80.65498352050781,
+        132.45545959472656,
+        34.68351364135742,
+        1.111878752708435,
+        0.8045299053192139
+      ]
+    }
+  ],
+  "target_names": [
+    "ghi_mean_w_m2",
+    "dni_mean_w_m2",
+    "dhi_mean_w_m2",
+    "temp_mean_c",
+    "wind_mean_m_s",
+    "ghi_std_w_m2",
+    "dni_std_w_m2",
+    "dhi_std_w_m2",
+    "temp_std_c",
+    "wind_std_m_s"
+  ],
+  "temporal_bins": 288,
+  "uncertainty_multiplier": 2.0
+}

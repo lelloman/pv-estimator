@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 #[command(about = "Interactive PV estimator terminal UI")]
 struct Args {
     #[arg(long)]
-    model_dir: PathBuf,
+    model_dir: Option<PathBuf>,
     #[arg(long, default_value = "source-model-artifacts.json")]
     manifest: String,
 }
@@ -94,8 +94,13 @@ fn main() {
 
 fn run() -> Result<()> {
     let args = Args::parse();
-    let mut estimator = SourceModelEstimator::load(&args.model_dir, &args.manifest)
-        .with_context(|| format!("loading model artifacts from {}", args.model_dir.display()))?;
+    let mut estimator = match &args.model_dir {
+        Some(model_dir) => SourceModelEstimator::load(model_dir, &args.manifest)
+            .with_context(|| format!("loading model artifacts from {}", model_dir.display()))?,
+        None => {
+            SourceModelEstimator::load_embedded().context("loading embedded model artifacts")?
+        }
+    };
 
     enable_raw_mode()?;
     execute!(io::stdout(), EnterAlternateScreen)?;

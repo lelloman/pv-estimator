@@ -1,6 +1,7 @@
 use std::f64::consts::PI;
 use std::fmt::Write as _;
 use std::fs::File;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -28,6 +29,17 @@ const MID_MONTH_DOY: [f64; 12] = [
 const DEFAULT_UNCERTAINTY_MULTIPLIER: f64 = 2.0;
 const SUPPORTED_MANIFEST_SCHEMA_V1: u32 = 1;
 const SUPPORTED_MANIFEST_SCHEMA_V2: u32 = 2;
+const EMBEDDED_SOURCE_MODEL_MANIFEST_JSON: &[u8] =
+    include_bytes!("../../../artifacts/source-models-768x8-int8/source-model-artifacts.json");
+const EMBEDDED_NASA_POWER_ONNX: &[u8] =
+    include_bytes!("../../../artifacts/source-models-768x8-int8/nasa_power.onnx");
+const EMBEDDED_PVGIS_ERA5_ONNX: &[u8] =
+    include_bytes!("../../../artifacts/source-models-768x8-int8/pvgis_era5.onnx");
+const EMBEDDED_PVGIS_SARAH3_ONNX: &[u8] =
+    include_bytes!("../../../artifacts/source-models-768x8-int8/pvgis_sarah3.onnx");
+const EMBEDDED_PVGIS_SARAH3_MASK_JSON: &[u8] = include_bytes!(
+    "../../../artifacts/source-models-768x8-int8/coverage/pvgis_sarah3_empirical_grid_mask.json"
+);
 
 #[derive(Debug, Clone)]
 pub struct EstimateRequest {
@@ -184,6 +196,26 @@ struct MonthlyPvPrediction {
 }
 
 impl SourceModelEstimator {
+    pub fn load_embedded() -> Result<Self> {
+        let manifest = load_manifest_bytes(
+            EMBEDDED_SOURCE_MODEL_MANIFEST_JSON,
+            "embedded source-model-artifacts.json",
+        )?;
+        let geography_features =
+            load_embedded_geography_features(manifest.geography_features.as_ref())?;
+        validate_manifest(&manifest, geography_features.as_ref())?;
+        let sources = load_embedded_sources(manifest.sources)?;
+        Ok(Self {
+            model_family: manifest.model_family,
+            input_features: manifest.input_features,
+            temporal_bins: manifest.temporal_bins,
+            target_names: manifest.target_names,
+            uncertainty_multiplier: manifest.uncertainty_multiplier,
+            geography_features,
+            sources,
+        })
+    }
+
     pub fn load(model_dir: impl AsRef<Path>, manifest_name: &str) -> Result<Self> {
         let model_dir = model_dir.as_ref();
         let manifest_path = model_dir.join(manifest_name);
@@ -428,6 +460,11 @@ fn load_manifest(path: &Path) -> Result<ArtifactManifest> {
     Ok(manifest)
 }
 
+fn load_manifest_bytes(bytes: &[u8], label: &str) -> Result<ArtifactManifest> {
+    serde_json::from_reader(Cursor::new(bytes))
+        .with_context(|| format!("parsing artifact manifest {label}"))
+}
+
 fn validate_manifest(
     manifest: &ArtifactManifest,
     geography_features: Option<&GeographyFeatureGrid>,
@@ -492,6 +529,15 @@ fn load_geography_features(
             )
         })?;
     GeographyFeatureGrid::load(contract, &grid_path).map(Some)
+}
+
+fn load_embedded_geography_features(
+    spec: Option<&ArtifactGeographyFeatures>,
+) -> Result<Option<GeographyFeatureGrid>> {
+    if spec.is_some() {
+        bail!("embedded source-model artifacts do not include geography feature grids yet");
+    }
+    Ok(None)
 }
 
 impl GeographyFeatureGrid {
@@ -639,6 +685,14 @@ fn load_sources(model_dir: &Path, sources: Vec<ArtifactSource>) -> Result<Vec<Lo
         .collect()
 }
 
+fn load_embedded_sources(sources: Vec<ArtifactSource>) -> Result<Vec<LoadedSource>> {
+    sources
+        .into_iter()
+        .filter(|source| source.active)
+        .map(load_embedded_source)
+        .collect()
+}
+
 fn load_source(model_dir: &Path, source: ArtifactSource) -> Result<LoadedSource> {
     if source.target_mean.len() != TARGETS || source.target_std.len() != TARGETS {
         bail!(
@@ -676,11 +730,75 @@ fn load_source(model_dir: &Path, source: ArtifactSource) -> Result<LoadedSource>
     })
 }
 
+fn load_embedded_source(source: ArtifactSource) -> Result<LoadedSource> {
+    if source.target_mean.len() != TARGETS || source.target_std.len() != TARGETS {
+        bail!(
+            "source {} target stats must contain {TARGETS} values",
+            source.source_id
+        );
+    }
+    let onnx_bytes = embedded_onnx_bytes(&source.onnx_path)?;
+    let session = Session::builder()
+        .context("creating ONNX Runtime session builder")?
+        .commit_from_memory(onnx_bytes)
+        .with_context(|| {
+            format!(
+                "loading embedded ONNX model {} for {}",
+                source.onnx_path.display(),
+                source.source_id
+            )
+        })?;
+    let coverage_rule = match source.coverage_rule {
+        ArtifactCoverageRule::Global => LoadedCoverageRule::Global,
+        ArtifactCoverageRule::GlobalLandPvgisGateway => LoadedCoverageRule::GlobalLandPvgisGateway,
+        ArtifactCoverageRule::EmpiricalGridMask { mask_path } => {
+            LoadedCoverageRule::EmpiricalGridMask(load_embedded_mask(&mask_path)?)
+        }
+    };
+    Ok(LoadedSource {
+        source_id: source.source_id,
+        label: source.label,
+        session,
+        input_name: source.input_name,
+        output_name: source.output_name,
+        coverage_rule,
+        target_mean: source
+            .target_mean
+            .try_into()
+            .expect("target mean length checked"),
+        target_std: source
+            .target_std
+            .try_into()
+            .expect("target std length checked"),
+    })
+}
+
+fn embedded_onnx_bytes(path: &Path) -> Result<&'static [u8]> {
+    match path.to_str() {
+        Some("nasa_power.onnx") => Ok(EMBEDDED_NASA_POWER_ONNX),
+        Some("pvgis_era5.onnx") => Ok(EMBEDDED_PVGIS_ERA5_ONNX),
+        Some("pvgis_sarah3.onnx") => Ok(EMBEDDED_PVGIS_SARAH3_ONNX),
+        _ => bail!(
+            "embedded source-model artifact is missing {}",
+            path.display()
+        ),
+    }
+}
+
 fn load_mask(path: &Path) -> Result<CoverageMask> {
     serde_json::from_reader(
         File::open(path).with_context(|| format!("opening coverage mask {}", path.display()))?,
     )
     .with_context(|| format!("parsing coverage mask {}", path.display()))
+}
+
+fn load_embedded_mask(path: &Path) -> Result<CoverageMask> {
+    let bytes = match path.to_str() {
+        Some("coverage/pvgis_sarah3_empirical_grid_mask.json") => EMBEDDED_PVGIS_SARAH3_MASK_JSON,
+        _ => bail!("embedded coverage mask is missing {}", path.display()),
+    };
+    serde_json::from_reader(Cursor::new(bytes))
+        .with_context(|| format!("parsing embedded coverage mask {}", path.display()))
 }
 
 impl LoadedSource {
