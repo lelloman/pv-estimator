@@ -943,7 +943,9 @@ dependencies = [
  "anyhow",
  "clap",
  "pv-core",
+ "pv-data",
  "pv-model",
+ "serde",
  "serde_json",
 ]
 

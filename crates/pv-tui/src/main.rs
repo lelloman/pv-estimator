@@ -283,6 +283,12 @@ impl App {
             self.status = "No matching location".to_string();
             return;
         };
+        self.apply_location_fields(&location);
+        self.mode = Mode::Normal;
+        self.recompute(estimator);
+    }
+
+    fn apply_location_fields(&mut self, location: &CitySearchResult) {
         self.fields[0].set_value(&location.display_name);
         self.fields[1].set_value(&location.country_code);
         self.fields[2].set_value(&format!("{:.4}", location.latitude_degrees));
@@ -292,8 +298,6 @@ impl App {
             "Selected {}, {}",
             location.display_name, location.country_code
         );
-        self.mode = Mode::Normal;
-        self.recompute(estimator);
     }
 }
 
@@ -778,5 +782,69 @@ mod tests {
         assert_eq!(azimuth_direction_label("45"), Some("SW"));
         assert_eq!(azimuth_direction_label("-45"), Some("SE"));
         assert_eq!(azimuth_direction_label("not-a-number"), None);
+    }
+
+    #[test]
+    fn field_editing_tracks_cursor_and_text() {
+        let mut field = Field::new("Name", "Milan");
+        field.move_left();
+        field.move_left();
+        field.insert('X');
+        assert_eq!(field.value, "MilXan");
+        assert_eq!(field.cursor, 4);
+
+        field.backspace();
+        assert_eq!(field.value, "Milan");
+        assert_eq!(field.cursor, 3);
+
+        field.delete();
+        assert_eq!(field.value, "Miln");
+        assert_eq!(field.cursor, 3);
+
+        field.move_right();
+        field.move_right();
+        assert_eq!(field.cursor, field.value.len());
+    }
+
+    #[test]
+    fn location_search_refreshes_results() {
+        let mut app = App::new();
+        app.location_query.set_value("Milan");
+        app.refresh_location_results();
+
+        let first = app.location_results.first().expect("Milan search result");
+        assert_eq!(first.display_name, "Milan");
+        assert_eq!(first.country_code, "IT");
+        assert_eq!(app.location_selected, 0);
+    }
+
+    #[test]
+    fn applying_selected_city_updates_location_fields() {
+        let mut app = App::new();
+        app.location_query.set_value("Milan");
+        app.refresh_location_results();
+        let milan = app
+            .location_results
+            .iter()
+            .find(|result| result.display_name == "Milan" && result.country_code == "IT")
+            .cloned()
+            .expect("Milan search result");
+
+        app.apply_location_fields(&milan);
+
+        assert_eq!(app.fields[0].value, "Milan");
+        assert_eq!(app.fields[1].value, "IT");
+        assert_eq!(
+            app.fields[2].value,
+            format!("{:.4}", milan.latitude_degrees)
+        );
+        assert_eq!(
+            app.fields[3].value,
+            format!("{:.4}", milan.longitude_degrees)
+        );
+        assert_eq!(
+            app.selected_location_id,
+            format!("geonames-{}", milan.geoname_id)
+        );
     }
 }

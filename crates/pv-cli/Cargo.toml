@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+autobins = false
+
+[[bin]]
+name = "pv"
+path = "src/main.rs"
 
 [lints]
 workspace = true
@@ -12,5 +17,7 @@ workspace = true
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 pv-core = { path = "../pv-core" }
+pv-data = { path = "../pv-data" }
 pv-model = { path = "../pv-model" }
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
