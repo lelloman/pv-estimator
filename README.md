@@ -112,7 +112,7 @@ not call a network service and does not depend on Python or PyTorch.
 
 For reproducibility, see the tight-v1 comparison report:
 
-- `experiments/ml-weather/results/2026-06-05_tight_v1_int8_comparison.md`
+- `reproduction/source-models/results/2026-06-05_tight_v1_int8_comparison.md`
 
 ## Known Limitations
 

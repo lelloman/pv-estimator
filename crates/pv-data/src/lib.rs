@@ -711,7 +711,7 @@ pub fn source_model_registry() -> SourceModelRegistry {
                 weather_source_id: "pvgis_sarah3",
                 label: "PVGIS-SARAH3",
                 coverage_rule: SourceModelCoverage::EmpiricalGridMask {
-                    mask_path: "experiments/ml-weather/config/source_coverage/pvgis_sarah3_empirical_grid_mask.json".to_string(),
+                    mask_path: "reproduction/source-models/config/source_coverage/pvgis_sarah3_empirical_grid_mask.json".to_string(),
                 },
                 checkpoint_uri: "rtx.homelab:~/pv-estimator-gpu/results/pvgis_sarah3_climate_normals_compressor_768x8_tight_v1/best_model.pt",
                 training_locations: 1_449,

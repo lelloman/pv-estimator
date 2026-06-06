@@ -1,8 +1,7 @@
 /target/
 /artifacts/
-experiments/ml-weather/runs/*
-!experiments/ml-weather/runs/.gitignore
+reproduction/source-models/runs/*
+!reproduction/source-models/runs/.gitignore
 **/*.rs.bk
 __pycache__/
 *.py[cod]
-experiments/ml-weather/.venv-geo/

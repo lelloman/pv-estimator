@@ -25,7 +25,7 @@ permitting review, or electrical engineering work.
 | `coverage/pvgis_sarah3_empirical_grid_mask.json` | Empirical SARAH3 applicability mask. |
 
 Artifact hashes are recorded in
-`experiments/ml-weather/results/2026-06-05_tight_v1_int8_comparison.md` and in
+`reproduction/source-models/results/2026-06-05_tight_v1_int8_comparison.md` and in
 the Hugging Face repository `SHA256SUMS` file.
 
 ## Manifest
@@ -113,7 +113,7 @@ Mean source disagreement spread was `4.785%` in the tight-v1 comparison.
 
 See the full report:
 
-- `experiments/ml-weather/results/2026-06-05_tight_v1_int8_comparison.md`
+- `reproduction/source-models/results/2026-06-05_tight_v1_int8_comparison.md`
 
 ## Limitations
 

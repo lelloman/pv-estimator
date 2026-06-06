@@ -25,7 +25,7 @@ const TARGET_NAMES: [&str; TARGETS] = [
     "wind_speed_m_s",
 ];
 const DEFAULT_DATA: &str =
-    "experiments/ml-weather/runs/global_grid_408/normalized/nasa_power_hourly.csv.gz";
+    "reproduction/source-models/runs/global_grid_7056/normalized/nasa_power_hourly.csv.gz";
 
 fn main() {
     if let Err(error) = run() {
@@ -80,9 +80,7 @@ impl RunConfig {
     fn from_args(args: Vec<String>) -> Result<Self, Box<dyn Error>> {
         let mut config = Self {
             data: PathBuf::from(DEFAULT_DATA),
-            out_dir: PathBuf::from(
-                "experiments/ml-weather/runs/global_grid_408/models/weather_mlp",
-            ),
+            out_dir: PathBuf::from("reproduction/source-models/runs/weather_mlp"),
             train_limit: 1_000_000,
             val_limit: 100_000,
             train_stride: 13,
@@ -980,10 +978,10 @@ impl NormalizeConfig {
             .clamp(1, 16);
         let mut config = Self {
             raw_dir: PathBuf::from(
-                "experiments/ml-weather/runs/global_grid_7056/raw/nasa_power_hourly",
+                "reproduction/source-models/runs/global_grid_7056/raw/nasa_power_hourly",
             ),
             out: PathBuf::from(
-                "experiments/ml-weather/runs/global_grid_7056/normalized/nasa_power_hourly.csv.gz",
+                "reproduction/source-models/runs/global_grid_7056/normalized/nasa_power_hourly.csv.gz",
             ),
             workers: default_workers,
             pigz_threads: 1,

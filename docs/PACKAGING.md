@@ -81,7 +81,7 @@ Keep these paths in any source distribution:
   `pv-data` build script
 - `docs/**`
 - `README.md`
-- `experiments/ml-weather/results/2026-06-05_tight_v1_int8_comparison.md`
+- `reproduction/source-models/results/2026-06-05_tight_v1_int8_comparison.md`
 
 The ONNX files and coverage mask are compile-time inputs. Omitting them breaks
 the embedded estimator build. If producing a source archive without embedded

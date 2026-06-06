@@ -1,0 +1,27 @@
+{
+  "pvgis_api_base": "https://re.jrc.ec.europa.eu/api/v5_3",
+  "seriescalc_endpoint": "https://re.jrc.ec.europa.eu/api/v5_3/seriescalc",
+  "default_start_year": 2005,
+  "default_end_year": 2023,
+  "recommended_request_delay_seconds": 2.0,
+  "databases": [
+    {
+      "database": "PVGIS-ERA5",
+      "source_id": "pvgis_era5_hourly",
+      "coverage": "worldwide",
+      "source_type": "reanalysis",
+      "nominal_resolution": "0.25 degree",
+      "active": true,
+      "notes": "Global fallback source in PVGIS; useful as the global ensemble member."
+    },
+    {
+      "database": "PVGIS-SARAH3",
+      "source_id": "pvgis_sarah3_hourly",
+      "coverage": "Europe, Africa, most of Asia, parts of South America; probe per coordinate",
+      "source_type": "satellite-derived irradiance",
+      "nominal_resolution": "0.05 degree",
+      "active": true,
+      "notes": "Coverage is not global. Treat HTTP 400 from PVGIS as a coverage miss."
+    }
+  ]
+}

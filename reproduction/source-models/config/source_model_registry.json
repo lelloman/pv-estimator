@@ -1,0 +1,63 @@
+{
+  "version": 1,
+  "created_at": "2026-06-05",
+  "model_family": "monthly-hourly climate-normal residual MLP",
+  "input_features": 66,
+  "outputs": [
+    "ghi_mean_w_m2",
+    "dni_mean_w_m2",
+    "dhi_mean_w_m2",
+    "temp_mean_c",
+    "wind_mean_m_s",
+    "ghi_std_w_m2",
+    "dni_std_w_m2",
+    "dhi_std_w_m2",
+    "temp_std_c",
+    "wind_std_m_s"
+  ],
+  "sources": [
+    {
+      "source_id": "nasa_power",
+      "label": "NASA POWER",
+      "active": true,
+      "coverage_rule": "global",
+      "checkpoint_path": "rtx.homelab:~/pv-estimator-gpu/results/full_climate_normals_compressor_holdout_768x8/best_model.pt",
+      "training_locations": 7056,
+      "training_rows": 309391488,
+      "best_epoch": 77,
+      "best_validation_mae_mean": 5.101154327392578,
+      "parameters": 9522442
+    },
+    {
+      "source_id": "pvgis_era5",
+      "label": "PVGIS-ERA5",
+      "active": true,
+      "coverage_rule": "global_land_pvgis_gateway",
+      "checkpoint_path": "rtx.homelab:~/pv-estimator-gpu/results/pvgis_era5_climate_normals_compressor_768x8_tight_v1/best_model.pt",
+      "training_locations": 2825,
+      "training_rows": 470464204,
+      "best_epoch": 77,
+      "best_validation_mae_mean": 7.124548,
+      "parameters": 9522442
+    },
+    {
+      "source_id": "pvgis_sarah3",
+      "label": "PVGIS-SARAH3",
+      "active": true,
+      "coverage_rule": "empirical_grid_mask",
+      "coverage_mask": "reproduction/source-models/config/source_coverage/pvgis_sarah3_empirical_grid_mask.json",
+      "checkpoint_path": "rtx.homelab:~/pv-estimator-gpu/results/pvgis_sarah3_climate_normals_compressor_768x8_tight_v1/best_model.pt",
+      "training_locations": 1449,
+      "training_rows": 241310667,
+      "best_epoch": 73,
+      "best_validation_mae_mean": 6.651263,
+      "parameters": 9522442
+    }
+  ],
+  "validation": {
+    "regional_benchmark_120_int8_comparison": "reproduction/source-models/results/2026-06-05_tight_v1_int8_comparison.md",
+    "pvgis_era5_reference_energy_mae_pct": 2.469701824532703,
+    "pvgis_sarah3_reference_energy_mae_pct": 3.2175929960525007,
+    "mean_source_disagreement_spread_pct": 4.784828610161867
+  }
+}
