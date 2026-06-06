@@ -15,6 +15,20 @@ cargo install --path crates/pv-tui
 
 The CLI package is named `pv-cli`, but it installs the binary as `pv`.
 
+## Documentation
+
+- [CLI reference](docs/CLI.md): full command syntax, options, JSON shapes,
+  and examples.
+- [TUI reference](docs/TUI.md): terminal UI layout, fields, key bindings, search,
+  and state behavior.
+- [Troubleshooting](docs/TROUBLESHOOTING.md): common install, argument parsing,
+  model loading, city search, and TUI issues.
+- [Packaging and distribution](docs/PACKAGING.md): release checks, source archive
+  requirements, optimized builds, and man-page installation.
+- [Model card](docs/MODEL_CARD.md): embedded tight-v1 INT8 model details,
+  evaluation snapshot, intended use, and limitations.
+- [Man pages](docs/man/): roff manual pages for packagers.
+
 ## CLI Usage
 
 Search for a city, then estimate with coordinates:

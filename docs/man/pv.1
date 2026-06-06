@@ -1,0 +1,105 @@
+.TH PV 1 "2026-06-05" "PV Estimator 0.1.0" "User Commands"
+.SH NAME
+pv \- local photovoltaic production estimator
+.SH SYNOPSIS
+.B pv
+.I COMMAND
+.RI [ OPTIONS ]
+.SH DESCRIPTION
+.B pv
+runs local photovoltaic production estimates and city search. The default
+estimate path uses the embedded tight-v1 INT8 source-model bundle. City search
+uses the embedded GeoNames catalog.
+.SH COMMANDS
+.TP
+.B estimate
+Estimate photovoltaic production for explicit coordinates.
+.TP
+.B search
+Search the embedded city catalog.
+.SH ESTIMATE
+.B "pv estimate"
+.BI --lat " LATITUDE"
+.BI --lon " LONGITUDE"
+.RI [ OPTIONS ]
+.PP
+Required options:
+.TP
+.BI --lat " LATITUDE"
+Latitude in decimal degrees, from -90 to 90.
+.TP
+.BI --lon " LONGITUDE"
+Longitude in decimal degrees, from -180 to 180. For negative values, prefer the
+form
+.BI --lon= -3.7038
+so the value is not parsed as an option.
+.PP
+Optional options:
+.TP
+.BI --location-id " ID"
+Identifier copied into output. Default: custom.
+.TP
+.BI --name " NAME"
+Display name copied into output. Default: Custom location.
+.TP
+.BI --region " REGION"
+Region or country label copied into output.
+.TP
+.BI --kwp " KWP"
+Peak power in kWp. Default: 1.0.
+.TP
+.BI --loss-pct " PCT"
+System loss percent. Default: 14.0.
+.TP
+.BI --tilt-deg " DEG"
+Panel tilt in degrees from horizontal. Default: 30.0.
+.TP
+.BI --azimuth-deg " DEG"
+PVGIS-style azimuth. 0 is south, -90 is east, 90 is west. Default: 0.0.
+.TP
+.BI --model-dir " DIR"
+Load model artifacts from a directory instead of embedded bytes.
+.TP
+.BI --manifest " NAME"
+Manifest filename inside model-dir. Default: source-model-artifacts.json.
+.TP
+.BI --format " table|json"
+Output format. Default: table.
+.SH SEARCH
+.B "pv search"
+.I QUERY
+.RI [ OPTIONS ]
+.PP
+Arguments and options:
+.TP
+.I QUERY
+City query. Trimmed query must contain at least two characters.
+.TP
+.BI --limit " N"
+Maximum result count, from 1 to 50. Default: 10.
+.TP
+.BI --format " table|json"
+Output format. Default: table.
+.SH EXAMPLES
+.EX
+pv search Milan
+pv search Milan --limit 5 --format json
+pv estimate --lat 45.4642 --lon 9.1900
+pv estimate --lat 40.4168 --lon=-3.7038 --format json
+.EE
+.SH EXIT STATUS
+.B pv
+returns 0 on success and a non-zero status on validation, argument parsing, model
+loading, or inference errors.
+.SH FILES
+.TP
+.I artifacts/source-models-768x8-int8
+Default source-model bundle embedded at compile time.
+.TP
+.I docs/CLI.md
+Detailed command reference.
+.TP
+.I docs/MODEL_CARD.md
+Model-card documentation for the embedded source-model ensemble.
+.SH SEE ALSO
+.BR pv-tui (1)
