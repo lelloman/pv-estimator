@@ -4,6 +4,11 @@ PV Estimator is a local Rust CLI/TUI for photovoltaic production estimates. The
 default path runs fully on the local machine with the committed tight-v1 INT8
 source-model bundle embedded into the binary.
 
+Public project links:
+
+- GitHub: <https://github.com/lelloman/pv-estimator>
+- Hugging Face model bundle: <https://huggingface.co/lelloman/pv-estimator-tight-v1-int8>
+
 ## Install
 
 From the workspace root:
@@ -100,8 +105,10 @@ config directory so the last inputs are restored on the next run.
 
 The embedded estimator uses `artifacts/source-models-768x8-int8`, which has been
 replaced with the tight-v1 INT8 bundle. It contains local ONNX models for NASA
-POWER, PVGIS ERA5, and PVGIS SARAH3 plus the SARAH3 coverage mask. The runtime
-does not call a network service and does not depend on Python or PyTorch.
+POWER, PVGIS ERA5, and PVGIS SARAH3 plus the SARAH3 coverage mask. The same
+bundle is published on Hugging Face at
+<https://huggingface.co/lelloman/pv-estimator-tight-v1-int8>. The runtime does
+not call a network service and does not depend on Python or PyTorch.
 
 For reproducibility, see the tight-v1 comparison report:
 

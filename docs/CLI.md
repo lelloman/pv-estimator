@@ -179,3 +179,23 @@ GeoNames catalog built into `pv-data`.
 Builds may need access to the GeoNames zip only if the committed local catalog
 artifact is unavailable. The normal repository checkout includes the artifact
 used by the build script.
+
+## External Model Bundle
+
+The same tight-v1 INT8 source-model bundle embedded by default is published on
+Hugging Face:
+
+- <https://huggingface.co/lelloman/pv-estimator-tight-v1-int8>
+
+After downloading it, pass the downloaded directory with `--model-dir`:
+
+```sh
+hf download lelloman/pv-estimator-tight-v1-int8 \
+  --local-dir pv-estimator-tight-v1-int8
+
+pv estimate \
+  --lat 40.4168 \
+  --lon=-3.7038 \
+  --model-dir pv-estimator-tight-v1-int8 \
+  --format json
+```

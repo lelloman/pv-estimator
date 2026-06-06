@@ -15,7 +15,9 @@ Docker image, or hosted API as part of local v1.
 - Platform support for the `ort` crate pinned in `Cargo.lock`.
 
 The default estimator embeds ONNX model files at compile time from
-`artifacts/source-models-768x8-int8`.
+`artifacts/source-models-768x8-int8`. The same model bundle is published at
+<https://huggingface.co/lelloman/pv-estimator-tight-v1-int8> for external
+consumers and reproducibility.
 
 ## Install From a Checkout
 
@@ -82,7 +84,9 @@ Keep these paths in any source distribution:
 - `experiments/ml-weather/results/2026-06-05_tight_v1_int8_comparison.md`
 
 The ONNX files and coverage mask are compile-time inputs. Omitting them breaks
-the embedded estimator build.
+the embedded estimator build. If producing a source archive without embedded
+weights, document that users must download the Hugging Face bundle and run with
+`--model-dir`; that is not the default local v1 package shape.
 
 ## Manual Page
 

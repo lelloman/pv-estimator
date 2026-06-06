@@ -5,7 +5,10 @@
 PV Estimator local v1 uses an embedded INT8 ONNX source-model ensemble to
 estimate photovoltaic production from coordinates and system parameters. The
 embedded artifact directory is `artifacts/source-models-768x8-int8`, which was
-replaced with the tight-v1 INT8 bundle after comparison on 2026-06-05.
+replaced with the tight-v1 INT8 bundle after comparison on 2026-06-05. The same
+bundle is published publicly on Hugging Face:
+
+- <https://huggingface.co/lelloman/pv-estimator-tight-v1-int8>
 
 The model is intended for local, approximate PV production estimates. It is not
 a substitute for site measurements, a bankability study, structural design,
@@ -22,7 +25,8 @@ permitting review, or electrical engineering work.
 | `coverage/pvgis_sarah3_empirical_grid_mask.json` | Empirical SARAH3 applicability mask. |
 
 Artifact hashes are recorded in
-`experiments/ml-weather/results/2026-06-05_tight_v1_int8_comparison.md`.
+`experiments/ml-weather/results/2026-06-05_tight_v1_int8_comparison.md` and in
+the Hugging Face repository `SHA256SUMS` file.
 
 ## Manifest
 
@@ -154,5 +158,19 @@ To load the same bundle explicitly instead of using embedded bytes:
   --lat 40.4168 \
   --lon=-3.7038 \
   --model-dir artifacts/source-models-768x8-int8 \
+  --format json
+```
+
+Download the external model bundle from Hugging Face when you want to use the
+published weights outside a source checkout:
+
+```sh
+hf download lelloman/pv-estimator-tight-v1-int8 \
+  --local-dir pv-estimator-tight-v1-int8
+
+./target/debug/pv estimate \
+  --lat 40.4168 \
+  --lon=-3.7038 \
+  --model-dir pv-estimator-tight-v1-int8 \
   --format json
 ```

@@ -60,6 +60,24 @@ pv estimate \
   --format json
 ```
 
+## Verify a Hugging Face Model Bundle
+
+The public tight-v1 INT8 bundle is available at:
+
+- <https://huggingface.co/lelloman/pv-estimator-tight-v1-int8>
+
+To verify a downloaded bundle:
+
+```sh
+hf download lelloman/pv-estimator-tight-v1-int8 \
+  --local-dir pv-estimator-tight-v1-int8
+
+cd pv-estimator-tight-v1-int8
+sha256sum -c SHA256SUMS
+```
+
+Then run `pv estimate` with `--model-dir pv-estimator-tight-v1-int8`.
+
 ## No Applicable Source Models
 
 Some coordinates may not have any applicable source-model coverage. Check that
