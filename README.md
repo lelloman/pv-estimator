@@ -1,56 +1,78 @@
 # PV Estimator
 
-PV Estimator is a local Rust CLI/TUI for photovoltaic production estimates. The
-default path runs fully on the local machine with the committed tight-v1 INT8
-source-model bundle embedded into the binary.
+[![Release](https://img.shields.io/github/v/release/lelloman/pv-estimator?sort=semver)](https://github.com/lelloman/pv-estimator/releases)
+[![Model weights](https://img.shields.io/badge/model%20weights-Hugging%20Face-yellow)](https://huggingface.co/lelloman/pv-estimator-tight-v1-int8)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 
-Public project links:
+PV Estimator estimates photovoltaic production from coordinates and simple
+system settings. It runs locally, includes an embedded city search catalog, and
+uses an embedded source-model bundle by default, so estimates do not require a
+hosted service or a Python runtime.
 
-- GitHub: <https://github.com/lelloman/pv-estimator>
-- Hugging Face model bundle: <https://huggingface.co/lelloman/pv-estimator-tight-v1-int8>
+The current release is a local CLI plus terminal UI:
+
+- `pv search`: find cities from the embedded GeoNames catalog.
+- `pv estimate`: estimate annual and monthly PV production from coordinates.
+- `pv-tui`: interactive terminal UI for searching locations and adjusting system inputs.
+
+The model bundle is also published separately on Hugging Face:
+
+- <https://huggingface.co/lelloman/pv-estimator-tight-v1-int8>
 
 ## Install
 
-From the workspace root:
+Install from a checkout of this repository:
 
 ```sh
 cargo install --path crates/pv-cli
 cargo install --path crates/pv-tui
 ```
 
-The CLI package is named `pv-cli`, but it installs the binary as `pv`.
+The CLI package is named `pv-cli`, but it installs the command as `pv`.
 
-## Documentation
+Release builds and source archives are available on GitHub:
 
-- [CLI reference](docs/CLI.md): full command syntax, options, JSON shapes,
-  and examples.
-- [TUI reference](docs/TUI.md): terminal UI layout, fields, key bindings, search,
-  and state behavior.
-- [Troubleshooting](docs/TROUBLESHOOTING.md): common install, argument parsing,
-  model loading, city search, and TUI issues.
-- [Packaging and distribution](docs/PACKAGING.md): release checks, source archive
-  requirements, optimized builds, and man-page installation.
-- [Model card](docs/MODEL_CARD.md): embedded tight-v1 INT8 model details,
-  evaluation snapshot, intended use, and limitations.
-- [Man pages](docs/man/): roff manual pages for packagers.
+- <https://github.com/lelloman/pv-estimator/releases>
 
-## CLI Usage
+## Quick Start
 
-Search for a city, then estimate with coordinates:
+Search for a city, then estimate with its coordinates:
 
 ```sh
 pv search Milan
-pv search Milan --limit 5 --format json
 pv estimate --lat 45.4642 --lon 9.1900
+```
+
+Use JSON output for scripts or downstream tools:
+
+```sh
+pv search Milan --limit 5 --format json
 pv estimate --lat 40.4168 --lon=-3.7038 --format json
 ```
 
-Negative longitudes should be passed with an equals sign, for example
-`--lon=-3.7038`, so the value is not parsed as another flag.
+Use an equals sign for negative longitudes, for example `--lon=-3.7038`, so the
+value is not parsed as another flag.
 
-`pv estimate` keeps a stable JSON schema for downstream tools. It accepts
-coordinates, system size, loss, tilt, azimuth, optional display fields, and an
-optional artifact directory:
+Run the terminal UI:
+
+```sh
+pv-tui
+```
+
+## What It Estimates
+
+PV Estimator returns climate-normal estimates for:
+
+- annual and monthly PV energy
+- annual and monthly in-plane irradiation
+- annual and monthly global horizontal irradiation
+- per-source estimates and ensemble bands
+- source coverage metadata
+
+Inputs are intentionally simple: latitude, longitude, peak power, system losses,
+panel tilt, and PVGIS-style azimuth. `0` means south, `-90` east, and `90` west.
+
+Example:
 
 ```sh
 pv estimate \
@@ -63,7 +85,26 @@ pv estimate \
   --tilt-deg 30 \
   --azimuth-deg 0 \
   --format json
+```
 
+## Local Model Bundle
+
+The default estimator embeds `artifacts/source-models-768x8-int8`, a tight-v1
+INT8 ONNX source-model ensemble. It includes source models for:
+
+- NASA POWER
+- PVGIS ERA5
+- PVGIS SARAH3
+
+The runtime uses only the sources applicable to the requested coordinate and
+reports the applicable source list in JSON output. The same bundle is mirrored
+on Hugging Face with hashes and metadata:
+
+- <https://huggingface.co/lelloman/pv-estimator-tight-v1-int8>
+
+You can also point the CLI at an explicit model directory:
+
+```sh
 pv estimate \
   --lat 40.4168 \
   --lon=-3.7038 \
@@ -71,61 +112,38 @@ pv estimate \
   --format json
 ```
 
-`pv search <query>` returns GeoNames city matches from the embedded catalog.
-Table output includes name, country, latitude, longitude, population, and match
-kind. JSON output is an array of:
-
-```json
-{
-  "geoname_id": 3173435,
-  "display_name": "Milan",
-  "country_code": "IT",
-  "latitude": 45.46427,
-  "longitude": 9.18951,
-  "population": 1371498,
-  "feature_code": "PPLA",
-  "matched_name": "Milan",
-  "match_kind": "exact_primary"
-}
-```
-
-## TUI Usage
-
-Run the interactive terminal UI:
-
-```sh
-pv-tui
-```
-
-Use the location search in the TUI to find a city, apply it to the estimate, and
-adjust the system fields locally. The TUI stores a small state file in the user
-config directory so the last inputs are restored on the next run.
-
-## Model Bundle
-
-The embedded estimator uses `artifacts/source-models-768x8-int8`, which has been
-replaced with the tight-v1 INT8 bundle. It contains local ONNX models for NASA
-POWER, PVGIS ERA5, and PVGIS SARAH3 plus the SARAH3 coverage mask. The same
-bundle is published on Hugging Face at
-<https://huggingface.co/lelloman/pv-estimator-tight-v1-int8>. The runtime does
-not call a network service and does not depend on Python or PyTorch.
-
-For reproducibility, see the tight-v1 comparison report:
+Reproduction material for the shipped source models lives in
+`reproduction/source-models/`. The tight-v1 comparison report is at:
 
 - `reproduction/source-models/results/2026-06-05_tight_v1_int8_comparison.md`
 
-## Known Limitations
+## Documentation
 
-- Estimates are climate-normal model predictions, not site measurements or a
-  bankability report.
-- The CLI does not support `estimate --city` in v1. Use `pv search`, then pass
-  coordinates to `pv estimate`.
-- Coverage and uncertainty are source-model driven. Some coordinates may have
-  fewer applicable sources.
-- `pv-service` and `pv-wasm` remain future adapters and are not part of the
-  local v1 deliverable.
+- [CLI reference](docs/CLI.md): commands, options, JSON shapes, and examples.
+- [TUI reference](docs/TUI.md): terminal UI fields, key bindings, search, and saved state.
+- [Model card](docs/MODEL_CARD.md): model details, evaluation snapshot, intended use, and limitations.
+- [Troubleshooting](docs/TROUBLESHOOTING.md): common install, parsing, model loading, search, and TUI issues.
+- [Packaging](docs/PACKAGING.md): release checks, source archive requirements, optimized builds, and man pages.
+- [Source-model reproduction](reproduction/source-models/README.md): retained rebuild path for the shipped bundle.
 
-## Development Checks
+## Limitations
+
+PV Estimator is an early-stage estimation tool. It is useful for local
+exploration and rough production comparisons, but it is not a site survey, a
+bankability report, an electrical design tool, or a replacement for measured
+site data.
+
+Known local-v1 limits:
+
+- `pv estimate` accepts coordinates only. Use `pv search`, then pass latitude and longitude.
+- Local shading, horizon obstructions, snow, soiling, curtailment, detailed inverter clipping, and detailed module behavior are not fully modeled.
+- Accuracy can degrade in regions or climates underrepresented by the source models.
+- Uncertainty bands come from source disagreement; they are not a fully calibrated probabilistic forecast.
+- `pv-service` and `pv-wasm` are future adapters, not part of the local release.
+
+## Development
+
+Common checks:
 
 ```sh
 cargo fmt --check
@@ -135,13 +153,21 @@ cargo build -p pv-cli -p pv-tui
 target/debug/pv estimate --lat 40.4168 --lon=-3.7038 --format json
 ```
 
-## Workspace
+Workspace layout:
 
-- `crates/pv-cli`: installed as `pv`; search and estimate commands
-- `crates/pv-tui`: local interactive terminal UI
-- `crates/pv-model`: embedded/source-model artifact loading and inference
-- `crates/pv-data`: embedded GeoNames city catalog and fixture/domain data
-- `crates/pv-core`: typed contracts, units, project schema, and reports
-- `crates/pv-service`: future HTTP service adapter
-- `crates/pv-wasm`: future WASM adapter
-- `xtask`: development-time import and maintenance commands
+- `crates/pv-cli`: CLI package, installed as `pv`.
+- `crates/pv-tui`: interactive terminal UI.
+- `crates/pv-model`: model artifact loading and local inference.
+- `crates/pv-data`: embedded city catalog and source-model registry metadata.
+- `crates/pv-core`: typed units, project/report contracts, and ensemble data structures.
+- `crates/pv-service`: future HTTP service adapter.
+- `crates/pv-wasm`: future WASM adapter.
+- `xtask`: development-time import and maintenance commands.
+
+Generated build outputs, model-reproduction runs, and bulk data should stay out
+of git. The committed reproduction tree keeps only the files needed to rebuild,
+export, or validate the shipped source-model bundle.
+
+## License
+
+Licensed under either MIT or Apache-2.0, at your option.
