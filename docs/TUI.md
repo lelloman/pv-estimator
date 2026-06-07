@@ -44,13 +44,21 @@ Editable fields:
 | `Region` | Region or country label. |
 | `Latitude` | Decimal latitude. |
 | `Longitude` | Decimal longitude. |
-| `kWp` | PV system peak power. |
 | `Loss %` | System loss percent. |
-| `Tilt deg` | Panel tilt from horizontal. |
-| `Azimuth deg` | PVGIS-style azimuth; `0` south, `-90` east, `90` west. |
+| `Arrays` | One or more `kWp,tilt,azimuth` entries separated by semicolons. The same format is shown under the field in the TUI. Azimuth uses the PVGIS convention: `0` south, `-90` east, `90` west. |
 
 Editing `Name`, `Region`, `Latitude`, or `Longitude` marks the location as
 `custom`. Applying a city search result sets a GeoNames-backed location id.
+
+Example `Arrays` value:
+
+```text
+1.5,30,0; 2.0,20,-90; 1.0,10,90
+```
+
+The TUI shows the parsed total kWp below the `Arrays` field. Long field values
+stay on one line and scroll horizontally with the cursor. A leading `<` or
+trailing `>` marks hidden text beyond the visible field area.
 
 ## Key Bindings
 
@@ -77,7 +85,7 @@ Edit mode:
 | `Backspace` / `Delete` | Remove text. |
 | `Enter` | Apply value and recompute. |
 | `Esc` | Leave edit mode. |
-| `Tab` / `Shift+Tab` | Leave edit mode and move field selection. |
+| `Tab` / `Shift+Tab` | Apply value, recompute, and move field selection. |
 
 Location mode:
 
