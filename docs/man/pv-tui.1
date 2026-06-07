@@ -8,7 +8,10 @@ pv-tui \- interactive terminal UI for PV Estimator
 .B pv-tui
 runs an interactive local terminal UI for photovoltaic production estimates. It
 uses the embedded tight-v1 INT8 source-model bundle unless a model directory is
-provided.
+provided. The Arrays field accepts one or more kWp,tilt,azimuth entries separated
+by semicolons. The TUI shows the parsed total kWp below the Arrays field. Long
+field values scroll horizontally with the cursor and use < or > to mark hidden
+text.
 .SH OPTIONS
 .TP
 .BI --model-dir " DIR"
@@ -37,6 +40,9 @@ Quit.
 .TP
 .B Enter
 Apply value and recompute.
+.TP
+.B Tab, Shift+Tab
+Apply value, recompute, and move field selection.
 .TP
 .B Esc
 Return to normal mode.

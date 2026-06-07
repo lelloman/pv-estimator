@@ -14,7 +14,9 @@ use crossterm::terminal::{
 use directories::ProjectDirs;
 use pv_core::source_model::SourceEnsembleEstimateDocument;
 use pv_data::CitySearchResult;
-use pv_model::{EstimateRequest, SourceModelEstimator, days_in_month, short_month_name};
+use pv_model::{
+    EstimateArray, EstimateRequest, SourceModelEstimator, days_in_month, short_month_name,
+};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
@@ -34,6 +36,8 @@ struct Args {
 }
 
 const TUI_STATE_SCHEMA_VERSION: u32 = 1;
+const ARRAY_FORMAT_HELP: &str = "format: kWp,tilt,azimuth; kWp,tilt,azimuth";
+const FIELD_LABEL_WIDTH: u16 = 13;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TuiState {
@@ -148,10 +152,8 @@ impl App {
                 Field::new("Region", ""),
                 Field::new("Latitude", "40.650"),
                 Field::new("Longitude", "15.643"),
-                Field::new("kWp", "1.0"),
                 Field::new("Loss %", "14.0"),
-                Field::new("Tilt deg", "30.0"),
-                Field::new("Azimuth deg", "0.0"),
+                Field::new("Arrays", "1.0,30.0,0.0"),
             ],
             selected: 2,
             mode: Mode::Normal,
@@ -166,8 +168,8 @@ impl App {
 
     fn recompute(&mut self, estimator: &mut SourceModelEstimator) {
         match self
-            .request()
-            .and_then(|request| estimator.estimate(&request))
+            .request_and_arrays()
+            .and_then(|(request, arrays)| estimator.estimate_arrays(&request, &arrays))
         {
             Ok(document) => {
                 self.status = "Estimate updated".to_string();
@@ -237,18 +239,23 @@ impl App {
         }
     }
 
-    fn request(&self) -> Result<EstimateRequest> {
-        Ok(EstimateRequest {
-            location_id: self.selected_location_id.clone(),
-            name: self.fields[0].value.clone(),
-            region: self.fields[1].value.clone(),
-            latitude: parse_f64(&self.fields[2])?,
-            longitude: parse_f64(&self.fields[3])?,
-            peak_power_kwp: parse_f64(&self.fields[4])?,
-            loss_pct: parse_f64(&self.fields[5])?,
-            tilt_deg: parse_f64(&self.fields[6])?,
-            azimuth_deg: parse_f64(&self.fields[7])?,
-        })
+    fn request_and_arrays(&self) -> Result<(EstimateRequest, Vec<EstimateArray>)> {
+        let arrays = parse_arrays(&self.fields[5])?;
+        let first_array = arrays[0];
+        Ok((
+            EstimateRequest {
+                location_id: self.selected_location_id.clone(),
+                name: self.fields[0].value.clone(),
+                region: self.fields[1].value.clone(),
+                latitude: parse_f64(&self.fields[2])?,
+                longitude: parse_f64(&self.fields[3])?,
+                peak_power_kwp: first_array.peak_power_kwp,
+                loss_pct: parse_f64(&self.fields[4])?,
+                tilt_deg: first_array.tilt_deg,
+                azimuth_deg: first_array.azimuth_deg,
+            },
+            arrays,
+        ))
     }
 
     fn selected_field_mut(&mut self) -> &mut Field {
@@ -371,6 +378,42 @@ fn parse_f64(field: &Field) -> Result<f64> {
         .with_context(|| format!("{} must be a number", field.label))
 }
 
+fn parse_arrays(field: &Field) -> Result<Vec<EstimateArray>> {
+    let entries = field
+        .value
+        .split(';')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        anyhow::bail!("Arrays must contain at least one kWp,tilt,azimuth entry");
+    }
+
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| parse_array_entry(index + 1, entry))
+        .collect()
+}
+
+fn parse_array_entry(index: usize, entry: &str) -> Result<EstimateArray> {
+    let parts = entry.split(',').map(str::trim).collect::<Vec<_>>();
+    if parts.len() != 3 {
+        anyhow::bail!("array {index} must be kWp,tilt,azimuth");
+    }
+    Ok(EstimateArray {
+        peak_power_kwp: parts[0]
+            .parse::<f64>()
+            .with_context(|| format!("array {index} kWp must be a number"))?,
+        tilt_deg: parts[1]
+            .parse::<f64>()
+            .with_context(|| format!("array {index} tilt must be a number"))?,
+        azimuth_deg: parts[2]
+            .parse::<f64>()
+            .with_context(|| format!("array {index} azimuth must be a number"))?,
+    })
+}
+
 fn handle_key(key: KeyEvent, app: &mut App, estimator: &mut SourceModelEstimator) -> Result<bool> {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Ok(true);
@@ -421,10 +464,12 @@ fn handle_edit_key(
         }
         KeyCode::Tab => {
             app.mode = Mode::Normal;
+            app.recompute(estimator);
             app.selected = (app.selected + 1).min(app.fields.len() - 1);
         }
         KeyCode::BackTab => {
             app.mode = Mode::Normal;
+            app.recompute(estimator);
             app.selected = app.selected.saturating_sub(1);
         }
         KeyCode::Backspace => {
@@ -510,7 +555,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
 
     let body = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(35), Constraint::Min(40)])
+        .constraints([Constraint::Length(45), Constraint::Min(40)])
         .split(vertical[1]);
     render_fields(frame, body[0], app);
     render_estimate(frame, body[1], app);
@@ -558,7 +603,10 @@ fn render_fields(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let mut lines = Vec::with_capacity(app.fields.len() + app.location_results.len().min(6) + 3);
+    let array_extra_lines = array_extra_line_count(app);
+    let mut lines = Vec::with_capacity(
+        app.fields.len() + array_extra_lines as usize + app.location_results.len().min(6) + 3,
+    );
     for (index, field) in app.fields.iter().enumerate() {
         let selected = index == app.selected;
         let style = match (selected, app.mode) {
@@ -566,22 +614,49 @@ fn render_fields(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             (true, Mode::Normal) => Style::default().fg(Color::Black).bg(Color::Cyan),
             _ => Style::default(),
         };
-        let mut spans = vec![
+        let value_view = field_value_view(field, field_value_width(inner), selected);
+        let spans = vec![
             Span::styled(
-                format!("{:<13}", field.label),
+                format!(
+                    "{:<width$}",
+                    field.label,
+                    width = FIELD_LABEL_WIDTH as usize
+                ),
                 Style::default().fg(Color::DarkGray),
             ),
-            Span::styled(field.value.as_str(), style),
+            Span::styled(value_view.value, style),
         ];
-        if field.label == "Azimuth deg"
-            && let Some(label) = azimuth_direction_label(field.value.as_str())
-        {
-            spans.push(Span::styled(
-                format!(" ({label})"),
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
         lines.push(Line::from(spans));
+        if field.label == "Arrays" {
+            lines.push(Line::from(vec![Span::styled(
+                format!("  {ARRAY_FORMAT_HELP}"),
+                Style::default().fg(Color::DarkGray),
+            )]));
+        }
+        if field.label == "Arrays"
+            && let Ok(arrays) = parse_arrays(field)
+        {
+            lines.push(Line::from(vec![Span::styled(
+                format!("  total {:.2} kWp", total_array_kwp(&arrays)),
+                Style::default().fg(Color::DarkGray),
+            )]));
+            for (array_index, array) in arrays.iter().enumerate() {
+                let direction = azimuth_direction_label(&array.azimuth_deg.to_string())
+                    .map(|label| format!(" {label}"))
+                    .unwrap_or_default();
+                lines.push(Line::from(vec![Span::styled(
+                    format!(
+                        "  A{} {:>5.2} kWp  tilt {:>4.1}  az {:>5.1}{}",
+                        array_index + 1,
+                        array.peak_power_kwp,
+                        array.tilt_deg,
+                        array.azimuth_deg,
+                        direction
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                )]));
+            }
+        }
     }
     lines.push(Line::from(""));
     let search_style = if app.mode == Mode::Location {
@@ -589,9 +664,17 @@ fn render_fields(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     } else {
         Style::default().fg(Color::DarkGray)
     };
+    let location_view = field_value_view(
+        &app.location_query,
+        field_value_width(inner),
+        app.mode == Mode::Location,
+    );
     lines.push(Line::from(vec![
-        Span::styled("Location     ", Style::default().fg(Color::DarkGray)),
-        Span::styled(app.location_query.value.as_str(), search_style),
+        Span::styled(
+            format!("{:<width$}", "Location", width = FIELD_LABEL_WIDTH as usize),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(location_view.value, search_style),
     ]));
     for (row, location) in app.location_results.iter().take(6).enumerate() {
         let selected = app.mode == Mode::Location && row == app.location_selected;
@@ -617,19 +700,74 @@ fn render_fields(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 
     if app.mode == Mode::Edit {
         let field = &app.fields[app.selected];
+        let value_view = field_value_view(field, field_value_width(inner), true);
         let y = inner.y.saturating_add(app.selected as u16);
         let x = inner
             .x
-            .saturating_add(13)
-            .saturating_add(field.cursor.min(u16::MAX as usize) as u16);
+            .saturating_add(FIELD_LABEL_WIDTH)
+            .saturating_add(value_view.cursor_col.min(u16::MAX as usize) as u16);
         frame.set_cursor_position(Position::new(x, y));
     } else if app.mode == Mode::Location {
-        let y = inner.y.saturating_add(app.fields.len() as u16 + 1);
+        let y = inner
+            .y
+            .saturating_add(app.fields.len() as u16 + array_extra_lines + 1);
+        let location_view = field_value_view(&app.location_query, field_value_width(inner), true);
         let x = inner
             .x
-            .saturating_add(13)
-            .saturating_add(app.location_query.cursor.min(u16::MAX as usize) as u16);
+            .saturating_add(FIELD_LABEL_WIDTH)
+            .saturating_add(location_view.cursor_col.min(u16::MAX as usize) as u16);
         frame.set_cursor_position(Position::new(x, y));
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FieldValueView {
+    value: String,
+    cursor_col: usize,
+}
+
+fn field_value_width(area: Rect) -> usize {
+    area.width.saturating_sub(FIELD_LABEL_WIDTH).max(1) as usize
+}
+
+fn field_value_view(field: &Field, max_width: usize, keep_cursor_visible: bool) -> FieldValueView {
+    if max_width == 0 {
+        return FieldValueView {
+            value: String::new(),
+            cursor_col: 0,
+        };
+    }
+
+    let chars = field.value.chars().collect::<Vec<_>>();
+    let cursor_char = field.value[..field.cursor].chars().count().min(chars.len());
+    if chars.len() <= max_width {
+        return FieldValueView {
+            value: field.value.clone(),
+            cursor_col: cursor_char.min(max_width.saturating_sub(1)),
+        };
+    }
+
+    let mut start = if keep_cursor_visible && cursor_char >= max_width {
+        cursor_char + 1 - max_width
+    } else {
+        0
+    };
+    start = start.min(chars.len().saturating_sub(max_width));
+    let end = (start + max_width).min(chars.len());
+    let mut visible = chars[start..end].iter().copied().collect::<Vec<_>>();
+    if start > 0 && !visible.is_empty() {
+        visible[0] = '<';
+    }
+    if end < chars.len() && !visible.is_empty() {
+        let last = visible.len() - 1;
+        visible[last] = '>';
+    }
+
+    FieldValueView {
+        value: visible.into_iter().collect(),
+        cursor_col: cursor_char
+            .saturating_sub(start)
+            .min(max_width.saturating_sub(1)),
     }
 }
 
@@ -721,12 +859,33 @@ fn render_estimate(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(lines), chunks[1]);
 }
 
+fn array_extra_line_count(app: &App) -> u16 {
+    app.fields
+        .iter()
+        .find(|field| field.label == "Arrays")
+        .map(|field| {
+            let parsed_lines = parse_arrays(field)
+                .ok()
+                .map(|arrays| arrays.len().saturating_add(1).min(u16::MAX as usize) as u16)
+                .unwrap_or(0);
+            1 + parsed_lines
+        })
+        .unwrap_or(0)
+}
+
+fn total_array_kwp(arrays: &[EstimateArray]) -> f64 {
+    arrays.iter().map(|array| array.peak_power_kwp).sum()
+}
+
 fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let (mode, help) = match app.mode {
         Mode::Normal => (
             "NORMAL",
             "arrows/tab select  enter edit  l locations  e estimate  q quit",
         ),
+        Mode::Edit if app.fields[app.selected].label == "Arrays" => {
+            ("EDIT", "enter/tab apply estimate  esc close edit")
+        }
         Mode::Edit => ("EDIT", "type value  enter apply  esc cancel edit  tab next"),
         Mode::Location => (
             "LOCATION",
@@ -782,6 +941,57 @@ mod tests {
         assert_eq!(azimuth_direction_label("45"), Some("SW"));
         assert_eq!(azimuth_direction_label("-45"), Some("SE"));
         assert_eq!(azimuth_direction_label("not-a-number"), None);
+    }
+
+    #[test]
+    fn parses_multiple_array_entries() {
+        let field = Field::new("Arrays", "1.5,30,0; 2.25,20,-90");
+        let arrays = parse_arrays(&field).expect("valid arrays");
+
+        assert_eq!(arrays.len(), 2);
+        assert_eq!(arrays[0].peak_power_kwp, 1.5);
+        assert_eq!(arrays[0].tilt_deg, 30.0);
+        assert_eq!(arrays[0].azimuth_deg, 0.0);
+        assert_eq!(arrays[1].peak_power_kwp, 2.25);
+        assert_eq!(arrays[1].tilt_deg, 20.0);
+        assert_eq!(arrays[1].azimuth_deg, -90.0);
+    }
+
+    #[test]
+    fn rejects_malformed_array_entries() {
+        let field = Field::new("Arrays", "1.5,30; 2.0,20,0");
+        let error = parse_arrays(&field).expect_err("entry is missing azimuth");
+
+        assert!(
+            error
+                .to_string()
+                .contains("array 1 must be kWp,tilt,azimuth")
+        );
+    }
+
+    #[test]
+    fn totals_array_kwp() {
+        let arrays =
+            parse_arrays(&Field::new("Arrays", "1.5,30,0; 2.25,20,-90")).expect("valid arrays");
+
+        assert_eq!(total_array_kwp(&arrays), 3.75);
+    }
+
+    #[test]
+    fn field_value_view_tracks_cursor_in_long_values() {
+        let mut field = Field::new("Arrays", "1,2,3; 4,5,6; 7,8,9");
+        field.cursor = 0;
+
+        let start = field_value_view(&field, 10, true);
+        assert_eq!(start.value.chars().count(), 10);
+        assert!(start.value.ends_with('>'));
+        assert_eq!(start.cursor_col, 0);
+
+        field.cursor = field.value.len();
+        let end = field_value_view(&field, 10, true);
+        assert_eq!(end.value.chars().count(), 10);
+        assert!(end.value.starts_with('<'));
+        assert_eq!(end.cursor_col, 9);
     }
 
     #[test]

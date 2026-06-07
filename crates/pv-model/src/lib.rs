@@ -54,6 +54,13 @@ pub struct EstimateRequest {
     pub azimuth_deg: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EstimateArray {
+    pub peak_power_kwp: f64,
+    pub tilt_deg: f64,
+    pub azimuth_deg: f64,
+}
+
 impl Default for EstimateRequest {
     fn default() -> Self {
         Self {
@@ -66,6 +73,16 @@ impl Default for EstimateRequest {
             loss_pct: 14.0,
             tilt_deg: 30.0,
             azimuth_deg: 0.0,
+        }
+    }
+}
+
+impl EstimateRequest {
+    pub fn single_array(&self) -> EstimateArray {
+        EstimateArray {
+            peak_power_kwp: self.peak_power_kwp,
+            tilt_deg: self.tilt_deg,
+            azimuth_deg: self.azimuth_deg,
         }
     }
 }
@@ -239,7 +256,16 @@ impl SourceModelEstimator {
         &mut self,
         request: &EstimateRequest,
     ) -> Result<SourceEnsembleEstimateDocument> {
-        validate_request(request)?;
+        self.estimate_arrays(request, &[request.single_array()])
+    }
+
+    pub fn estimate_arrays(
+        &mut self,
+        request: &EstimateRequest,
+        arrays: &[EstimateArray],
+    ) -> Result<SourceEnsembleEstimateDocument> {
+        validate_request_location_and_loss(request)?;
+        validate_arrays(arrays)?;
         let features = encode_features(
             request.latitude,
             request.longitude,
@@ -259,7 +285,7 @@ impl SourceModelEstimator {
                 continue;
             }
             let climate = source.predict_climate(&features)?;
-            let pv = estimate_pv_from_climate(&climate, request);
+            let pv = estimate_pv_from_climate(&climate, request, arrays);
             applicable_sources.push(WeatherSourceId::new(&source.source_id)?);
             source_estimates.push(source_estimate(&source.source_id, pv)?);
         }
@@ -286,10 +312,10 @@ impl SourceModelEstimator {
                 longitude: request.longitude,
             },
             system: EstimateSystem {
-                peak_power_kwp: request.peak_power_kwp,
+                peak_power_kwp: total_peak_power_kwp(arrays),
                 loss_pct: request.loss_pct,
-                tilt_deg: request.tilt_deg,
-                aspect_deg: request.azimuth_deg,
+                tilt_deg: weighted_array_value(arrays, |array| array.tilt_deg),
+                aspect_deg: weighted_array_value(arrays, |array| array.azimuth_deg),
             },
             coverage: EstimateCoverage {
                 pvgis_sarah3_applicable: sarah3_applicable,
@@ -301,6 +327,13 @@ impl SourceModelEstimator {
                 "input_features": self.input_features,
                 "temporal_bins": self.temporal_bins,
                 "target_names": self.target_names,
+                "arrays": arrays.iter().map(|array| {
+                    json!({
+                        "peak_power_kwp": array.peak_power_kwp,
+                        "tilt_deg": array.tilt_deg,
+                        "azimuth_deg": array.azimuth_deg,
+                    })
+                }).collect::<Vec<_>>(),
             }),
         })
     }
@@ -324,22 +357,54 @@ pub fn short_month_name(month: u8) -> Option<&'static str> {
 }
 
 pub fn validate_request(request: &EstimateRequest) -> Result<()> {
+    validate_request_location_and_loss(request)?;
+    validate_array(request.single_array(), "system")
+}
+
+fn validate_request_location_and_loss(request: &EstimateRequest) -> Result<()> {
     if !(-90.0..=90.0).contains(&request.latitude) {
         bail!("latitude must be in [-90, 90]");
     }
     if !(-180.0..=180.0).contains(&request.longitude) {
         bail!("longitude must be in [-180, 180]");
     }
-    if request.peak_power_kwp <= 0.0 {
-        bail!("peak power must be positive");
-    }
     if !(0.0..100.0).contains(&request.loss_pct) {
         bail!("loss percent must be in [0, 100)");
     }
-    if !(0.0..=90.0).contains(&request.tilt_deg) {
-        bail!("tilt must be in [0, 90]");
+    Ok(())
+}
+
+pub fn validate_arrays(arrays: &[EstimateArray]) -> Result<()> {
+    if arrays.is_empty() {
+        bail!("at least one array is required");
+    }
+    for (index, array) in arrays.iter().copied().enumerate() {
+        validate_array(array, &format!("array {}", index + 1))?;
     }
     Ok(())
+}
+
+fn validate_array(array: EstimateArray, label: &str) -> Result<()> {
+    if array.peak_power_kwp <= 0.0 {
+        bail!("{label} peak power must be positive");
+    }
+    if !(0.0..=90.0).contains(&array.tilt_deg) {
+        bail!("{label} tilt must be in [0, 90]");
+    }
+    Ok(())
+}
+
+fn total_peak_power_kwp(arrays: &[EstimateArray]) -> f64 {
+    arrays.iter().map(|array| array.peak_power_kwp).sum()
+}
+
+fn weighted_array_value(arrays: &[EstimateArray], value: impl Fn(EstimateArray) -> f64) -> f64 {
+    let total_kwp = total_peak_power_kwp(arrays);
+    arrays
+        .iter()
+        .map(|array| array.peak_power_kwp * value(*array))
+        .sum::<f64>()
+        / total_kwp
 }
 
 pub fn format_table(document: &SourceEnsembleEstimateDocument) -> String {
@@ -930,10 +995,71 @@ fn encode_features(
 fn estimate_pv_from_climate(
     climate: &[[f64; TARGETS]; TEMPORAL_BINS],
     request: &EstimateRequest,
+    arrays: &[EstimateArray],
+) -> PvPrediction {
+    let total_kwp = total_peak_power_kwp(arrays);
+    let predictions = arrays
+        .iter()
+        .map(|array| estimate_array_pv_from_climate(climate, request, *array))
+        .collect::<Vec<_>>();
+
+    let monthly = (0..12)
+        .map(|month| {
+            let month_predictions = predictions
+                .iter()
+                .map(|prediction| &prediction.monthly[month])
+                .collect::<Vec<_>>();
+            MonthlyPvPrediction {
+                month: month_predictions[0].month,
+                energy_kwh: month_predictions
+                    .iter()
+                    .map(|prediction| prediction.energy_kwh)
+                    .sum(),
+                poa_kwh_m2: arrays
+                    .iter()
+                    .zip(month_predictions.iter())
+                    .map(|(array, prediction)| array.peak_power_kwp * prediction.poa_kwh_m2)
+                    .sum::<f64>()
+                    / total_kwp,
+                ghi_kwh_m2: arrays
+                    .iter()
+                    .zip(month_predictions.iter())
+                    .map(|(array, prediction)| array.peak_power_kwp * prediction.ghi_kwh_m2)
+                    .sum::<f64>()
+                    / total_kwp,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    PvPrediction {
+        annual_energy_kwh: predictions
+            .iter()
+            .map(|prediction| prediction.annual_energy_kwh)
+            .sum(),
+        annual_poa_kwh_m2: arrays
+            .iter()
+            .zip(predictions.iter())
+            .map(|(array, prediction)| array.peak_power_kwp * prediction.annual_poa_kwh_m2)
+            .sum::<f64>()
+            / total_kwp,
+        annual_ghi_kwh_m2: arrays
+            .iter()
+            .zip(predictions.iter())
+            .map(|(array, prediction)| array.peak_power_kwp * prediction.annual_ghi_kwh_m2)
+            .sum::<f64>()
+            / total_kwp,
+        monthly,
+    }
+}
+
+fn estimate_array_pv_from_climate(
+    climate: &[[f64; TARGETS]; TEMPORAL_BINS],
+    request: &EstimateRequest,
+    array: EstimateArray,
 ) -> PvPrediction {
     let lat_rad = request.latitude.to_radians();
-    let tilt = request.tilt_deg.to_radians();
-    let surface_azimuth_from_north = ((180.0 + request.azimuth_deg) % 360.0).to_radians();
+    let tilt = array.tilt_deg.to_radians();
+    let surface_azimuth_from_north = ((180.0 + array.azimuth_deg) % 360.0).to_radians();
     let loss_factor = 1.0 - request.loss_pct / 100.0;
     let albedo = 0.2;
     let gamma = -0.0040;
@@ -967,7 +1093,7 @@ fn estimate_pv_from_climate(
             let poa = (beam + diffuse + ground).max(0.0);
             let cell_temp = temp + poa * (noct_c - 20.0) / 800.0;
             let temp_factor = (1.0 + gamma * (cell_temp - 25.0)).max(0.0);
-            let energy = request.peak_power_kwp * (poa / 1000.0) * temp_factor * loss_factor;
+            let energy = array.peak_power_kwp * (poa / 1000.0) * temp_factor * loss_factor;
             poa_day += poa;
             energy_day += energy;
             ghi_day += ghi;
@@ -1079,6 +1205,46 @@ fn default_output_name() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validates_array_inputs() {
+        validate_arrays(&[
+            EstimateArray {
+                peak_power_kwp: 1.5,
+                tilt_deg: 30.0,
+                azimuth_deg: 0.0,
+            },
+            EstimateArray {
+                peak_power_kwp: 2.0,
+                tilt_deg: 15.0,
+                azimuth_deg: -90.0,
+            },
+        ])
+        .expect("valid arrays");
+
+        assert!(validate_arrays(&[]).is_err());
+        assert!(
+            validate_arrays(&[EstimateArray {
+                peak_power_kwp: 1.0,
+                tilt_deg: 91.0,
+                azimuth_deg: 0.0,
+            }])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn location_loss_validation_ignores_legacy_array_fields() {
+        let request = EstimateRequest {
+            peak_power_kwp: -1.0,
+            tilt_deg: 120.0,
+            ..EstimateRequest::default()
+        };
+
+        validate_request_location_and_loss(&request)
+            .expect("multi-array validation does not use legacy array fields");
+        assert!(validate_request(&request).is_err());
+    }
 
     #[test]
     fn feature_encoder_matches_expected_shape_and_first_values() {
