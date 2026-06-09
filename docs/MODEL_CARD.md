@@ -68,13 +68,18 @@ coordinate. The JSON output reports `coverage.applicable_sources` and
 User-facing inputs:
 
 - Latitude and longitude in decimal degrees.
-- Peak power in kWp.
 - System loss percent.
-- Tilt in degrees.
-- PVGIS-style azimuth in degrees.
+- One or more PV arrays, each with peak power in kWp, tilt in degrees, and
+  PVGIS-style azimuth in degrees.
 
-Derived model features include encoded geography, temporal bins, solar geometry,
-and system orientation terms. The local v1 manifest schema uses 66 input
+For multi-array systems, the estimator runs each submitted orientation against
+the same climate-normal source prediction and aggregates production. Output
+`system.peak_power_kwp` is total installed kWp, while per-array input metadata is
+preserved in `references.arrays`.
+
+Derived model features include encoded geography and temporal bins. Solar
+geometry and array orientation are applied during the PV conversion step rather
+than as ONNX climate-model inputs. The local v1 manifest schema uses 66 input
 features.
 
 ## Outputs
