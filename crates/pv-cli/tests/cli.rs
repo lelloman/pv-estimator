@@ -86,6 +86,95 @@ fn estimate_accepts_explicit_model_dir() {
 }
 
 #[test]
+fn estimate_accepts_multiple_arrays() {
+    let output = assert_success(
+        pv().args([
+            "estimate",
+            "--lat",
+            "45.4642",
+            "--lon",
+            "9.1900",
+            "--array",
+            "1.5,30,0",
+            "--array",
+            "2.25,20,-90",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run pv estimate with arrays"),
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).expect("estimate JSON");
+
+    assert_eq!(document["system"]["peak_power_kwp"], 3.75);
+    assert_eq!(document["references"]["arrays"][0]["peak_power_kwp"], 1.5);
+    assert_eq!(document["references"]["arrays"][1]["azimuth_deg"], -90.0);
+}
+
+#[test]
+fn estimate_accepts_semicolon_array_list() {
+    let output = assert_success(
+        pv().args([
+            "estimate",
+            "--lat",
+            "45.4642",
+            "--lon",
+            "9.1900",
+            "--array",
+            "1.5,30,0; 2.25,20,-90",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run pv estimate with array list"),
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).expect("estimate JSON");
+
+    assert_eq!(document["system"]["peak_power_kwp"], 3.75);
+    assert_eq!(
+        document["references"]["arrays"]
+            .as_array()
+            .expect("arrays reference")
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn estimate_rejects_malformed_arrays() {
+    let output = assert_failure(
+        pv().args([
+            "estimate", "--lat", "45.4642", "--lon", "9.1900", "--array", "1.5,30",
+        ])
+        .output()
+        .expect("run pv estimate with invalid array"),
+    );
+
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("array 1 must be KWP,TILT,AZIMUTH"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn estimate_rejects_empty_array_list() {
+    let output = assert_failure(
+        pv().args([
+            "estimate", "--lat", "45.4642", "--lon", "9.1900", "--array", ";",
+        ])
+        .output()
+        .expect("run pv estimate with empty array list"),
+    );
+
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("at least one --array entry is required"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn search_milan_json_returns_city_fields() {
     let output = assert_success(
         pv().args(["search", "Milan", "--format", "json"])

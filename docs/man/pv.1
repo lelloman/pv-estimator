@@ -55,7 +55,11 @@ System loss percent. Default: 14.0.
 Panel tilt in degrees from horizontal. Default: 30.0.
 .TP
 .BI --azimuth-deg " DEG"
-PVGIS-style azimuth. 0 is south, -90 is east, 90 is west. Default: 0.0.
+PVGIS-style azimuth for the default single array. 0 is south, -90 is east, 90 is west. Default: 0.0.
+.TP
+.BI --array " KWP,TILT,AZIMUTH"
+Add an array. May be repeated or contain semicolon-separated entries. When set,
+array entries define the system instead of --kwp, --tilt-deg, and --azimuth-deg.
 .TP
 .BI --model-dir " DIR"
 Load model artifacts from a directory instead of embedded bytes.
@@ -86,6 +90,8 @@ pv search Milan
 pv search Milan --limit 5 --format json
 pv estimate --lat 45.4642 --lon 9.1900
 pv estimate --lat 40.4168 --lon=-3.7038 --format json
+pv estimate --lat 45.4642 --lon 9.1900 --array 1.5,30,0 --array 2.0,20,-90
+pv estimate --lat 45.4642 --lon 9.1900 --array "1.5,30,0; 2.0,20,-90"
 .EE
 .SH EXIT STATUS
 .B pv
