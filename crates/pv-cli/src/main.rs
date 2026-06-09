@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use pv_data::{CityMatchKind, CitySearchResult};
-use pv_model::{EstimateRequest, SourceModelEstimator, format_table};
+use pv_model::{EstimateArray, EstimateRequest, SourceModelEstimator, format_table};
 use serde::Serialize;
 
 #[derive(Debug, Parser)]
@@ -42,6 +42,8 @@ struct EstimateArgs {
     tilt_deg: f64,
     #[arg(long, default_value_t = 0.0)]
     azimuth_deg: f64,
+    #[arg(long = "array", value_name = "KWP,TILT,AZIMUTH")]
+    arrays: Vec<String>,
     #[arg(long)]
     model_dir: Option<PathBuf>,
     #[arg(long, default_value = "source-model-artifacts.json")]
@@ -92,23 +94,67 @@ fn run() -> Result<()> {
     }
 }
 
+fn estimate_arrays(args: &EstimateArgs) -> Result<Vec<EstimateArray>> {
+    if args.arrays.is_empty() {
+        return Ok(vec![EstimateArray {
+            peak_power_kwp: args.kwp,
+            tilt_deg: args.tilt_deg,
+            azimuth_deg: args.azimuth_deg,
+        }]);
+    }
+
+    let arrays = args
+        .arrays
+        .iter()
+        .flat_map(|value| value.split(';'))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .enumerate()
+        .map(|(index, value)| parse_array_arg(index + 1, value))
+        .collect::<Result<Vec<_>>>()?;
+    if arrays.is_empty() {
+        bail!("at least one --array entry is required");
+    }
+    Ok(arrays)
+}
+
+fn parse_array_arg(index: usize, value: &str) -> Result<EstimateArray> {
+    let parts = value.split(',').map(str::trim).collect::<Vec<_>>();
+    if parts.len() != 3 {
+        bail!("array {index} must be KWP,TILT,AZIMUTH");
+    }
+    Ok(EstimateArray {
+        peak_power_kwp: parts[0]
+            .parse::<f64>()
+            .map_err(|_| anyhow::anyhow!("array {index} KWP must be a number"))?,
+        tilt_deg: parts[1]
+            .parse::<f64>()
+            .map_err(|_| anyhow::anyhow!("array {index} TILT must be a number"))?,
+        azimuth_deg: parts[2]
+            .parse::<f64>()
+            .map_err(|_| anyhow::anyhow!("array {index} AZIMUTH must be a number"))?,
+    })
+}
+
 fn estimate(args: EstimateArgs) -> Result<()> {
+    let arrays = estimate_arrays(&args)?;
+    let first_array = arrays[0];
     let request = EstimateRequest {
         latitude: args.lat,
         longitude: args.lon,
         location_id: args.location_id,
         name: args.name,
         region: args.region,
-        peak_power_kwp: args.kwp,
+        peak_power_kwp: first_array.peak_power_kwp,
         loss_pct: args.loss_pct,
-        tilt_deg: args.tilt_deg,
-        azimuth_deg: args.azimuth_deg,
+        tilt_deg: first_array.tilt_deg,
+        azimuth_deg: first_array.azimuth_deg,
     };
     let mut estimator = match &args.model_dir {
         Some(model_dir) => SourceModelEstimator::load(model_dir, &args.manifest)?,
         None => SourceModelEstimator::load_embedded()?,
     };
-    let document = estimator.estimate(&request)?;
+    let document = estimator.estimate_arrays(&request, &arrays)?;
     match args.format {
         OutputFormat::Json => write_json(&document),
         OutputFormat::Table => {
