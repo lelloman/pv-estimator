@@ -58,8 +58,9 @@ Panel tilt in degrees from horizontal. Default: 30.0.
 PVGIS-style azimuth for the default single array. 0 is south, -90 is east, 90 is west. Default: 0.0.
 .TP
 .BI --array " KWP,TILT,AZIMUTH"
-Add an array. May be repeated or contain semicolon-separated entries. When set,
-array entries define the system instead of --kwp, --tilt-deg, and --azimuth-deg.
+Add an array as kWp,tilt,azimuth. May be repeated or contain semicolon-separated
+entries. When set, array entries define the system instead of --kwp, --tilt-deg,
+and --azimuth-deg. JSON output preserves submitted entries in references.arrays.
 .TP
 .BI --model-dir " DIR"
 Load model artifacts from a directory instead of embedded bytes.

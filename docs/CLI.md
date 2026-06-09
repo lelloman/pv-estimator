@@ -128,6 +128,13 @@ The top-level object is stable for local v1:
 }
 ```
 
+`system.peak_power_kwp` is the total installed kWp used for the estimate. For
+multi-array estimates, `system.tilt_deg` and `system.aspect_deg` are
+capacity-weighted display values; the exact submitted arrays are preserved in
+`references.arrays` with `peak_power_kwp`, `tilt_deg`, and `azimuth_deg` for each
+array. For single-array estimates, `references.arrays` contains one entry that
+matches `--kwp`, `--tilt-deg`, and `--azimuth-deg`.
+
 `ensemble_estimate` contains per-source annual/monthly estimates, ensemble mean
 bands, and uncertainty bands. Energy values are stored as watt-hours. Irradiation
 values are stored as kilowatt-hours per square meter.

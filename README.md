@@ -50,6 +50,15 @@ pv search Milan --limit 5 --format json
 pv estimate --lat 40.4168 --lon=-3.7038 --format json
 ```
 
+Estimate systems with multiple orientations by adding arrays as
+`kWp,tilt,azimuth` triples:
+
+```sh
+pv estimate --lat 45.4642 --lon 9.1900 \
+  --array 1.5,30,0 \
+  --array 2.0,20,-90
+```
+
 Use an equals sign for negative longitudes, for example `--lon=-3.7038`, so the
 value is not parsed as another flag.
 
@@ -69,10 +78,11 @@ PV Estimator returns climate-normal estimates for:
 - per-source estimates and ensemble bands
 - source coverage metadata
 
-Inputs are intentionally simple: latitude, longitude, peak power, system losses,
-panel tilt, and PVGIS-style azimuth. `0` means south, `-90` east, and `90` west.
+Inputs are intentionally simple: latitude, longitude, system losses, and one or
+more PV arrays. Each array is a peak-power, tilt, and PVGIS-style azimuth triple.
+Azimuth `0` means south, `-90` east, and `90` west.
 
-Example:
+Single-array example:
 
 ```sh
 pv estimate \
@@ -84,6 +94,20 @@ pv estimate \
   --loss-pct 14 \
   --tilt-deg 30 \
   --azimuth-deg 0 \
+  --format json
+```
+
+Multi-array example:
+
+```sh
+pv estimate \
+  --lat 45.4642 \
+  --lon 9.1900 \
+  --name Milan \
+  --region IT \
+  --loss-pct 14 \
+  --array 1.5,30,0 \
+  --array 2.0,20,-90 \
   --format json
 ```
 
@@ -136,6 +160,7 @@ site data.
 Known local-v1 limits:
 
 - `pv estimate` accepts coordinates only. Use `pv search`, then pass latitude and longitude.
+- Multiple arrays model capacity and orientation only; string layout, MPPT assignment, and inverter clipping still are not modeled in detail.
 - Local shading, horizon obstructions, snow, soiling, curtailment, detailed inverter clipping, and detailed module behavior are not fully modeled.
 - Accuracy can degrade in regions or climates underrepresented by the source models.
 - Uncertainty bands come from source disagreement; they are not a fully calibrated probabilistic forecast.
