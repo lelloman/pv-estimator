@@ -36,7 +36,7 @@ struct Args {
 }
 
 const TUI_STATE_SCHEMA_VERSION: u32 = 1;
-const ARRAY_FORMAT_HELP: &str = "format: kWp,tilt,azimuth; kWp,tilt,azimuth";
+const ARRAY_FORMAT_HELP: &str = "format: kWp,tilt,az; repeat with ;";
 const FIELD_LABEL_WIDTH: u16 = 13;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -930,6 +930,57 @@ fn truncate(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use ratatui::backend::TestBackend;
+
+    const SNAPSHOT_SIZE: (u16, u16) = (80, 24);
+
+    fn render_snapshot(app: &App) -> String {
+        let backend = TestBackend::new(SNAPSHOT_SIZE.0, SNAPSHOT_SIZE.1);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal.draw(|frame| render(frame, app)).expect("draw TUI");
+        terminal.backend().to_string()
+    }
+
+    fn assert_snapshot(name: &str, actual: &str) {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src/snapshots")
+            .join(format!("{name}.snap"));
+        if std::env::var_os("PV_TUI_UPDATE_SNAPSHOTS").is_some() {
+            std::fs::write(&path, actual).expect("write snapshot");
+            return;
+        }
+        let expected = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("reading snapshot {}: {error}", path.display()));
+        assert_eq!(actual, expected, "snapshot {} changed", path.display());
+    }
+
+    #[test]
+    fn default_layout_snapshot() {
+        let app = App::new();
+
+        assert_snapshot("default_layout", &render_snapshot(&app));
+    }
+
+    #[test]
+    fn long_arrays_edit_snapshot() {
+        let mut app = App::new();
+        app.selected = 5;
+        app.mode = Mode::Edit;
+        app.fields[5].set_value("1.50,30,0; 2.25,20,-90; 3.75,15,90; 4.50,10,45");
+
+        assert_snapshot("long_arrays_edit", &render_snapshot(&app));
+    }
+
+    #[test]
+    fn location_search_snapshot() {
+        let mut app = App::new();
+        app.mode = Mode::Location;
+        app.location_query.set_value("Milan");
+        app.refresh_location_results();
+
+        assert_snapshot("location_search", &render_snapshot(&app));
+    }
 
     #[test]
     fn azimuth_label_matches_pvgis_convention() {
