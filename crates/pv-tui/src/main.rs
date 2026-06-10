@@ -862,6 +862,26 @@ fn render_estimate(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(monthly_table_lines(&rows)), chunks[1]);
 }
 
+fn monthly_table_minimums(rows: &[[String; 7]]) -> Option<(f64, f64)> {
+    if rows.is_empty() {
+        return None;
+    }
+    Some((min_table_column(rows, 2)?, min_table_column(rows, 5)?))
+}
+
+fn min_table_column(rows: &[[String; 7]], index: usize) -> Option<f64> {
+    rows.iter()
+        .filter_map(|row| row[index].parse::<f64>().ok())
+        .min_by(f64::total_cmp)
+}
+
+fn is_table_minimum(value: &str, minimum: f64) -> bool {
+    value
+        .parse::<f64>()
+        .map(|parsed| parsed.total_cmp(&minimum).is_eq())
+        .unwrap_or(false)
+}
+
 fn monthly_table_column_widths(rows: &[[String; 7]]) -> [usize; 7] {
     let mut column_widths = [0usize; 7];
     for (index, header) in MONTHLY_TABLE_HEADERS.iter().enumerate() {
@@ -941,10 +961,12 @@ fn monthly_table_lines(rows: &[[String; 7]]) -> Vec<Line<'static>> {
             &MONTHLY_TABLE_HEADERS.map(str::to_string),
             column_widths,
             true,
+            None,
         ),
     ];
+    let minimums = monthly_table_minimums(rows);
     for row in rows {
-        lines.push(monthly_table_line(row, column_widths, false));
+        lines.push(monthly_table_line(row, column_widths, false, minimums));
     }
     lines
 }
@@ -953,11 +975,21 @@ fn monthly_table_line(
     row: &[String; 7],
     column_widths: [usize; 7],
     is_header: bool,
+    minimums: Option<(f64, f64)>,
 ) -> Line<'static> {
     let label_style = Style::default().fg(Color::DarkGray);
     let value_style = Style::default();
     let base_style = if is_header { label_style } else { value_style };
     let mean_style = Style::default().fg(Color::Green);
+    let minimum_style = Style::default().fg(Color::Red);
+    let monthly_min_style = minimums
+        .filter(|(monthly_min, _)| is_table_minimum(&row[2], *monthly_min))
+        .map(|_| minimum_style)
+        .unwrap_or(base_style);
+    let daily_min_style = minimums
+        .filter(|(_, daily_min)| is_table_minimum(&row[5], *daily_min))
+        .map(|_| minimum_style)
+        .unwrap_or(base_style);
     Line::from(vec![
         Span::styled(
             format!("{:<width$}", row[0], width = column_widths[0]),
@@ -971,7 +1003,7 @@ fn monthly_table_line(
         Span::styled(" ", base_style),
         Span::styled(
             format!("{:<width$}", row[2], width = column_widths[2]),
-            base_style,
+            monthly_min_style,
         ),
         Span::styled(" ", base_style),
         Span::styled(
@@ -986,7 +1018,7 @@ fn monthly_table_line(
         Span::styled(" ", base_style),
         Span::styled(
             format!("{:<width$}", row[5], width = column_widths[5]),
-            base_style,
+            daily_min_style,
         ),
         Span::styled(" ", base_style),
         Span::styled(
@@ -1155,16 +1187,27 @@ mod tests {
     }
 
     #[test]
-    fn monthly_table_marks_mean_columns_green() {
-        let rows = vec![[
-            "Jan".to_string(),
-            "999.9".to_string(),
-            "1000".to_string(),
-            "1200".to_string(),
-            "32.3".to_string(),
-            "33.3".to_string(),
-            "38.7".to_string(),
-        ]];
+    fn monthly_table_marks_mean_columns_green_and_min_columns_red() {
+        let rows = vec![
+            [
+                "Jan".to_string(),
+                "999.9".to_string(),
+                "1000".to_string(),
+                "1200".to_string(),
+                "32.3".to_string(),
+                "33.3".to_string(),
+                "38.7".to_string(),
+            ],
+            [
+                "Feb".to_string(),
+                "1000.0".to_string(),
+                "10000".to_string(),
+                "120000".to_string(),
+                "35.7".to_string(),
+                "357.1".to_string(),
+                "4285.7".to_string(),
+            ],
+        ];
 
         let lines = monthly_table_lines(&rows);
 
@@ -1173,7 +1216,13 @@ mod tests {
         assert_eq!(lines[2].spans[8].style.fg, Some(Color::Green));
         assert_eq!(lines[3].spans[0].style.fg, Some(Color::DarkGray));
         assert_eq!(lines[3].spans[2].style.fg, Some(Color::Green));
+        assert_eq!(lines[3].spans[4].style.fg, Some(Color::Red));
         assert_eq!(lines[3].spans[8].style.fg, Some(Color::Green));
+        assert_eq!(lines[3].spans[10].style.fg, Some(Color::Red));
+        assert_eq!(lines[4].spans[2].style.fg, Some(Color::Green));
+        assert_eq!(lines[4].spans[4].style.fg, None);
+        assert_eq!(lines[4].spans[8].style.fg, Some(Color::Green));
+        assert_eq!(lines[4].spans[10].style.fg, None);
     }
 
     #[test]
