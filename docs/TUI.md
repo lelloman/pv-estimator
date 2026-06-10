@@ -30,9 +30,9 @@ pv-tui [--model-dir <DIR>] [--manifest <NAME>]
 
 The TUI has three main areas:
 
-- Summary line: annual estimate, uncertainty band, and status.
 - System pane: editable location and system fields plus city search results.
-- Estimate pane: source coverage and monthly production table.
+- Estimate pane: annual estimate, uncertainty band, source coverage, and monthly production table.
+- Footer: status messages above the active key bindings.
 
 ## Fields
 

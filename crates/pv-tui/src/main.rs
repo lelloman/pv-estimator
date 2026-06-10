@@ -38,6 +38,8 @@ struct Args {
 const TUI_STATE_SCHEMA_VERSION: u32 = 1;
 const ARRAY_FORMAT_HELP: &str = "format: kWp,tilt,az; repeat with ;";
 const FIELD_LABEL_WIDTH: u16 = 13;
+const ESTIMATE_LABEL_WIDTH: usize = 8;
+const MONTHLY_TABLE_HEADERS: [&str; 7] = ["Month", "mean", "min", "max", "mean", "min", "max"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TuiState {
@@ -544,25 +546,29 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
     let area = frame.area();
     let vertical = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),
-            Constraint::Min(10),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Min(10), Constraint::Length(2)])
         .split(area);
-
-    render_summary(frame, vertical[0], app);
 
     let body = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(45), Constraint::Min(40)])
-        .split(vertical[1]);
+        .split(vertical[0]);
     render_fields(frame, body[0], app);
     render_estimate(frame, body[1], app);
-    render_footer(frame, vertical[2], app);
+    render_footer(frame, vertical[1], app);
 }
 
-fn render_summary(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+fn estimate_metric_line(label: &'static str, value: String, value_style: Style) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("{label:<ESTIMATE_LABEL_WIDTH$}"),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(value, value_style),
+    ])
+}
+
+fn annual_band_lines(app: &App) -> [Line<'static>; 2] {
     let (annual, band) = app
         .estimate
         .as_ref()
@@ -584,18 +590,16 @@ fn render_summary(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         })
         .unwrap_or_else(|| ("-".to_string(), "-".to_string()));
 
-    let line = Line::from(vec![
-        Span::styled("Annual ", Style::default().fg(Color::DarkGray)),
-        Span::styled(annual, Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw("   "),
-        Span::styled("Band ", Style::default().fg(Color::DarkGray)),
-        Span::raw(band),
-    ]);
-    let status = Line::from(vec![
-        Span::styled("Status ", Style::default().fg(Color::DarkGray)),
-        Span::raw(app.status.as_str()),
-    ]);
-    frame.render_widget(Paragraph::new(vec![line, status]), area);
+    [
+        estimate_metric_line(
+            "Annual",
+            annual,
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        estimate_metric_line("Band", band, Style::default()),
+    ]
 }
 
 fn render_fields(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
@@ -777,7 +781,11 @@ fn render_estimate(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(block, area);
 
     let Some(document) = &app.estimate else {
-        frame.render_widget(Paragraph::new("No estimate"), inner);
+        let [annual, band] = annual_band_lines(app);
+        frame.render_widget(
+            Paragraph::new(vec![annual, band, Line::from("No estimate")]),
+            inner,
+        );
         return;
     };
 
@@ -789,36 +797,31 @@ fn render_estimate(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         .map(|source| source.as_str())
         .collect::<Vec<_>>()
         .join(", ");
+    let [annual, band] = annual_band_lines(app);
     let header = Paragraph::new(vec![
-        Line::from(format!(
-            "POA {:.2} kWh/m2",
-            estimate
-                .annual_in_plane_irradiation
-                .mean
-                .as_kilowatt_hours_per_square_meter()
-        )),
-        Line::from(format!("Sources {sources}")),
+        annual,
+        band,
+        estimate_metric_line(
+            "POA",
+            format!(
+                "{:.2} kWh/m2",
+                estimate
+                    .annual_in_plane_irradiation
+                    .mean
+                    .as_kilowatt_hours_per_square_meter()
+            ),
+            Style::default(),
+        ),
+        estimate_metric_line("Sources", sources, Style::default()),
     ]);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(5)])
+        .constraints([Constraint::Length(4), Constraint::Min(5)])
         .split(inner);
     frame.render_widget(header.wrap(Wrap { trim: true }), chunks[0]);
 
-    let mut lines = vec![
-        Line::from(Span::styled(
-            format!("{:<5} | {:^16} | {:^14}", "", "Monthly kWh", "Daily kWh"),
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(Span::styled(
-            format!(
-                "{:<5} | {:>5} {:>4} {:>4} | {:>4} {:>4} {:>4}",
-                "Month", "mean", "min", "max", "mean", "min", "max"
-            ),
-            Style::default().fg(Color::DarkGray),
-        )),
-    ];
+    let mut rows = Vec::new();
     for monthly in &estimate.monthly_estimates {
         let month = monthly.month.value();
         let days = days_in_month(month).expect("valid month has a day count");
@@ -845,18 +848,152 @@ fn render_estimate(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                     "-".to_string(),
                 )
             });
-        lines.push(Line::from(format!(
-            "{:<5} | {:>5.1} {:>4} {:>4} | {:>4.1} {:>4} {:>4}",
-            month_name,
-            total_kwh,
+        rows.push([
+            month_name.to_string(),
+            format!("{total_kwh:.1}"),
             total_min,
             total_max,
-            total_kwh / days,
+            format!("{:.1}", total_kwh / days),
             daily_min,
-            daily_max
-        )));
+            daily_max,
+        ]);
     }
-    frame.render_widget(Paragraph::new(lines), chunks[1]);
+
+    frame.render_widget(Paragraph::new(monthly_table_lines(&rows)), chunks[1]);
+}
+
+fn monthly_table_column_widths(rows: &[[String; 7]]) -> [usize; 7] {
+    let mut column_widths = [0usize; 7];
+    for (index, header) in MONTHLY_TABLE_HEADERS.iter().enumerate() {
+        column_widths[index] = header.len();
+    }
+    for row in rows {
+        for (index, value) in row.iter().enumerate() {
+            column_widths[index] = column_widths[index].max(value.len());
+        }
+    }
+    column_widths
+}
+
+#[cfg(test)]
+fn monthly_table_text_lines(rows: &[[String; 7]]) -> Vec<String> {
+    let column_widths = monthly_table_column_widths(rows);
+    let monthly_width = column_widths[1] + column_widths[2] + column_widths[3] + 2;
+    let daily_width = column_widths[4] + column_widths[5] + column_widths[6] + 2;
+
+    let mut lines = vec![
+        String::new(),
+        format!(
+            "{:<month_width$} | {:<monthly_width$} | {:<daily_width$}",
+            "",
+            "Monthly kWh",
+            "Daily kWh",
+            month_width = column_widths[0],
+        ),
+        monthly_table_text_row(&MONTHLY_TABLE_HEADERS.map(str::to_string), column_widths),
+    ];
+    for row in rows {
+        lines.push(monthly_table_text_row(row, column_widths));
+    }
+    lines
+}
+
+#[cfg(test)]
+fn monthly_table_text_row(row: &[String; 7], column_widths: [usize; 7]) -> String {
+    format!(
+        "{:<month_width$} | {:<monthly_mean_width$} {:<monthly_min_width$} {:<monthly_max_width$} | {:<daily_mean_width$} {:<daily_min_width$} {:<daily_max_width$}",
+        row[0],
+        row[1],
+        row[2],
+        row[3],
+        row[4],
+        row[5],
+        row[6],
+        month_width = column_widths[0],
+        monthly_mean_width = column_widths[1],
+        monthly_min_width = column_widths[2],
+        monthly_max_width = column_widths[3],
+        daily_mean_width = column_widths[4],
+        daily_min_width = column_widths[5],
+        daily_max_width = column_widths[6],
+    )
+}
+
+fn monthly_table_lines(rows: &[[String; 7]]) -> Vec<Line<'static>> {
+    let column_widths = monthly_table_column_widths(rows);
+    let monthly_width = column_widths[1] + column_widths[2] + column_widths[3] + 2;
+    let daily_width = column_widths[4] + column_widths[5] + column_widths[6] + 2;
+    let header_style = Style::default().fg(Color::DarkGray);
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!(
+                "{:<month_width$} | {:<monthly_width$} | {:<daily_width$}",
+                "",
+                "Monthly kWh",
+                "Daily kWh",
+                month_width = column_widths[0],
+            ),
+            header_style,
+        )),
+        monthly_table_line(
+            &MONTHLY_TABLE_HEADERS.map(str::to_string),
+            column_widths,
+            true,
+        ),
+    ];
+    for row in rows {
+        lines.push(monthly_table_line(row, column_widths, false));
+    }
+    lines
+}
+
+fn monthly_table_line(
+    row: &[String; 7],
+    column_widths: [usize; 7],
+    is_header: bool,
+) -> Line<'static> {
+    let label_style = Style::default().fg(Color::DarkGray);
+    let value_style = Style::default();
+    let base_style = if is_header { label_style } else { value_style };
+    let mean_style = Style::default().fg(Color::Green);
+    Line::from(vec![
+        Span::styled(
+            format!("{:<width$}", row[0], width = column_widths[0]),
+            label_style,
+        ),
+        Span::styled(" | ", base_style),
+        Span::styled(
+            format!("{:<width$}", row[1], width = column_widths[1]),
+            mean_style,
+        ),
+        Span::styled(" ", base_style),
+        Span::styled(
+            format!("{:<width$}", row[2], width = column_widths[2]),
+            base_style,
+        ),
+        Span::styled(" ", base_style),
+        Span::styled(
+            format!("{:<width$}", row[3], width = column_widths[3]),
+            base_style,
+        ),
+        Span::styled(" | ", base_style),
+        Span::styled(
+            format!("{:<width$}", row[4], width = column_widths[4]),
+            mean_style,
+        ),
+        Span::styled(" ", base_style),
+        Span::styled(
+            format!("{:<width$}", row[5], width = column_widths[5]),
+            base_style,
+        ),
+        Span::styled(" ", base_style),
+        Span::styled(
+            format!("{:<width$}", row[6], width = column_widths[6]),
+            base_style,
+        ),
+    ])
 }
 
 fn array_extra_line_count(app: &App) -> u16 {
@@ -892,12 +1029,16 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             "type filter  arrows select  enter apply  esc close",
         ),
     };
-    let line = Line::from(vec![
+    let status = Line::from(vec![
+        Span::styled("Status ", Style::default().fg(Color::DarkGray)),
+        Span::raw(app.status.as_str()),
+    ]);
+    let help = Line::from(vec![
         Span::styled(mode, Style::default().add_modifier(Modifier::BOLD)),
         Span::raw("  "),
         Span::raw(help),
     ]);
-    frame.render_widget(Paragraph::new(line), area);
+    frame.render_widget(Paragraph::new(vec![status, help]), area);
 }
 
 fn azimuth_direction_label(value: &str) -> Option<&'static str> {
@@ -980,6 +1121,59 @@ mod tests {
         app.refresh_location_results();
 
         assert_snapshot("location_search", &render_snapshot(&app));
+    }
+
+    #[test]
+    fn monthly_table_uses_widest_left_aligned_columns() {
+        let rows = vec![
+            [
+                "Jan".to_string(),
+                "999.9".to_string(),
+                "1000".to_string(),
+                "1200".to_string(),
+                "32.3".to_string(),
+                "33.3".to_string(),
+                "38.7".to_string(),
+            ],
+            [
+                "Feb".to_string(),
+                "1000.0".to_string(),
+                "10000".to_string(),
+                "120000".to_string(),
+                "35.7".to_string(),
+                "357.1".to_string(),
+                "4285.7".to_string(),
+            ],
+        ];
+
+        let lines = monthly_table_text_lines(&rows);
+
+        assert_eq!(lines[0], "");
+        assert_eq!(lines[2], "Month | mean   min   max    | mean min   max   ");
+        assert_eq!(lines[3], "Jan   | 999.9  1000  1200   | 32.3 33.3  38.7  ");
+        assert_eq!(lines[4], "Feb   | 1000.0 10000 120000 | 35.7 357.1 4285.7");
+    }
+
+    #[test]
+    fn monthly_table_marks_mean_columns_green() {
+        let rows = vec![[
+            "Jan".to_string(),
+            "999.9".to_string(),
+            "1000".to_string(),
+            "1200".to_string(),
+            "32.3".to_string(),
+            "33.3".to_string(),
+            "38.7".to_string(),
+        ]];
+
+        let lines = monthly_table_lines(&rows);
+
+        assert_eq!(lines[2].spans[0].style.fg, Some(Color::DarkGray));
+        assert_eq!(lines[2].spans[2].style.fg, Some(Color::Green));
+        assert_eq!(lines[2].spans[8].style.fg, Some(Color::Green));
+        assert_eq!(lines[3].spans[0].style.fg, Some(Color::DarkGray));
+        assert_eq!(lines[3].spans[2].style.fg, Some(Color::Green));
+        assert_eq!(lines[3].spans[8].style.fg, Some(Color::Green));
     }
 
     #[test]
