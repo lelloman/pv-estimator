@@ -45,7 +45,7 @@ Editable fields:
 | `Latitude` | Decimal latitude. |
 | `Longitude` | Decimal longitude. |
 | `Loss %` | System loss percent. |
-| `Arrays` | One or more `kWp,tilt,azimuth` entries separated by semicolons. The TUI shows an abbreviated `kWp,tilt,az` hint under the field. Azimuth uses the PVGIS convention: `0` south, `-90` east, `90` west. |
+| `Arrays` | One or more array definitions. The main screen shows an `[Edit]` summary plus a parsed table preview. Azimuth uses the PVGIS convention: `0` south, `-90` east, `90` west. |
 
 Editing `Name`, `Region`, `Latitude`, or `Longitude` marks the location as
 `custom`. Applying a city search result sets a GeoNames-backed location id.
@@ -56,9 +56,9 @@ Example `Arrays` value:
 1.5,30,0; 2.0,20,-90; 1.0,10,90
 ```
 
-The TUI shows the parsed total kWp and per-array summary rows below the `Arrays`
-field. Press `Enter` on `Arrays`, or click the row, to open a dedicated arrays
-editor. Long field values stay on one line and scroll horizontally with the
+The TUI shows the parsed total kWp and per-array summary table below the
+`Arrays` field. Press `Enter` on `Arrays`, or click the row, to open a dedicated
+arrays editor. Long text fields stay on one line and scroll horizontally with the
 cursor. A leading `<` or trailing `>` marks hidden text beyond the visible field
 area.
 
