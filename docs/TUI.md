@@ -74,6 +74,7 @@ Normal mode:
 | `Enter` | Edit selected field. On `Name`, open location search mode. On `Arrays`, open the arrays editor. |
 | `l` | Open location search mode. |
 | `e` | Recompute estimate. |
+| `PageUp` / `PageDown` | Scroll the monthly estimate table. |
 | `q` | Quit. |
 | `Ctrl+C` | Quit. |
 
@@ -113,6 +114,12 @@ Location mode:
 | `Backspace` / `Delete` | Remove query text and refresh results. |
 | `Enter` | Apply selected city and recompute. |
 | `Esc` | Return to normal mode. |
+
+## Estimate Table
+
+The monthly estimate table keeps its headings fixed and scrolls month rows on
+small terminals. Use `PageUp` / `PageDown`, or the mouse wheel over the Estimate
+pane, to move the visible month window.
 
 ## Location Search
 
