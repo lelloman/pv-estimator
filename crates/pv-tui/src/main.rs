@@ -25,7 +25,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Parser)]
@@ -39,11 +39,15 @@ struct Args {
 }
 
 const TUI_STATE_SCHEMA_VERSION: u32 = 1;
-const ARRAY_FORMAT_HELP: &str = "format: kWp,tilt,az; repeat with ;";
+const ARRAY_FIELD_INDEX: usize = 5;
 const FIELD_LABEL_WIDTH: u16 = 13;
 const ESTIMATE_LABEL_WIDTH: usize = 8;
 const SEARCH_LABEL_WIDTH: u16 = 8;
 const LOCATION_RESULT_HEADER_ROWS: u16 = 3;
+const ARRAY_EDITOR_HEADER_ROWS: u16 = 3;
+const ARRAY_TABLE_WIDTHS: [u16; 9] = [4, 1, 8, 1, 8, 1, 9, 1, 9];
+const ARRAY_CELL_WIDTHS: [usize; 3] = [8, 8, 9];
+const ARRAY_CELL_STARTS: [u16; 3] = [7, 18, 29];
 const MONTHLY_TABLE_HEADERS: [&str; 7] = ["Month", "mean", "min", "max", "mean", "min", "max"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +69,7 @@ enum Mode {
     Normal,
     Edit,
     Location,
+    Arrays,
 }
 
 #[derive(Debug)]
@@ -85,6 +90,10 @@ struct App {
     location_query: Field,
     location_results: Vec<CitySearchResult>,
     location_selected: usize,
+    array_selected: usize,
+    array_column: usize,
+    array_editing: bool,
+    array_cell: Field,
 }
 
 struct TerminalGuard;
@@ -171,6 +180,10 @@ impl App {
             location_query: Field::new("Find", ""),
             location_results: Vec::new(),
             location_selected: 0,
+            array_selected: 0,
+            array_column: 0,
+            array_editing: false,
+            array_cell: Field::new("Array", ""),
         }
     }
 
@@ -248,7 +261,7 @@ impl App {
     }
 
     fn request_and_arrays(&self) -> Result<(EstimateRequest, Vec<EstimateArray>)> {
-        let arrays = parse_arrays(&self.fields[5])?;
+        let arrays = parse_arrays(&self.fields[ARRAY_FIELD_INDEX])?;
         let first_array = arrays[0];
         Ok((
             EstimateRequest {
@@ -326,6 +339,113 @@ impl App {
             location.display_name, location.country_code
         );
     }
+    fn open_array_editor(&mut self) {
+        self.mode = Mode::Arrays;
+        self.array_editing = false;
+        self.clamp_array_selection();
+        self.status = "Edit system arrays".to_string();
+    }
+
+    fn close_array_editor(&mut self) {
+        self.mode = Mode::Normal;
+        self.array_editing = false;
+        self.status = "Arrays editor closed".to_string();
+    }
+
+    fn current_arrays(&self) -> Vec<EstimateArray> {
+        parse_arrays(&self.fields[ARRAY_FIELD_INDEX]).unwrap_or_else(|_| vec![default_array()])
+    }
+
+    fn clamp_array_selection(&mut self) {
+        let arrays = self.current_arrays();
+        if arrays.is_empty() {
+            self.array_selected = 0;
+        } else {
+            self.array_selected = self.array_selected.min(arrays.len() - 1);
+        }
+        self.array_column = self.array_column.min(2);
+    }
+
+    fn set_arrays(&mut self, arrays: &[EstimateArray]) {
+        self.fields[ARRAY_FIELD_INDEX].set_value(&arrays_to_field_value(arrays));
+        self.clamp_array_selection();
+    }
+
+    fn add_array(&mut self, estimator: &mut SourceModelEstimator) {
+        let mut arrays = self.current_arrays();
+        arrays.push(default_array());
+        self.array_selected = arrays.len() - 1;
+        self.array_column = 0;
+        self.set_arrays(&arrays);
+        self.recompute(estimator);
+    }
+
+    fn remove_selected_array(&mut self, estimator: &mut SourceModelEstimator) {
+        let mut arrays = self.current_arrays();
+        if arrays.len() <= 1 {
+            self.status = "At least one array is required".to_string();
+            return;
+        }
+        arrays.remove(self.array_selected.min(arrays.len() - 1));
+        self.array_selected = self.array_selected.saturating_sub(1).min(arrays.len() - 1);
+        self.set_arrays(&arrays);
+        self.recompute(estimator);
+    }
+
+    fn start_array_cell_edit(&mut self) {
+        let arrays = self.current_arrays();
+        let Some(array) = arrays.get(self.array_selected) else {
+            return;
+        };
+        self.array_cell
+            .set_value(&array_cell_value(array, self.array_column));
+        self.array_editing = true;
+        self.status = "Editing array value".to_string();
+    }
+
+    fn apply_array_cell_edit(&mut self, estimator: &mut SourceModelEstimator) {
+        let value = match self.array_cell.value.parse::<f64>() {
+            Ok(value) => value,
+            Err(_) => {
+                self.status = "Array value must be a number".to_string();
+                return;
+            }
+        };
+        let mut arrays = self.current_arrays();
+        let Some(array) = arrays.get_mut(self.array_selected) else {
+            return;
+        };
+        match self.array_column {
+            0 => array.peak_power_kwp = value,
+            1 => array.tilt_deg = value,
+            2 => array.azimuth_deg = value,
+            _ => {}
+        }
+        self.array_editing = false;
+        self.set_arrays(&arrays);
+        self.recompute(estimator);
+    }
+
+    fn move_array_cell_forward(&mut self) {
+        if self.array_column < 2 {
+            self.array_column += 1;
+        } else {
+            self.array_column = 0;
+            let arrays = self.current_arrays();
+            if !arrays.is_empty() {
+                self.array_selected = (self.array_selected + 1).min(arrays.len() - 1);
+            }
+        }
+    }
+
+    fn move_array_cell_backward(&mut self) {
+        if self.array_column > 0 {
+            self.array_column -= 1;
+        } else {
+            self.array_column = 2;
+            self.array_selected = self.array_selected.saturating_sub(1);
+        }
+    }
 }
 
 fn tui_state_path() -> Option<PathBuf> {
@@ -398,6 +518,36 @@ fn parse_f64(field: &Field) -> Result<f64> {
         .with_context(|| format!("{} must be a number", field.label))
 }
 
+fn default_array() -> EstimateArray {
+    EstimateArray {
+        peak_power_kwp: 1.0,
+        tilt_deg: 30.0,
+        azimuth_deg: 0.0,
+    }
+}
+
+fn arrays_to_field_value(arrays: &[EstimateArray]) -> String {
+    arrays
+        .iter()
+        .map(|array| {
+            format!(
+                "{:.2},{:.1},{:.1}",
+                array.peak_power_kwp, array.tilt_deg, array.azimuth_deg
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn array_cell_value(array: &EstimateArray, column: usize) -> String {
+    match column {
+        0 => format!("{:.2}", array.peak_power_kwp),
+        1 => format!("{:.1}", array.tilt_deg),
+        2 => format!("{:.1}", array.azimuth_deg),
+        _ => String::new(),
+    }
+}
+
 fn parse_arrays(field: &Field) -> Result<Vec<EstimateArray>> {
     let entries = field
         .value
@@ -443,6 +593,7 @@ fn handle_key(key: KeyEvent, app: &mut App, estimator: &mut SourceModelEstimator
         Mode::Normal => handle_normal_key(key, app, estimator),
         Mode::Edit => handle_edit_key(key, app, estimator),
         Mode::Location => handle_location_key(key, app, estimator),
+        Mode::Arrays => handle_arrays_key(key, app, estimator),
     }
 }
 
@@ -459,6 +610,7 @@ fn handle_normal_key(
         KeyCode::Home => app.selected = 0,
         KeyCode::End => app.selected = app.fields.len() - 1,
         KeyCode::Enter if app.fields[app.selected].label == "Name" => app.open_location_search(),
+        KeyCode::Enter if app.fields[app.selected].label == "Arrays" => app.open_array_editor(),
         KeyCode::Enter => app.mode = Mode::Edit,
         KeyCode::Char('l') => app.open_location_search(),
         KeyCode::Char('e') => app.recompute(estimator),
@@ -543,6 +695,32 @@ fn handle_mouse(
         return Ok(());
     }
 
+    if app.mode == Mode::Arrays {
+        match array_footer_hit(vertical[1], mouse.column, mouse.row) {
+            Some(ArrayFooterAction::Done) => app.close_array_editor(),
+            Some(ArrayFooterAction::Add) => app.add_array(estimator),
+            Some(ArrayFooterAction::Remove) => app.remove_selected_array(estimator),
+            None => {
+                let arrays = app.current_arrays();
+                let inner = array_editor_inner(vertical[0]);
+                let visible_start = array_visible_start(
+                    app.array_selected,
+                    arrays.len(),
+                    array_visible_row_count(inner),
+                );
+                if let Some((array_index, array_column)) =
+                    array_cell_at(vertical[0], mouse.column, mouse.row, visible_start)
+                    && array_index < arrays.len()
+                {
+                    app.array_selected = array_index;
+                    app.array_column = array_column;
+                    app.start_array_cell_edit();
+                }
+            }
+        }
+        return Ok(());
+    }
+
     let body = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(45), Constraint::Min(40)])
@@ -550,10 +728,17 @@ fn handle_mouse(
     let fields_inner = Block::default().borders(Borders::ALL).inner(body[0]);
     if mouse.column >= fields_inner.x
         && mouse.column < fields_inner.x.saturating_add(fields_inner.width)
-        && mouse.row == fields_inner.y
+        && mouse.row >= fields_inner.y
     {
-        app.selected = 0;
-        app.open_location_search();
+        let row = mouse.row.saturating_sub(fields_inner.y) as usize;
+        if row < app.fields.len() {
+            app.selected = row;
+            match app.fields[row].label {
+                "Name" => app.open_location_search(),
+                "Arrays" => app.open_array_editor(),
+                _ => {}
+            }
+        }
     }
     Ok(())
 }
@@ -600,6 +785,66 @@ fn handle_location_key(
     Ok(false)
 }
 
+fn handle_arrays_key(
+    key: KeyEvent,
+    app: &mut App,
+    estimator: &mut SourceModelEstimator,
+) -> Result<bool> {
+    if app.array_editing {
+        match key.code {
+            KeyCode::Esc => {
+                app.array_editing = false;
+                app.status = "Array edit cancelled".to_string();
+            }
+            KeyCode::Enter => app.apply_array_cell_edit(estimator),
+            KeyCode::Tab => {
+                app.apply_array_cell_edit(estimator);
+                if !app.array_editing {
+                    app.move_array_cell_forward();
+                }
+            }
+            KeyCode::BackTab => {
+                app.apply_array_cell_edit(estimator);
+                if !app.array_editing {
+                    app.move_array_cell_backward();
+                }
+            }
+            KeyCode::Backspace => app.array_cell.backspace(),
+            KeyCode::Delete => app.array_cell.delete(),
+            KeyCode::Left => app.array_cell.move_left(),
+            KeyCode::Right => app.array_cell.move_right(),
+            KeyCode::Home => app.array_cell.cursor = 0,
+            KeyCode::End => app.array_cell.cursor = app.array_cell.value.len(),
+            KeyCode::Char(character)
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                app.array_cell.insert(character);
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
+
+    match key.code {
+        KeyCode::Esc => app.close_array_editor(),
+        KeyCode::Enter => app.start_array_cell_edit(),
+        KeyCode::Up => app.array_selected = app.array_selected.saturating_sub(1),
+        KeyCode::Down => {
+            let arrays = app.current_arrays();
+            if !arrays.is_empty() {
+                app.array_selected = (app.array_selected + 1).min(arrays.len() - 1);
+            }
+        }
+        KeyCode::Left | KeyCode::BackTab => app.move_array_cell_backward(),
+        KeyCode::Right | KeyCode::Tab => app.move_array_cell_forward(),
+        KeyCode::Char('a') => app.add_array(estimator),
+        KeyCode::Char('d') | KeyCode::Delete => app.remove_selected_array(estimator),
+        _ => {}
+    }
+    app.clamp_array_selection();
+    Ok(false)
+}
+
 fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
     let area = frame.area();
     let vertical = Layout::default()
@@ -609,6 +854,11 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
 
     if app.mode == Mode::Location {
         render_location_search(frame, vertical[0], app);
+        render_footer(frame, vertical[1], app);
+        return;
+    }
+    if app.mode == Mode::Arrays {
+        render_array_editor(frame, vertical[0], app);
         render_footer(frame, vertical[1], app);
         return;
     }
@@ -695,35 +945,10 @@ fn render_fields(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             Span::styled(value_view.value, style),
         ];
         lines.push(Line::from(spans));
-        if field.label == "Arrays" {
-            lines.push(Line::from(vec![Span::styled(
-                format!("  {ARRAY_FORMAT_HELP}"),
-                Style::default().fg(Color::DarkGray),
-            )]));
-        }
         if field.label == "Arrays"
             && let Ok(arrays) = parse_arrays(field)
         {
-            lines.push(Line::from(vec![Span::styled(
-                format!("  total {:.2} kWp", total_array_kwp(&arrays)),
-                Style::default().fg(Color::DarkGray),
-            )]));
-            for (array_index, array) in arrays.iter().enumerate() {
-                let direction = azimuth_direction_label(&array.azimuth_deg.to_string())
-                    .map(|label| format!(" {label}"))
-                    .unwrap_or_default();
-                lines.push(Line::from(vec![Span::styled(
-                    format!(
-                        "  A{} {:>5.2} kWp  tilt {:>4.1}  az {:>5.1}{}",
-                        array_index + 1,
-                        array.peak_power_kwp,
-                        array.tilt_deg,
-                        array.azimuth_deg,
-                        direction
-                    ),
-                    Style::default().fg(Color::DarkGray),
-                )]));
-            }
+            lines.extend(array_summary_lines(&arrays));
         }
     }
     frame.render_widget(Paragraph::new(lines), inner);
@@ -738,6 +963,190 @@ fn render_fields(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             .saturating_add(value_view.cursor_col.min(u16::MAX as usize) as u16);
         frame.set_cursor_position(Position::new(x, y));
     }
+}
+
+fn array_summary_lines(arrays: &[EstimateArray]) -> Vec<Line<'static>> {
+    let label_style = Style::default().fg(Color::DarkGray);
+    let total_style = Style::default().fg(Color::Green);
+    let value_style = Style::default();
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("  total ", label_style),
+            Span::styled(format!("{:.2} kWp", total_array_kwp(arrays)), total_style),
+        ]),
+        Line::from(vec![Span::styled(
+            "  ID | kWp  | Tilt | Az     | Dir",
+            label_style,
+        )]),
+    ];
+    for (array_index, array) in arrays.iter().enumerate() {
+        let direction = azimuth_direction_label(&array.azimuth_deg.to_string()).unwrap_or("");
+        lines.push(Line::from(vec![
+            Span::styled(format!("  A{:<2}| ", array_index + 1), label_style),
+            Span::styled(format!("{:<5.2}", array.peak_power_kwp), value_style),
+            Span::styled("| ", label_style),
+            Span::styled(format!("{:<5.1}", array.tilt_deg), value_style),
+            Span::styled("| ", label_style),
+            Span::styled(format!("{:<7.1}", array.azimuth_deg), value_style),
+            Span::styled("| ", label_style),
+            Span::styled(direction.to_string(), value_style),
+        ]));
+    }
+    lines
+}
+
+fn render_array_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let block = Block::default().borders(Borders::ALL).title("Arrays");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let arrays = app.current_arrays();
+    let total_kwp = total_array_kwp(&arrays);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(1)])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled("Total ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{total_kwp:.2} kWp"),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(""),
+        ]),
+        chunks[0],
+    );
+
+    let visible_count = array_visible_row_count(inner);
+    let visible_start = array_visible_start(app.array_selected, arrays.len(), visible_count);
+    let rows = arrays
+        .iter()
+        .enumerate()
+        .skip(visible_start)
+        .take(visible_count)
+        .map(|(index, array)| array_editor_row(app, index, array));
+    let header = Row::new(vec![
+        Cell::from("ID"),
+        Cell::from("|"),
+        Cell::from("kWp"),
+        Cell::from("|"),
+        Cell::from("Tilt"),
+        Cell::from("|"),
+        Cell::from("Azimuth"),
+        Cell::from("|"),
+        Cell::from("Direction"),
+    ])
+    .style(Style::default().fg(Color::DarkGray));
+    let widths = ARRAY_TABLE_WIDTHS.map(Constraint::Length);
+    let table = Table::new(rows, widths).header(header).column_spacing(1);
+    frame.render_widget(table, chunks[1]);
+
+    if app.array_editing {
+        let visible_row = app.array_selected.saturating_sub(visible_start);
+        let cursor = array_editor_cursor(inner, &app.array_cell, visible_row, app.array_column);
+        frame.set_cursor_position(cursor);
+    }
+}
+
+fn array_editor_row(app: &App, index: usize, array: &EstimateArray) -> Row<'static> {
+    let selected = app.array_selected == index;
+    let cell_style = |column: usize| {
+        if selected && app.array_column == column {
+            if app.array_editing {
+                Style::default().fg(Color::Black).bg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            }
+        } else {
+            Style::default()
+        }
+    };
+    let value_for = |column: usize| {
+        if selected && app.array_column == column && app.array_editing {
+            field_value_view(&app.array_cell, ARRAY_CELL_WIDTHS[column], true).value
+        } else {
+            array_cell_value(array, column)
+        }
+    };
+    let direction = azimuth_direction_label(&array.azimuth_deg.to_string()).unwrap_or("");
+    let separator = Cell::from("|").style(Style::default().fg(Color::DarkGray));
+    Row::new(vec![
+        Cell::from(format!("A{}", index + 1)).style(Style::default().fg(Color::DarkGray)),
+        separator.clone(),
+        Cell::from(value_for(0)).style(cell_style(0)),
+        separator.clone(),
+        Cell::from(value_for(1)).style(cell_style(1)),
+        separator.clone(),
+        Cell::from(value_for(2)).style(cell_style(2)),
+        separator,
+        Cell::from(direction.to_string()).style(Style::default().fg(Color::DarkGray)),
+    ])
+}
+
+fn array_editor_cursor(inner: Rect, field: &Field, row: usize, column: usize) -> Position {
+    let value_view = field_value_view(field, ARRAY_CELL_WIDTHS[column], true);
+    Position::new(
+        inner
+            .x
+            .saturating_add(ARRAY_CELL_STARTS[column])
+            .saturating_add(value_view.cursor_col.min(u16::MAX as usize) as u16),
+        inner
+            .y
+            .saturating_add(ARRAY_EDITOR_HEADER_ROWS)
+            .saturating_add(row.min(u16::MAX as usize) as u16),
+    )
+}
+
+fn array_editor_inner(area: Rect) -> Rect {
+    Block::default().borders(Borders::ALL).inner(area)
+}
+
+fn array_cell_at(
+    area: Rect,
+    column: u16,
+    row: u16,
+    visible_start: usize,
+) -> Option<(usize, usize)> {
+    let inner = array_editor_inner(area);
+    if column < inner.x || column >= inner.x.saturating_add(inner.width) {
+        return None;
+    }
+    let first_row = inner.y.saturating_add(ARRAY_EDITOR_HEADER_ROWS);
+    if row < first_row {
+        return None;
+    }
+    let visible_row = row.saturating_sub(first_row) as usize;
+    if visible_row >= array_visible_row_count(inner) {
+        return None;
+    }
+    let rel_col = column.saturating_sub(inner.x);
+    let cell_column = ARRAY_CELL_STARTS
+        .iter()
+        .enumerate()
+        .find_map(|(index, start)| {
+            let end = start.saturating_add(ARRAY_CELL_WIDTHS[index] as u16);
+            (rel_col >= *start && rel_col < end).then_some(index)
+        })?;
+    Some((visible_start + visible_row, cell_column))
+}
+
+fn array_visible_row_count(inner: Rect) -> usize {
+    inner.height.saturating_sub(ARRAY_EDITOR_HEADER_ROWS).max(1) as usize
+}
+
+fn array_visible_start(selected: usize, total: usize, visible_count: usize) -> usize {
+    if total <= visible_count {
+        return 0;
+    }
+    selected
+        .saturating_add(1)
+        .saturating_sub(visible_count)
+        .min(total.saturating_sub(visible_count))
 }
 
 fn render_location_search(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
@@ -1162,6 +1571,41 @@ fn total_array_kwp(arrays: &[EstimateArray]) -> f64 {
     arrays.iter().map(|array| array.peak_power_kwp).sum()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArrayFooterAction {
+    Done,
+    Add,
+    Remove,
+}
+
+fn array_footer_hit(area: Rect, column: u16, row: u16) -> Option<ArrayFooterAction> {
+    if row != area.y.saturating_add(1) {
+        return None;
+    }
+    let hits = [
+        (
+            "ARRAYS  ".len() as u16,
+            "[Done]".len() as u16,
+            ArrayFooterAction::Done,
+        ),
+        (
+            "ARRAYS  [Done]  ".len() as u16,
+            "[Add]".len() as u16,
+            ArrayFooterAction::Add,
+        ),
+        (
+            "ARRAYS  [Done]  [Add]  ".len() as u16,
+            "[Remove]".len() as u16,
+            ArrayFooterAction::Remove,
+        ),
+    ];
+    hits.into_iter().find_map(|(start, width, action)| {
+        let start = area.x.saturating_add(start);
+        let end = start.saturating_add(width);
+        (column >= start && column < end).then_some(action)
+    })
+}
+
 fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let (mode, help) = match app.mode {
         Mode::Normal => (
@@ -1176,6 +1620,14 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             "LOCATION",
             "type filter  arrows select  enter apply  esc cancel",
         ),
+        Mode::Arrays if app.array_editing => (
+            "ARRAYS",
+            "type value  enter apply  tab next  esc cancel edit",
+        ),
+        Mode::Arrays => (
+            "ARRAYS",
+            "arrows select  enter edit  a add  d remove  esc done",
+        ),
     };
     let status = Line::from(vec![
         Span::styled("Status ", Style::default().fg(Color::DarkGray)),
@@ -1187,6 +1639,24 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             Span::raw("  "),
             Span::styled(
                 "[Cancel]",
+                Style::default().fg(Color::Black).bg(Color::Yellow),
+            ),
+            Span::raw("  "),
+            Span::raw(help),
+        ])
+    } else if app.mode == Mode::Arrays {
+        Line::from(vec![
+            Span::styled(mode, Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("  "),
+            Span::styled(
+                "[Done]",
+                Style::default().fg(Color::Black).bg(Color::Yellow),
+            ),
+            Span::raw("  "),
+            Span::styled("[Add]", Style::default().fg(Color::Black).bg(Color::Yellow)),
+            Span::raw("  "),
+            Span::styled(
+                "[Remove]",
                 Style::default().fg(Color::Black).bg(Color::Yellow),
             ),
             Span::raw("  "),
@@ -1290,6 +1760,64 @@ mod tests {
         app.refresh_location_results();
 
         assert_snapshot("location_search", &render_snapshot(&app));
+    }
+
+    #[test]
+    fn arrays_editor_snapshot() {
+        let mut app = App::new();
+        app.mode = Mode::Arrays;
+        app.selected = ARRAY_FIELD_INDEX;
+        app.array_selected = 1;
+        app.array_column = 2;
+        app.fields[ARRAY_FIELD_INDEX].set_value("1.50,30,0; 2.25,20,-90");
+
+        assert_snapshot("arrays_editor", &render_snapshot(&app));
+    }
+
+    #[test]
+    fn arrays_editor_hit_tests_match_layout() {
+        let area = Rect::new(0, 0, 80, 22);
+        assert_eq!(array_cell_at(area, 8, 4, 0), Some((0, 0)));
+        assert_eq!(array_cell_at(area, 19, 5, 0), Some((1, 1)));
+        assert_eq!(array_cell_at(area, 30, 5, 3), Some((4, 2)));
+        assert_eq!(array_cell_at(area, 1, 3, 0), None);
+        assert_eq!(array_visible_start(20, 30, 10), 11);
+
+        let footer_area = Rect::new(0, 22, 80, 2);
+        assert_eq!(
+            array_footer_hit(footer_area, 9, 23),
+            Some(ArrayFooterAction::Done)
+        );
+        assert_eq!(
+            array_footer_hit(footer_area, 17, 23),
+            Some(ArrayFooterAction::Add)
+        );
+        assert_eq!(
+            array_footer_hit(footer_area, 25, 23),
+            Some(ArrayFooterAction::Remove)
+        );
+        assert_eq!(array_footer_hit(footer_area, 33, 23), None);
+    }
+
+    #[test]
+    fn arrays_to_field_value_preserves_structured_rows() {
+        let arrays = vec![
+            EstimateArray {
+                peak_power_kwp: 1.5,
+                tilt_deg: 30.0,
+                azimuth_deg: 0.0,
+            },
+            EstimateArray {
+                peak_power_kwp: 2.25,
+                tilt_deg: 20.0,
+                azimuth_deg: -90.0,
+            },
+        ];
+
+        assert_eq!(
+            arrays_to_field_value(&arrays),
+            "1.50,30.0,0.0; 2.25,20.0,-90.0"
+        );
     }
 
     #[test]

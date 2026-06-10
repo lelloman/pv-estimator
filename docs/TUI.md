@@ -57,7 +57,8 @@ Example `Arrays` value:
 ```
 
 The TUI shows the parsed total kWp and per-array summary rows below the `Arrays`
-field. Long field values stay on one line and scroll horizontally with the
+field. Press `Enter` on `Arrays`, or click the row, to open a dedicated arrays
+editor. Long field values stay on one line and scroll horizontally with the
 cursor. A leading `<` or trailing `>` marks hidden text beyond the visible field
 area.
 
@@ -70,7 +71,7 @@ Normal mode:
 | `Up` / `Down` | Move between fields. |
 | `Tab` / `Shift+Tab` | Move between fields. |
 | `Home` / `End` | Jump to first or last field. |
-| `Enter` | Edit selected field. On `Name`, open location search mode. |
+| `Enter` | Edit selected field. On `Name`, open location search mode. On `Arrays`, open the arrays editor. |
 | `l` | Open location search mode. |
 | `e` | Recompute estimate. |
 | `q` | Quit. |
@@ -87,6 +88,18 @@ Edit mode:
 | `Enter` | Apply value and recompute. |
 | `Esc` | Leave edit mode. |
 | `Tab` / `Shift+Tab` | Apply value, recompute, and move field selection. |
+
+Arrays mode:
+
+| Key | Action |
+| --- | --- |
+| `Up` / `Down` | Move between arrays. |
+| `Left` / `Right` | Move between `kWp`, `Tilt`, and `Azimuth` cells. |
+| `Enter` | Edit the selected cell, or apply a cell edit. |
+| `Tab` / `Shift+Tab` | Move between cells. While editing, apply and move. |
+| `a` | Add a new default array. |
+| `d` / `Delete` | Remove the selected array. |
+| `Esc` | Leave arrays mode, or cancel the current cell edit. |
 
 Location mode:
 
