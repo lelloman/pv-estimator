@@ -53,6 +53,7 @@ Optional options:
 | `--loss-pct <PCT>` | `14.0` | System loss percent. Must be at least `0` and less than `100`. |
 | `--tilt-deg <DEG>` | `30.0` | Panel tilt in degrees from horizontal, from `0` to `90`. |
 | `--azimuth-deg <DEG>` | `0.0` | PVGIS-style azimuth for the default single array. `0` is south, `-90` east, `90` west. |
+| `--storage-kwh <KWH>` | none | Optional usable battery storage capacity metadata. Must be positive when set. It does not change PV estimate math. |
 | `--array <KWP,TILT,AZIMUTH>` | none | Add one or more arrays. Can be repeated or contain semicolon-separated entries. When present, `--array` entries define the system instead of `--kwp`, `--tilt-deg`, and `--azimuth-deg`. |
 | `--model-dir <DIR>` | embedded | Directory containing `source-model-artifacts.json` and ONNX files. |
 | `--manifest <NAME>` | `source-model-artifacts.json` | Manifest filename inside `--model-dir`. |

@@ -40,7 +40,8 @@ struct Args {
 
 const TUI_STATE_SCHEMA_VERSION: u32 = 1;
 const PRICE_FIELD_INDEX: usize = 5;
-const ARRAY_FIELD_INDEX: usize = 6;
+const STORAGE_FIELD_INDEX: usize = 6;
+const ARRAY_FIELD_INDEX: usize = 7;
 const FIELD_LABEL_WIDTH: u16 = 13;
 const ESTIMATE_LABEL_WIDTH: usize = 11;
 const SEARCH_LABEL_WIDTH: u16 = 8;
@@ -175,6 +176,7 @@ impl App {
                 Field::new("Longitude", "15.643"),
                 Field::new("Loss %", "14.0"),
                 Field::new("EUR/kWh", ""),
+                Field::new("Storage kWh", ""),
                 Field::new("Arrays", "1.0,30.0,0.0"),
             ],
             selected: 2,
@@ -271,6 +273,10 @@ impl App {
         parse_optional_f64(&self.fields[PRICE_FIELD_INDEX])
     }
 
+    fn storage_usable_kwh(&self) -> Result<Option<f64>> {
+        parse_optional_positive_f64(&self.fields[STORAGE_FIELD_INDEX])
+    }
+
     fn request_and_arrays(&self) -> Result<(EstimateRequest, Vec<EstimateArray>)> {
         let arrays = parse_arrays(&self.fields[ARRAY_FIELD_INDEX])?;
         let first_array = arrays[0];
@@ -285,6 +291,7 @@ impl App {
                 loss_pct: parse_f64(&self.fields[4])?,
                 tilt_deg: first_array.tilt_deg,
                 azimuth_deg: first_array.azimuth_deg,
+                storage_usable_kwh: self.storage_usable_kwh()?,
             },
             arrays,
         ))
@@ -538,6 +545,16 @@ fn parse_optional_f64(field: &Field) -> Result<Option<f64>> {
         .parse::<f64>()
         .map(Some)
         .with_context(|| format!("{} must be empty or a number", field.label))
+}
+
+fn parse_optional_positive_f64(field: &Field) -> Result<Option<f64>> {
+    let Some(value) = parse_optional_f64(field)? else {
+        return Ok(None);
+    };
+    if !value.is_finite() || value <= 0.0 {
+        anyhow::bail!("{} must be empty or positive", field.label);
+    }
+    Ok(Some(value))
 }
 
 fn parse_f64(field: &Field) -> Result<f64> {
@@ -1874,6 +1891,7 @@ mod tests {
                 loss_pct: 14.0,
                 tilt_deg: 30.0,
                 aspect_deg: 0.0,
+                storage_usable_kwh: None,
             },
             coverage: EstimateCoverage {
                 pvgis_sarah3_applicable: true,
@@ -2181,6 +2199,69 @@ mod tests {
         assert_eq!(azimuth_direction_label("45"), Some("SW"));
         assert_eq!(azimuth_direction_label("-45"), Some("SE"));
         assert_eq!(azimuth_direction_label("not-a-number"), None);
+    }
+
+    #[test]
+    fn parses_optional_positive_storage() {
+        assert_eq!(
+            parse_optional_positive_f64(&Field::new("Storage kWh", "")).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_optional_positive_f64(&Field::new("Storage kWh", "5.5")).unwrap(),
+            Some(5.5)
+        );
+        assert!(parse_optional_positive_f64(&Field::new("Storage kWh", "0")).is_err());
+        assert!(parse_optional_positive_f64(&Field::new("Storage kWh", "-1")).is_err());
+    }
+
+    #[test]
+    fn old_state_without_storage_keeps_default_empty_storage_field() {
+        let mut app = App::new();
+        let state = TuiState {
+            schema_version: TUI_STATE_SCHEMA_VERSION,
+            selected_location_id: "custom".to_string(),
+            location_query: String::new(),
+            fields: vec![
+                TuiFieldState {
+                    label: "Name".to_string(),
+                    value: "Saved".to_string(),
+                },
+                TuiFieldState {
+                    label: "Region".to_string(),
+                    value: "IT".to_string(),
+                },
+                TuiFieldState {
+                    label: "Latitude".to_string(),
+                    value: "45.0".to_string(),
+                },
+                TuiFieldState {
+                    label: "Longitude".to_string(),
+                    value: "9.0".to_string(),
+                },
+                TuiFieldState {
+                    label: "Loss %".to_string(),
+                    value: "12.0".to_string(),
+                },
+                TuiFieldState {
+                    label: "EUR/kWh".to_string(),
+                    value: "0.22".to_string(),
+                },
+                TuiFieldState {
+                    label: "Arrays".to_string(),
+                    value: "2.0,30,0".to_string(),
+                },
+            ],
+        };
+
+        for field in &mut app.fields {
+            if let Some(saved) = state.fields.iter().find(|saved| saved.label == field.label) {
+                field.set_value(&saved.value);
+            }
+        }
+
+        assert_eq!(app.fields[STORAGE_FIELD_INDEX].value, "");
+        assert_eq!(app.fields[ARRAY_FIELD_INDEX].value, "2.0,30,0");
     }
 
     #[test]

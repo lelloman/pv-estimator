@@ -51,6 +51,8 @@ pub struct EstimateSystem {
     pub loss_pct: f64,
     pub tilt_deg: f64,
     pub aspect_deg: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_usable_kwh: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -42,6 +42,8 @@ struct EstimateArgs {
     tilt_deg: f64,
     #[arg(long, default_value_t = 0.0)]
     azimuth_deg: f64,
+    #[arg(long = "storage-kwh")]
+    storage_kwh: Option<f64>,
     #[arg(long = "array", value_name = "KWP,TILT,AZIMUTH")]
     arrays: Vec<String>,
     #[arg(long)]
@@ -149,6 +151,7 @@ fn estimate(args: EstimateArgs) -> Result<()> {
         loss_pct: args.loss_pct,
         tilt_deg: first_array.tilt_deg,
         azimuth_deg: first_array.azimuth_deg,
+        storage_usable_kwh: args.storage_kwh,
     };
     let mut estimator = match &args.model_dir {
         Some(model_dir) => SourceModelEstimator::load(model_dir, &args.manifest)?,

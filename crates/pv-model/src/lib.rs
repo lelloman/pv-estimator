@@ -9,6 +9,7 @@ use ndarray::Array2;
 use ort::session::Session;
 use ort::value::TensorRef;
 use pv_core::ids::WeatherSourceId;
+use pv_core::simulation::{MonthlyProductionBand, ProductionProfile};
 use pv_core::source_model::{
     AnnualPvEnsembleEstimate, EstimateCoverage, EstimateLocation, EstimateSystem, Irradiation,
     MonthOfYear, SourceAnnualPvEstimate, SourceEnsembleEstimateDocument, SourceMonthlyPvEstimate,
@@ -52,6 +53,7 @@ pub struct EstimateRequest {
     pub loss_pct: f64,
     pub tilt_deg: f64,
     pub azimuth_deg: f64,
+    pub storage_usable_kwh: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -73,6 +75,7 @@ impl Default for EstimateRequest {
             loss_pct: 14.0,
             tilt_deg: 30.0,
             azimuth_deg: 0.0,
+            storage_usable_kwh: None,
         }
     }
 }
@@ -259,6 +262,50 @@ impl SourceModelEstimator {
         self.estimate_arrays(request, &[request.single_array()])
     }
 
+    pub fn production_profile(&mut self, request: &EstimateRequest) -> Result<ProductionProfile> {
+        self.production_profile_arrays(request, &[request.single_array()])
+    }
+
+    pub fn production_profile_arrays(
+        &mut self,
+        request: &EstimateRequest,
+        arrays: &[EstimateArray],
+    ) -> Result<ProductionProfile> {
+        validate_request_location_and_loss(request)?;
+        validate_arrays(arrays)?;
+        let features = encode_features(
+            request.latitude,
+            request.longitude,
+            self.input_features,
+            self.geography_features.as_ref(),
+        )?;
+        let mut source_estimates = Vec::new();
+        let mut source_profiles = Vec::new();
+
+        for source in &mut self.sources {
+            if !source.applies(request.latitude, request.longitude) {
+                continue;
+            }
+            let climate = source.predict_climate(&features)?;
+            let pv = estimate_pv_from_climate(&climate, request, arrays);
+            source_profiles.push(estimate_hourly_pv_from_climate(&climate, request, arrays));
+            source_estimates.push(source_estimate(&source.source_id, pv)?);
+        }
+
+        let ensemble = AnnualPvEnsembleEstimate::from_source_estimates_with_uncertainty(
+            source_estimates,
+            self.uncertainty_multiplier,
+        )
+        .ok_or_else(|| {
+            anyhow!(
+                "no applicable source models for {},{}",
+                request.latitude,
+                request.longitude
+            )
+        })?;
+        production_profile_from_sources(&ensemble, &source_profiles)
+    }
+
     pub fn estimate_arrays(
         &mut self,
         request: &EstimateRequest,
@@ -316,6 +363,7 @@ impl SourceModelEstimator {
                 loss_pct: request.loss_pct,
                 tilt_deg: weighted_array_value(arrays, |array| array.tilt_deg),
                 aspect_deg: weighted_array_value(arrays, |array| array.azimuth_deg),
+                storage_usable_kwh: request.storage_usable_kwh,
             },
             coverage: EstimateCoverage {
                 pvgis_sarah3_applicable: sarah3_applicable,
@@ -370,6 +418,11 @@ fn validate_request_location_and_loss(request: &EstimateRequest) -> Result<()> {
     }
     if !(0.0..100.0).contains(&request.loss_pct) {
         bail!("loss percent must be in [0, 100)");
+    }
+    if let Some(storage_usable_kwh) = request.storage_usable_kwh {
+        if !storage_usable_kwh.is_finite() || storage_usable_kwh <= 0.0 {
+            bail!("storage usable kWh must be positive");
+        }
     }
     Ok(())
 }
@@ -429,13 +482,19 @@ pub fn format_table(document: &SourceEnsembleEstimateDocument) -> String {
         document.location.latitude, document.location.longitude
     )
     .expect("writing string");
+    let storage = document
+        .system
+        .storage_usable_kwh
+        .map(|value| format!(", storage {value:.2} kWh"))
+        .unwrap_or_default();
     writeln!(
         &mut output,
-        "system: {:.2} kWp, loss {:.1}%, tilt {:.1} deg, azimuth {:.1} deg",
+        "system: {:.2} kWp, loss {:.1}%, tilt {:.1} deg, azimuth {:.1} deg{}",
         document.system.peak_power_kwp,
         document.system.loss_pct,
         document.system.tilt_deg,
-        document.system.aspect_deg
+        document.system.aspect_deg,
+        storage
     )
     .expect("writing string");
     writeln!(
@@ -1120,6 +1179,140 @@ fn estimate_array_pv_from_climate(
     }
 }
 
+fn estimate_hourly_pv_from_climate(
+    climate: &[[f64; TARGETS]; TEMPORAL_BINS],
+    request: &EstimateRequest,
+    arrays: &[EstimateArray],
+) -> Vec<f64> {
+    let mut month_hour = [[0.0; 24]; 12];
+    for array in arrays {
+        let array_month_hour =
+            estimate_array_month_hour_energy_from_climate(climate, request, *array);
+        for month in 0..12 {
+            for hour in 0..24 {
+                month_hour[month][hour] += array_month_hour[month][hour];
+            }
+        }
+    }
+
+    let mut hourly = Vec::with_capacity(8760);
+    for month in 0..12 {
+        for _day in 0..MONTH_DAYS[month] as usize {
+            hourly.extend_from_slice(&month_hour[month]);
+        }
+    }
+    hourly
+}
+
+fn estimate_array_month_hour_energy_from_climate(
+    climate: &[[f64; TARGETS]; TEMPORAL_BINS],
+    request: &EstimateRequest,
+    array: EstimateArray,
+) -> [[f64; 24]; 12] {
+    let lat_rad = request.latitude.to_radians();
+    let tilt = array.tilt_deg.to_radians();
+    let surface_azimuth_from_north = ((180.0 + array.azimuth_deg) % 360.0).to_radians();
+    let loss_factor = 1.0 - request.loss_pct / 100.0;
+    let albedo = 0.2;
+    let gamma = -0.0040;
+    let noct_c = 45.0;
+    let mut month_hour = [[0.0; 24]; 12];
+
+    for month in 0..12 {
+        for hour in 0..24 {
+            let idx = month * 24 + hour;
+            let ghi = climate[idx][0];
+            let dni = climate[idx][1];
+            let dhi = climate[idx][2];
+            let temp = climate[idx][3];
+            let (cosz, cosi) = solar_cosines(
+                lat_rad,
+                request.longitude,
+                surface_azimuth_from_north,
+                tilt,
+                MID_MONTH_DOY[month],
+                hour as f64 + 0.5,
+            );
+            let beam = if cosz > 0.0 { dni * cosi } else { 0.0 };
+            let diffuse = dhi * (1.0 + tilt.cos()) / 2.0;
+            let ground = ghi * albedo * (1.0 - tilt.cos()) / 2.0;
+            let poa = (beam + diffuse + ground).max(0.0);
+            let cell_temp = temp + poa * (noct_c - 20.0) / 800.0;
+            let temp_factor = (1.0 + gamma * (cell_temp - 25.0)).max(0.0);
+            month_hour[month][hour] =
+                array.peak_power_kwp * (poa / 1000.0) * temp_factor * loss_factor;
+        }
+    }
+
+    month_hour
+}
+
+fn production_profile_from_sources(
+    ensemble: &AnnualPvEnsembleEstimate,
+    source_profiles: &[Vec<f64>],
+) -> Result<ProductionProfile> {
+    if source_profiles.is_empty() {
+        bail!("at least one source production profile is required");
+    }
+    let mut hourly_mean_kwh = vec![0.0; 8760];
+    for profile in source_profiles {
+        if profile.len() != 8760 {
+            bail!("source production profile must contain 8760 hourly values");
+        }
+        for (output, value) in hourly_mean_kwh.iter_mut().zip(profile.iter()) {
+            *output += *value / source_profiles.len() as f64;
+        }
+    }
+
+    let monthly = ensemble
+        .monthly_estimates
+        .iter()
+        .map(|monthly| MonthlyProductionBand {
+            month: monthly.month.value(),
+            mean_kwh: monthly.energy.mean.as_kilowatt_hours(),
+            low_kwh: monthly.energy.low.as_kilowatt_hours(),
+            high_kwh: monthly.energy.high.as_kilowatt_hours(),
+        })
+        .collect::<Vec<_>>();
+    normalize_hourly_profile_to_monthly_bands(&mut hourly_mean_kwh, &monthly)?;
+    Ok(ProductionProfile {
+        hourly_mean_kwh,
+        monthly,
+    })
+}
+
+fn normalize_hourly_profile_to_monthly_bands(
+    hourly: &mut [f64],
+    monthly: &[MonthlyProductionBand],
+) -> Result<()> {
+    if hourly.len() != 8760 || monthly.len() != 12 {
+        bail!("production profile requires 8760 hours and 12 monthly bands");
+    }
+    let mut start = 0;
+    for (month, band) in monthly.iter().enumerate() {
+        let end = start + MONTH_DAYS[month] as usize * 24;
+        let current = hourly[start..end].iter().sum::<f64>();
+        if current > 0.0 {
+            let scale = band.mean_kwh / current;
+            for value in &mut hourly[start..end] {
+                *value *= scale;
+            }
+            let adjusted = hourly[start..end].iter().sum::<f64>();
+            if let Some(last) = hourly[start..end]
+                .iter_mut()
+                .rev()
+                .find(|value| **value > 0.0)
+            {
+                *last += band.mean_kwh - adjusted;
+            }
+        } else if band.mean_kwh > 0.0 {
+            bail!("monthly production profile has zero hourly shape for non-zero month");
+        }
+        start = end;
+    }
+    Ok(())
+}
+
 fn solar_cosines(
     lat_rad: f64,
     lon: f64,
@@ -1244,6 +1437,97 @@ mod tests {
         validate_request_location_and_loss(&request)
             .expect("multi-array validation does not use legacy array fields");
         assert!(validate_request(&request).is_err());
+    }
+
+    #[test]
+    fn hourly_profile_expands_to_8760_and_matches_monthly_estimates() {
+        let climate = test_climate();
+        let request = EstimateRequest::default();
+        let arrays = [request.single_array()];
+        let hourly = estimate_hourly_pv_from_climate(&climate, &request, &arrays);
+        let estimate = estimate_pv_from_climate(&climate, &request, &arrays);
+
+        assert_eq!(hourly.len(), 8760);
+        let mut start = 0;
+        for monthly in &estimate.monthly {
+            let end = start + days_in_month(monthly.month).unwrap() as usize * 24;
+            let sum = hourly[start..end].iter().sum::<f64>();
+            assert!((sum - monthly.energy_kwh).abs() < 1.0e-9);
+            start = end;
+        }
+    }
+
+    #[test]
+    fn multi_array_hourly_profiles_preserve_total_production() {
+        let climate = test_climate();
+        let request = EstimateRequest::default();
+        let arrays = [
+            EstimateArray {
+                peak_power_kwp: 1.5,
+                tilt_deg: 30.0,
+                azimuth_deg: 0.0,
+            },
+            EstimateArray {
+                peak_power_kwp: 2.0,
+                tilt_deg: 15.0,
+                azimuth_deg: -90.0,
+            },
+        ];
+        let hourly = estimate_hourly_pv_from_climate(&climate, &request, &arrays);
+        let estimate = estimate_pv_from_climate(&climate, &request, &arrays);
+
+        assert!((hourly.iter().sum::<f64>() - estimate.annual_energy_kwh).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn production_profile_from_single_source_has_degenerate_monthly_bands() {
+        let climate = test_climate();
+        let request = EstimateRequest::default();
+        let arrays = [request.single_array()];
+        let pv = estimate_pv_from_climate(&climate, &request, &arrays);
+        let source = source_estimate("fixture", pv).expect("source estimate");
+        let ensemble = AnnualPvEnsembleEstimate::from_source_estimates(vec![source])
+            .expect("one source is enough");
+        let hourly = estimate_hourly_pv_from_climate(&climate, &request, &arrays);
+        let profile = production_profile_from_sources(&ensemble, &[hourly]).expect("profile");
+
+        assert_eq!(profile.hourly_mean_kwh.len(), 8760);
+        assert_eq!(profile.monthly.len(), 12);
+        for band in &profile.monthly {
+            assert_eq!(band.low_kwh, band.mean_kwh);
+            assert_eq!(band.high_kwh, band.mean_kwh);
+        }
+    }
+
+    #[test]
+    fn validates_optional_storage_only_when_set() {
+        let mut request = EstimateRequest::default();
+        validate_request(&request).expect("storage is optional");
+
+        request.storage_usable_kwh = Some(5.0);
+        validate_request(&request).expect("positive storage is valid");
+
+        request.storage_usable_kwh = Some(0.0);
+        assert!(validate_request(&request).is_err());
+    }
+
+    fn test_climate() -> [[f64; TARGETS]; TEMPORAL_BINS] {
+        let mut climate = [[0.0; TARGETS]; TEMPORAL_BINS];
+        for month in 0..12 {
+            for hour in 0..24 {
+                let index = month * 24 + hour;
+                let daylight = (6..=18).contains(&hour);
+                climate[index][0] = if daylight {
+                    500.0 + month as f64 * 10.0
+                } else {
+                    0.0
+                };
+                climate[index][1] = if daylight { 250.0 } else { 0.0 };
+                climate[index][2] = if daylight { 150.0 } else { 0.0 };
+                climate[index][3] = 20.0;
+            }
+        }
+        climate
     }
 
     #[test]
