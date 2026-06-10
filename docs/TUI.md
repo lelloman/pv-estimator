@@ -46,6 +46,7 @@ Editable fields:
 | `Longitude` | Decimal longitude. |
 | `Loss %` | System loss percent. |
 | `EUR/kWh` | Optional energy value used to show estimated annual revenue. Leave empty to hide revenue. |
+| `Storage kWh` | Optional usable battery storage capacity metadata. Leave empty when no storage is modeled. |
 | `Arrays` | One or more array definitions. The main screen shows an `[Edit]` summary plus a parsed table preview. Azimuth uses the PVGIS convention: `0` south, `-90` east, `90` west. |
 
 Editing `Name`, `Region`, `Latitude`, or `Longitude` marks the location as

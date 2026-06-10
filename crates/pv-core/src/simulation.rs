@@ -1,0 +1,553 @@
+use serde::{Deserialize, Serialize};
+use std::error::Error;
+use std::fmt;
+
+const HOURS_PER_YEAR: usize = 8760;
+const MONTH_DAYS: [usize; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+const DEFAULT_RUNS: usize = 10_000;
+const DEFAULT_SEED: u64 = 0x9e37_79b9_7f4a_7c15;
+const ROUND_TRIP_EFFICIENCY: f64 = 0.95;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProductionProfile {
+    pub hourly_mean_kwh: Vec<f64>,
+    pub monthly: Vec<MonthlyProductionBand>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MonthlyProductionBand {
+    pub month: u8,
+    pub mean_kwh: f64,
+    pub low_kwh: f64,
+    pub high_kwh: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LoadProfile {
+    AnnualKwh { annual_kwh: f64, shape: LoadShape },
+    DailyKwh { daily_kwh: f64, shape: LoadShape },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LoadShape {
+    BuiltIn { shape_id: BuiltInLoadShapeId },
+    HourlyWeights { weights: Vec<f64> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuiltInLoadShapeId {
+    ResidentialDefault,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct StorageConfig {
+    pub usable_capacity_kwh: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SimulationOptions {
+    pub runs: usize,
+    pub seed: Option<u64>,
+}
+
+impl Default for SimulationOptions {
+    fn default() -> Self {
+        Self {
+            runs: DEFAULT_RUNS,
+            seed: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SimulationRequest {
+    pub production: ProductionProfile,
+    pub load: LoadProfile,
+    pub storage: Option<StorageConfig>,
+    #[serde(default)]
+    pub options: SimulationOptions,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SimulationResult {
+    pub requested_runs: usize,
+    pub completed_runs: usize,
+    pub cancelled: bool,
+    pub summaries: SimulationMetricSummaries,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SimulationRunMetrics {
+    pub production_kwh: f64,
+    pub load_kwh: f64,
+    pub self_consumed_kwh: f64,
+    pub grid_import_kwh: f64,
+    pub grid_export_kwh: f64,
+    pub battery_losses_kwh: f64,
+    pub ending_soc_kwh: f64,
+    pub self_consumption_ratio: f64,
+    pub self_sufficiency_ratio: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SimulationMetricSummaries {
+    pub production_kwh: MetricSummary,
+    pub load_kwh: MetricSummary,
+    pub self_consumed_kwh: MetricSummary,
+    pub grid_import_kwh: MetricSummary,
+    pub grid_export_kwh: MetricSummary,
+    pub battery_losses_kwh: MetricSummary,
+    pub ending_soc_kwh: MetricSummary,
+    pub self_consumption_ratio: MetricSummary,
+    pub self_sufficiency_ratio: MetricSummary,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct MetricSummary {
+    pub p10: f64,
+    pub p50: f64,
+    pub p90: f64,
+    pub mean: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SimulationError {
+    message: String,
+}
+
+impl SimulationError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for SimulationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl Error for SimulationError {}
+
+pub fn simulate(request: &SimulationRequest) -> Result<SimulationResult, SimulationError> {
+    simulate_with_cancellation(request, || false)
+}
+
+pub fn simulate_with_cancellation(
+    request: &SimulationRequest,
+    mut cancelled: impl FnMut() -> bool,
+) -> Result<SimulationResult, SimulationError> {
+    validate_request(request)?;
+    let load = hourly_load_profile(&request.load)?;
+    let capacity = request
+        .storage
+        .map(|storage| storage.usable_capacity_kwh)
+        .unwrap_or(0.0);
+    let mut rng = SmallRng::new(request.options.seed.unwrap_or(DEFAULT_SEED));
+    let mut runs = Vec::with_capacity(request.options.runs);
+
+    for run_index in 0..request.options.runs {
+        if run_index > 0 && cancelled() {
+            return Ok(SimulationResult {
+                requested_runs: request.options.runs,
+                completed_runs: runs.len(),
+                cancelled: true,
+                summaries: summarize_runs(&runs),
+            });
+        }
+        let production = stochastic_hourly_production(&request.production, &mut rng);
+        runs.push(dispatch_run(&production, &load, capacity));
+    }
+
+    Ok(SimulationResult {
+        requested_runs: request.options.runs,
+        completed_runs: runs.len(),
+        cancelled: false,
+        summaries: summarize_runs(&runs),
+    })
+}
+
+fn validate_request(request: &SimulationRequest) -> Result<(), SimulationError> {
+    if request.options.runs == 0 {
+        return Err(SimulationError::new("simulation runs must be positive"));
+    }
+    if request.production.hourly_mean_kwh.len() != HOURS_PER_YEAR {
+        return Err(SimulationError::new(
+            "production profile must contain 8760 hourly values",
+        ));
+    }
+    if request.production.monthly.len() != 12 {
+        return Err(SimulationError::new(
+            "production profile must contain 12 monthly bands",
+        ));
+    }
+    for (index, value) in request.production.hourly_mean_kwh.iter().enumerate() {
+        if !value.is_finite() || *value < 0.0 {
+            return Err(SimulationError::new(format!(
+                "production hour {} must be finite and non-negative",
+                index + 1
+            )));
+        }
+    }
+    for (index, band) in request.production.monthly.iter().enumerate() {
+        if band.month as usize != index + 1 {
+            return Err(SimulationError::new(
+                "monthly production bands must be ordered 1..=12",
+            ));
+        }
+        if !band.mean_kwh.is_finite()
+            || !band.low_kwh.is_finite()
+            || !band.high_kwh.is_finite()
+            || band.mean_kwh < 0.0
+            || band.low_kwh < 0.0
+            || band.high_kwh < 0.0
+            || band.low_kwh > band.high_kwh
+        {
+            return Err(SimulationError::new(
+                "monthly production bands must be finite, non-negative, and ordered",
+            ));
+        }
+    }
+    if let Some(storage) = request.storage {
+        if !storage.usable_capacity_kwh.is_finite() || storage.usable_capacity_kwh <= 0.0 {
+            return Err(SimulationError::new(
+                "storage usable capacity must be positive",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn hourly_load_profile(load: &LoadProfile) -> Result<Vec<f64>, SimulationError> {
+    let (energy_kwh, shape) = match load {
+        LoadProfile::AnnualKwh { annual_kwh, shape } => (*annual_kwh, shape),
+        LoadProfile::DailyKwh { daily_kwh, shape } => (*daily_kwh * 365.0, shape),
+    };
+    if !energy_kwh.is_finite() || energy_kwh <= 0.0 {
+        return Err(SimulationError::new("load energy must be positive"));
+    }
+    let weights = yearly_shape_weights(shape)?;
+    let sum = weights.iter().sum::<f64>();
+    if sum <= 0.0 {
+        return Err(SimulationError::new(
+            "load shape weights must contain positive energy",
+        ));
+    }
+    Ok(weights
+        .into_iter()
+        .map(|weight| energy_kwh * weight / sum)
+        .collect())
+}
+
+fn yearly_shape_weights(shape: &LoadShape) -> Result<Vec<f64>, SimulationError> {
+    match shape {
+        LoadShape::BuiltIn {
+            shape_id: BuiltInLoadShapeId::ResidentialDefault,
+        } => Ok(repeat_daily_weights(&RESIDENTIAL_DEFAULT_WEIGHTS)),
+        LoadShape::HourlyWeights { weights } if weights.len() == 24 => {
+            Ok(repeat_daily_weights(weights))
+        }
+        LoadShape::HourlyWeights { weights } if weights.len() == HOURS_PER_YEAR => {
+            validate_weights(weights)?;
+            Ok(weights.clone())
+        }
+        LoadShape::HourlyWeights { .. } => Err(SimulationError::new(
+            "hourly load weights must contain either 24 or 8760 values",
+        )),
+    }
+}
+
+fn repeat_daily_weights(weights: &[f64]) -> Vec<f64> {
+    validate_weights(weights).expect("built-in weights are valid");
+    let mut output = Vec::with_capacity(HOURS_PER_YEAR);
+    for _ in 0..365 {
+        output.extend_from_slice(weights);
+    }
+    output
+}
+
+fn validate_weights(weights: &[f64]) -> Result<(), SimulationError> {
+    if weights.is_empty() {
+        return Err(SimulationError::new("load shape weights are required"));
+    }
+    for value in weights {
+        if !value.is_finite() || *value < 0.0 {
+            return Err(SimulationError::new(
+                "load shape weights must be finite and non-negative",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn stochastic_hourly_production(profile: &ProductionProfile, rng: &mut SmallRng) -> Vec<f64> {
+    let mut output = profile.hourly_mean_kwh.clone();
+    let mut start = 0;
+    for (month_index, days) in MONTH_DAYS.iter().copied().enumerate() {
+        let end = start + days * 24;
+        let band = profile.monthly[month_index];
+        let monthly_target = if band.high_kwh > band.low_kwh {
+            band.low_kwh + (band.high_kwh - band.low_kwh) * rng.next_f64()
+        } else {
+            band.mean_kwh
+        };
+        let current = output[start..end].iter().sum::<f64>();
+        if current > 0.0 {
+            let scale = monthly_target / current;
+            for value in &mut output[start..end] {
+                *value *= scale;
+            }
+            let adjusted = output[start..end].iter().sum::<f64>();
+            if let Some(last) = output[start..end]
+                .iter_mut()
+                .rev()
+                .find(|value| **value > 0.0)
+            {
+                *last = (*last + monthly_target - adjusted).max(0.0);
+            }
+        }
+        start = end;
+    }
+    output
+}
+
+fn dispatch_run(production: &[f64], load: &[f64], capacity_kwh: f64) -> SimulationRunMetrics {
+    let charge_efficiency = ROUND_TRIP_EFFICIENCY.sqrt();
+    let discharge_efficiency = ROUND_TRIP_EFFICIENCY.sqrt();
+    let mut soc = capacity_kwh * 0.5;
+    let initial_soc = soc;
+    let mut metrics = SimulationRunMetrics {
+        production_kwh: 0.0,
+        load_kwh: 0.0,
+        self_consumed_kwh: 0.0,
+        grid_import_kwh: 0.0,
+        grid_export_kwh: 0.0,
+        battery_losses_kwh: 0.0,
+        ending_soc_kwh: 0.0,
+        self_consumption_ratio: 0.0,
+        self_sufficiency_ratio: 0.0,
+    };
+
+    for (&pv, &demand) in production.iter().zip(load.iter()) {
+        metrics.production_kwh += pv;
+        metrics.load_kwh += demand;
+        let direct = pv.min(demand);
+        metrics.self_consumed_kwh += direct;
+        let surplus = pv - direct;
+        let deficit = demand - direct;
+
+        if capacity_kwh > 0.0 && surplus > 0.0 {
+            let room = (capacity_kwh - soc).max(0.0);
+            let accepted = surplus.min(room / charge_efficiency);
+            let stored = accepted * charge_efficiency;
+            soc += stored;
+            metrics.battery_losses_kwh += accepted - stored;
+            metrics.grid_export_kwh += surplus - accepted;
+        } else {
+            metrics.grid_export_kwh += surplus;
+        }
+
+        if capacity_kwh > 0.0 && deficit > 0.0 {
+            let delivered = deficit.min(soc * discharge_efficiency);
+            let removed = delivered / discharge_efficiency;
+            soc -= removed;
+            metrics.self_consumed_kwh += delivered;
+            metrics.battery_losses_kwh += removed - delivered;
+            metrics.grid_import_kwh += deficit - delivered;
+        } else {
+            metrics.grid_import_kwh += deficit;
+        }
+    }
+
+    metrics.ending_soc_kwh = soc;
+    metrics.self_consumption_ratio = ratio(metrics.self_consumed_kwh, metrics.production_kwh);
+    metrics.self_sufficiency_ratio = ratio(metrics.self_consumed_kwh, metrics.load_kwh);
+    debug_assert!(initial_soc >= 0.0);
+    metrics
+}
+
+fn ratio(numerator: f64, denominator: f64) -> f64 {
+    if denominator > 0.0 {
+        numerator / denominator
+    } else {
+        0.0
+    }
+}
+
+fn summarize_runs(runs: &[SimulationRunMetrics]) -> SimulationMetricSummaries {
+    SimulationMetricSummaries {
+        production_kwh: summarize_metric(runs.iter().map(|run| run.production_kwh)),
+        load_kwh: summarize_metric(runs.iter().map(|run| run.load_kwh)),
+        self_consumed_kwh: summarize_metric(runs.iter().map(|run| run.self_consumed_kwh)),
+        grid_import_kwh: summarize_metric(runs.iter().map(|run| run.grid_import_kwh)),
+        grid_export_kwh: summarize_metric(runs.iter().map(|run| run.grid_export_kwh)),
+        battery_losses_kwh: summarize_metric(runs.iter().map(|run| run.battery_losses_kwh)),
+        ending_soc_kwh: summarize_metric(runs.iter().map(|run| run.ending_soc_kwh)),
+        self_consumption_ratio: summarize_metric(runs.iter().map(|run| run.self_consumption_ratio)),
+        self_sufficiency_ratio: summarize_metric(runs.iter().map(|run| run.self_sufficiency_ratio)),
+    }
+}
+
+fn summarize_metric(values: impl IntoIterator<Item = f64>) -> MetricSummary {
+    let mut values = values.into_iter().collect::<Vec<_>>();
+    if values.is_empty() {
+        return MetricSummary::default();
+    }
+    values.sort_by(f64::total_cmp);
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    MetricSummary {
+        p10: percentile(&values, 0.10),
+        p50: percentile(&values, 0.50),
+        p90: percentile(&values, 0.90),
+        mean,
+    }
+}
+
+fn percentile(sorted: &[f64], percentile: f64) -> f64 {
+    let index = (percentile * (sorted.len().saturating_sub(1)) as f64).round() as usize;
+    sorted[index.min(sorted.len() - 1)]
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SmallRng {
+    state: u64,
+}
+
+impl SmallRng {
+    fn new(seed: u64) -> Self {
+        Self { state: seed.max(1) }
+    }
+
+    fn next_f64(&mut self) -> f64 {
+        self.state ^= self.state >> 12;
+        self.state ^= self.state << 25;
+        self.state ^= self.state >> 27;
+        let value = self.state.wrapping_mul(0x2545_f491_4f6c_dd1d);
+        ((value >> 11) as f64) / ((1u64 << 53) as f64)
+    }
+}
+
+const RESIDENTIAL_DEFAULT_WEIGHTS: [f64; 24] = [
+    0.55, 0.45, 0.40, 0.38, 0.40, 0.55, 0.85, 1.05, 0.95, 0.80, 0.72, 0.70, 0.76, 0.78, 0.82, 0.90,
+    1.08, 1.35, 1.55, 1.45, 1.20, 0.95, 0.78, 0.65,
+];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn flat_profile(monthly_kwh: f64) -> ProductionProfile {
+        let mut hourly = Vec::with_capacity(HOURS_PER_YEAR);
+        let mut monthly = Vec::new();
+        for (index, days) in MONTH_DAYS.iter().copied().enumerate() {
+            let value = monthly_kwh / (days * 24) as f64;
+            hourly.extend(std::iter::repeat_n(value, days * 24));
+            monthly.push(MonthlyProductionBand {
+                month: (index + 1) as u8,
+                mean_kwh: monthly_kwh,
+                low_kwh: monthly_kwh,
+                high_kwh: monthly_kwh,
+            });
+        }
+        ProductionProfile {
+            hourly_mean_kwh: hourly,
+            monthly,
+        }
+    }
+
+    fn request(production: ProductionProfile, storage: Option<f64>) -> SimulationRequest {
+        SimulationRequest {
+            production,
+            load: LoadProfile::AnnualKwh {
+                annual_kwh: 3650.0,
+                shape: LoadShape::HourlyWeights {
+                    weights: vec![1.0; 24],
+                },
+            },
+            storage: storage.map(|usable_capacity_kwh| StorageConfig {
+                usable_capacity_kwh,
+            }),
+            options: SimulationOptions {
+                runs: 3,
+                seed: Some(42),
+            },
+        }
+    }
+
+    #[test]
+    fn no_storage_balances_production_load_import_and_export() {
+        let result = simulate(&request(flat_profile(120.0), None)).expect("simulation succeeds");
+        let summaries = result.summaries;
+        let left = summaries.production_kwh.mean + summaries.grid_import_kwh.mean;
+        let right = summaries.load_kwh.mean + summaries.grid_export_kwh.mean;
+
+        assert!((left - right).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn storage_reduces_import_when_surplus_precedes_deficit() {
+        let mut profile = flat_profile(0.0);
+        profile.hourly_mean_kwh[0] = 10.0;
+        profile.monthly[0].mean_kwh = 10.0;
+        profile.monthly[0].low_kwh = 10.0;
+        profile.monthly[0].high_kwh = 10.0;
+        let without = simulate(&request(profile.clone(), None)).expect("simulation succeeds");
+        let with = simulate(&request(profile, Some(5.0))).expect("simulation succeeds");
+
+        assert!(with.summaries.grid_import_kwh.mean < without.summaries.grid_import_kwh.mean);
+    }
+
+    #[test]
+    fn battery_efficiency_creates_losses() {
+        let mut profile = flat_profile(0.0);
+        profile.hourly_mean_kwh[0] = 10.0;
+        profile.monthly[0].mean_kwh = 10.0;
+        profile.monthly[0].low_kwh = 10.0;
+        profile.monthly[0].high_kwh = 10.0;
+        let result = simulate(&request(profile, Some(5.0))).expect("simulation succeeds");
+
+        assert!(result.summaries.battery_losses_kwh.mean > 0.0);
+    }
+
+    #[test]
+    fn same_seed_produces_identical_stochastic_summary() {
+        let mut profile = flat_profile(100.0);
+        for band in &mut profile.monthly {
+            band.low_kwh = 80.0;
+            band.high_kwh = 120.0;
+        }
+        let first = simulate(&request(profile.clone(), None)).expect("simulation succeeds");
+        let second = simulate(&request(profile, None)).expect("simulation succeeds");
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn cancellation_returns_partial_result() {
+        let calls = Cell::new(0);
+        let result = simulate_with_cancellation(&request(flat_profile(100.0), None), || {
+            calls.set(calls.get() + 1);
+            true
+        })
+        .expect("simulation succeeds");
+
+        assert!(result.cancelled);
+        assert_eq!(result.completed_runs, 1);
+    }
+
+    #[test]
+    fn quantile_summaries_are_stable_on_fixture() {
+        let summary = summarize_metric([10.0, 20.0, 30.0, 40.0, 50.0]);
+
+        assert_eq!(summary.p10, 10.0);
+        assert_eq!(summary.p50, 30.0);
+        assert_eq!(summary.p90, 50.0);
+        assert_eq!(summary.mean, 30.0);
+    }
+}

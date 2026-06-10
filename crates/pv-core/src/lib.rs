@@ -4,6 +4,7 @@ pub mod catalog;
 pub mod ids;
 pub mod issues;
 pub mod project;
+pub mod simulation;
 pub mod source_model;
 pub mod units;
 pub mod weather;
@@ -26,6 +27,12 @@ pub mod prelude {
         LoadProfileReference, MountingGroup, ProjectLoadError, PvSystemProject, SchemaVersion,
         SimulationSettings, StringDefinition, SystemLocation, TopologyConnection,
         load_project_json, save_project_json,
+    };
+    pub use crate::simulation::{
+        BuiltInLoadShapeId, LoadProfile, LoadShape, MetricSummary, MonthlyProductionBand,
+        ProductionProfile, SimulationMetricSummaries, SimulationOptions, SimulationRequest,
+        SimulationResult, SimulationRunMetrics, StorageConfig, simulate,
+        simulate_with_cancellation,
     };
     pub use crate::source_model::{
         AnnualPvEnsembleEstimate, CalibratedEnergyBand, CalibratedIrradiationBand,

@@ -55,6 +55,71 @@ fn estimate_uses_embedded_defaults() {
 }
 
 #[test]
+fn estimate_includes_storage_metadata_when_set() {
+    let output = assert_success(
+        pv().args([
+            "estimate",
+            "--lat",
+            "40.4168",
+            "--lon=-3.7038",
+            "--storage-kwh",
+            "5.5",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run pv estimate with storage"),
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).expect("estimate JSON");
+
+    assert_eq!(document["schema_version"], 1);
+    assert_eq!(document["system"]["storage_usable_kwh"], 5.5);
+}
+
+#[test]
+fn estimate_omits_storage_metadata_when_unset() {
+    let output = assert_success(
+        pv().args([
+            "estimate",
+            "--lat",
+            "40.4168",
+            "--lon=-3.7038",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run pv estimate without storage"),
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).expect("estimate JSON");
+
+    assert!(document["system"].get("storage_usable_kwh").is_none());
+}
+
+#[test]
+fn estimate_rejects_invalid_storage() {
+    for storage_arg in ["--storage-kwh=0", "--storage-kwh=-1", "--storage-kwh=NaN"] {
+        let output = assert_failure(
+            pv().args([
+                "estimate",
+                "--lat",
+                "45.4642",
+                "--lon",
+                "9.1900",
+                storage_arg,
+            ])
+            .output()
+            .expect("run pv estimate with invalid storage"),
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("storage usable kWh must be positive")
+                || stderr.contains("invalid value"),
+            "stderr:\n{stderr}"
+        );
+    }
+}
+
+#[test]
 fn estimate_accepts_explicit_model_dir() {
     let model_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
