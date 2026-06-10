@@ -1,4 +1,4 @@
-"┌System────────────────────────────────┐┌Estimate──────────────────────────────┐"
+"┌[1] System────────────────────────────┐┌[4] Estimate──────────────────────────┐"
 "│Name         Custom location          ││Annual kWh -                          │"
 "│Region                                ││No estimate                           │"
 "│Latitude     40.650                   ││                                      │"
@@ -21,4 +21,4 @@
 "│                                      ││                                      │"
 "└──────────────────────────────────────┘└──────────────────────────────────────┘"
 "Status Ready                                                                    "
-"NORMAL  arrows/tab select  enter edit  l locations  e estimate  q quit          "
+"NORMAL  1-4 panels  tab/arrows focus  up/down fields  enter edit  e estimate  q "
