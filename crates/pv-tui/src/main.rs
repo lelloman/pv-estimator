@@ -932,7 +932,11 @@ fn render_fields(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             (true, Mode::Normal) => Style::default().fg(Color::Black).bg(Color::Cyan),
             _ => Style::default(),
         };
-        let value_view = field_value_view(field, field_value_width(inner), selected);
+        let value_view = if field.label == "Arrays" {
+            arrays_field_summary(field)
+        } else {
+            field_value_view(field, field_value_width(inner), selected).value
+        };
         let spans = vec![
             Span::styled(
                 format!(
@@ -942,7 +946,7 @@ fn render_fields(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                 ),
                 Style::default().fg(Color::DarkGray),
             ),
-            Span::styled(value_view.value, style),
+            Span::styled(value_view, style),
         ];
         lines.push(Line::from(spans));
         if field.label == "Arrays"
@@ -963,6 +967,16 @@ fn render_fields(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             .saturating_add(value_view.cursor_col.min(u16::MAX as usize) as u16);
         frame.set_cursor_position(Position::new(x, y));
     }
+}
+
+fn arrays_field_summary(field: &Field) -> String {
+    parse_arrays(field)
+        .map(|arrays| {
+            let count = arrays.len();
+            let noun = if count == 1 { "array" } else { "arrays" };
+            format!("[Edit]  {count} {noun}")
+        })
+        .unwrap_or_else(|_| "[Edit]  invalid arrays".to_string())
 }
 
 fn array_summary_lines(arrays: &[EstimateArray]) -> Vec<Line<'static>> {
