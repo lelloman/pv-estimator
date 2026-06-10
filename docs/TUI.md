@@ -45,6 +45,7 @@ Editable fields:
 | `Latitude` | Decimal latitude. |
 | `Longitude` | Decimal longitude. |
 | `Loss %` | System loss percent. |
+| `EUR/kWh` | Optional energy value used to show estimated annual revenue. Leave empty to hide revenue. |
 | `Arrays` | One or more array definitions. The main screen shows an `[Edit]` summary plus a parsed table preview. Azimuth uses the PVGIS convention: `0` south, `-90` east, `90` west. |
 
 Editing `Name`, `Region`, `Latitude`, or `Longitude` marks the location as
@@ -117,9 +118,11 @@ Location mode:
 
 ## Estimate Table
 
-The monthly estimate table keeps its headings fixed and scrolls month rows on
-small terminals. Use `PageUp` / `PageDown`, or the mouse wheel over the Estimate
-pane, to move the visible month window.
+The Estimate pane shows `Annual kWh` as `{mean} - {min}..{max}`. When
+`EUR/kWh` is set, it also shows `Revenue €` with the same mean and min/max range
+format. The monthly estimate table keeps its headings fixed and scrolls month
+rows on small terminals. Use `PageUp` / `PageDown`, or the mouse wheel over the
+Estimate pane, to move the visible month window.
 
 ## Location Search
 
