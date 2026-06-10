@@ -39,9 +39,10 @@ struct Args {
 }
 
 const TUI_STATE_SCHEMA_VERSION: u32 = 1;
-const ARRAY_FIELD_INDEX: usize = 5;
+const PRICE_FIELD_INDEX: usize = 5;
+const ARRAY_FIELD_INDEX: usize = 6;
 const FIELD_LABEL_WIDTH: u16 = 13;
-const ESTIMATE_LABEL_WIDTH: usize = 8;
+const ESTIMATE_LABEL_WIDTH: usize = 11;
 const SEARCH_LABEL_WIDTH: u16 = 8;
 const LOCATION_RESULT_HEADER_ROWS: u16 = 3;
 const ARRAY_EDITOR_HEADER_ROWS: u16 = 3;
@@ -173,6 +174,7 @@ impl App {
                 Field::new("Latitude", "40.650"),
                 Field::new("Longitude", "15.643"),
                 Field::new("Loss %", "14.0"),
+                Field::new("EUR/kWh", ""),
                 Field::new("Arrays", "1.0,30.0,0.0"),
             ],
             selected: 2,
@@ -193,7 +195,8 @@ impl App {
 
     fn recompute(&mut self, estimator: &mut SourceModelEstimator) {
         match self
-            .request_and_arrays()
+            .energy_price_eur_per_kwh()
+            .and_then(|_| self.request_and_arrays())
             .and_then(|(request, arrays)| estimator.estimate_arrays(&request, &arrays))
         {
             Ok(document) => {
@@ -262,6 +265,10 @@ impl App {
         if let Err(error) = result {
             self.status = format!("Could not save state: {error:#}");
         }
+    }
+
+    fn energy_price_eur_per_kwh(&self) -> Result<Option<f64>> {
+        parse_optional_f64(&self.fields[PRICE_FIELD_INDEX])
     }
 
     fn request_and_arrays(&self) -> Result<(EstimateRequest, Vec<EstimateArray>)> {
@@ -520,6 +527,17 @@ impl Field {
             self.cursor += character.len_utf8();
         }
     }
+}
+
+fn parse_optional_f64(field: &Field) -> Result<Option<f64>> {
+    let value = field.value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    value
+        .parse::<f64>()
+        .map(Some)
+        .with_context(|| format!("{} must be empty or a number", field.label))
 }
 
 fn parse_f64(field: &Field) -> Result<f64> {
@@ -925,38 +943,57 @@ fn estimate_metric_line(label: &'static str, value: String, value_style: Style) 
     ])
 }
 
-fn annual_band_lines(app: &App) -> [Line<'static>; 2] {
-    let (annual, band) = app
-        .estimate
-        .as_ref()
+fn annual_energy_line(document: Option<&SourceEnsembleEstimateDocument>) -> Line<'static> {
+    let value = document
         .map(|document| {
             let estimate = &document.ensemble_estimate;
-            let annual = format!("{:.2} kWh", estimate.annual_energy.mean.as_kilowatt_hours());
-            let band = estimate
+            let mean = estimate.annual_energy.mean.as_kilowatt_hours().round();
+            estimate
                 .uncertainty
                 .annual_energy
                 .map(|band| {
                     format!(
-                        "{:.2}..{:.2} kWh",
-                        band.low.as_kilowatt_hours(),
-                        band.high.as_kilowatt_hours()
+                        "{mean:.0} - {:.0}..{:.0}",
+                        band.low.as_kilowatt_hours().round(),
+                        band.high.as_kilowatt_hours().round()
                     )
                 })
-                .unwrap_or_else(|| "insufficient sources".to_string());
-            (annual, band)
+                .unwrap_or_else(|| format!("{mean:.0} - -..-"))
         })
-        .unwrap_or_else(|| ("-".to_string(), "-".to_string()));
+        .unwrap_or_else(|| "-".to_string());
 
-    [
-        estimate_metric_line(
-            "Annual",
-            annual,
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        ),
-        estimate_metric_line("Band", band, Style::default()),
-    ]
+    estimate_metric_line(
+        "Annual kWh",
+        value,
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+fn annual_revenue_line(document: &SourceEnsembleEstimateDocument, price: f64) -> Line<'static> {
+    let estimate = &document.ensemble_estimate;
+    let mean = estimate.annual_energy.mean.as_kilowatt_hours() * price;
+    let value = estimate
+        .uncertainty
+        .annual_energy
+        .map(|band| {
+            format!(
+                "{:.0} - {:.0}..{:.0}",
+                mean.round(),
+                (band.low.as_kilowatt_hours() * price).round(),
+                (band.high.as_kilowatt_hours() * price).round()
+            )
+        })
+        .unwrap_or_else(|| format!("{:.0} - -..-", mean.round()));
+
+    estimate_metric_line(
+        "Revenue €",
+        value,
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+    )
 }
 
 fn render_fields(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
@@ -975,10 +1012,16 @@ fn render_fields(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             (true, Mode::Normal) => Style::default().fg(Color::Black).bg(Color::Cyan),
             _ => Style::default(),
         };
+        let value_width = field_value_width(inner);
         let value_view = if field.label == "Arrays" {
             arrays_field_summary(field)
         } else {
-            field_value_view(field, field_value_width(inner), selected).value
+            field_value_view(field, value_width, selected).value
+        };
+        let label_style = if selected {
+            style
+        } else {
+            Style::default().fg(Color::DarkGray)
         };
         let spans = vec![
             Span::styled(
@@ -987,9 +1030,12 @@ fn render_fields(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                     field.label,
                     width = FIELD_LABEL_WIDTH as usize
                 ),
-                Style::default().fg(Color::DarkGray),
+                label_style,
             ),
-            Span::styled(value_view, style),
+            Span::styled(
+                format!("{:<width$}", value_view, width = value_width),
+                style,
+            ),
         ];
         lines.push(Line::from(spans));
         if field.label == "Arrays"
@@ -1363,9 +1409,8 @@ fn render_estimate(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(block, area);
 
     let Some(document) = &app.estimate else {
-        let [annual, band] = annual_band_lines(app);
         frame.render_widget(
-            Paragraph::new(vec![annual, band, Line::from("No estimate")]),
+            Paragraph::new(vec![annual_energy_line(None), Line::from("No estimate")]),
             inner,
         );
         return;
@@ -1379,27 +1424,28 @@ fn render_estimate(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         .map(|source| source.as_str())
         .collect::<Vec<_>>()
         .join(", ");
-    let [annual, band] = annual_band_lines(app);
-    let header = Paragraph::new(vec![
-        annual,
-        band,
-        estimate_metric_line(
-            "POA",
-            format!(
-                "{:.2} kWh/m2",
-                estimate
-                    .annual_in_plane_irradiation
-                    .mean
-                    .as_kilowatt_hours_per_square_meter()
-            ),
-            Style::default(),
+    let mut header_lines = vec![annual_energy_line(Some(document))];
+    if let Some(price) = app.energy_price_eur_per_kwh().ok().flatten() {
+        header_lines.push(annual_revenue_line(document, price));
+    }
+    header_lines.push(estimate_metric_line(
+        "POA",
+        format!(
+            "{:.2} kWh/m2",
+            estimate
+                .annual_in_plane_irradiation
+                .mean
+                .as_kilowatt_hours_per_square_meter()
         ),
-        estimate_metric_line("Sources", sources, Style::default()),
-    ]);
+        Style::default(),
+    ));
+    header_lines.push(estimate_metric_line("Sources", sources, Style::default()));
+    let header_height = header_lines.len().min(u16::MAX as usize) as u16;
+    let header = Paragraph::new(header_lines);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(4), Constraint::Min(5)])
+        .constraints([Constraint::Length(header_height), Constraint::Min(5)])
         .split(inner);
     frame.render_widget(header.wrap(Wrap { trim: true }), chunks[0]);
 
@@ -1908,8 +1954,17 @@ mod tests {
     }
 
     #[test]
+    fn empty_price_field_selected_snapshot() {
+        let mut app = App::new();
+        app.selected = PRICE_FIELD_INDEX;
+
+        assert_snapshot("empty_price_selected", &render_snapshot(&app));
+    }
+
+    #[test]
     fn populated_estimate_snapshot() {
         let mut app = App::new();
+        app.fields[PRICE_FIELD_INDEX].set_value("0.22");
         app.estimate = Some(populated_estimate_document());
 
         assert_snapshot("populated_estimate", &render_snapshot(&app));
@@ -1918,9 +1973,9 @@ mod tests {
     #[test]
     fn long_arrays_edit_snapshot() {
         let mut app = App::new();
-        app.selected = 5;
+        app.selected = ARRAY_FIELD_INDEX;
         app.mode = Mode::Edit;
-        app.fields[5].set_value("1.50,30,0; 2.25,20,-90; 3.75,15,90; 4.50,10,45");
+        app.fields[ARRAY_FIELD_INDEX].set_value("1.50,30,0; 2.25,20,-90; 3.75,15,90; 4.50,10,45");
 
         assert_snapshot("long_arrays_edit", &render_snapshot(&app));
     }
@@ -2126,6 +2181,19 @@ mod tests {
         assert_eq!(azimuth_direction_label("45"), Some("SW"));
         assert_eq!(azimuth_direction_label("-45"), Some("SE"));
         assert_eq!(azimuth_direction_label("not-a-number"), None);
+    }
+
+    #[test]
+    fn parses_optional_energy_price() {
+        assert_eq!(
+            parse_optional_f64(&Field::new("EUR/kWh", "")).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_optional_f64(&Field::new("EUR/kWh", "0.22")).unwrap(),
+            Some(0.22)
+        );
+        assert!(parse_optional_f64(&Field::new("EUR/kWh", "abc")).is_err());
     }
 
     #[test]
