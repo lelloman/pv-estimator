@@ -6,10 +6,13 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, size,
 };
 use directories::ProjectDirs;
 use pv_core::source_model::SourceEnsembleEstimateDocument;
@@ -39,6 +42,8 @@ const TUI_STATE_SCHEMA_VERSION: u32 = 1;
 const ARRAY_FORMAT_HELP: &str = "format: kWp,tilt,az; repeat with ;";
 const FIELD_LABEL_WIDTH: u16 = 13;
 const ESTIMATE_LABEL_WIDTH: usize = 8;
+const SEARCH_LABEL_WIDTH: u16 = 8;
+const LOCATION_RESULT_HEADER_ROWS: u16 = 3;
 const MONTHLY_TABLE_HEADERS: [&str; 7] = ["Month", "mean", "min", "max", "mean", "min", "max"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,7 +92,7 @@ struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
     }
 }
 
@@ -109,7 +114,7 @@ fn run() -> Result<()> {
     };
 
     enable_raw_mode()?;
-    execute!(io::stdout(), EnterAlternateScreen)?;
+    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
     let _guard = TerminalGuard;
 
     let backend = CrosstermBackend::new(io::stdout());
@@ -135,6 +140,7 @@ fn run_app(
         if event::poll(Duration::from_millis(200))? {
             match event::read()? {
                 Event::Key(key) if handle_key(key, app, estimator)? => break,
+                Event::Mouse(mouse) => handle_mouse(mouse, app, estimator)?,
                 Event::Resize(_, _) => {}
                 _ => {}
             }
@@ -277,6 +283,18 @@ impl App {
             self.location_results = pv_data::search_cities(&self.location_query.value, 30);
         }
         self.clamp_location_selection();
+    }
+
+    fn open_location_search(&mut self) {
+        self.mode = Mode::Location;
+        self.location_selected = 0;
+        self.refresh_location_results();
+        self.status = "Search and select a location".to_string();
+    }
+
+    fn cancel_location_search(&mut self) {
+        self.mode = Mode::Normal;
+        self.status = "Location search cancelled".to_string();
     }
 
     fn clamp_location_selection(&mut self) {
@@ -440,13 +458,9 @@ fn handle_normal_key(
         KeyCode::BackTab => app.selected = app.selected.saturating_sub(1),
         KeyCode::Home => app.selected = 0,
         KeyCode::End => app.selected = app.fields.len() - 1,
+        KeyCode::Enter if app.fields[app.selected].label == "Name" => app.open_location_search(),
         KeyCode::Enter => app.mode = Mode::Edit,
-        KeyCode::Char('l') => {
-            app.mode = Mode::Location;
-            app.location_selected = 0;
-            app.refresh_location_results();
-            app.status = "Select location by name".to_string();
-        }
+        KeyCode::Char('l') => app.open_location_search(),
         KeyCode::Char('e') => app.recompute(estimator),
         _ => {}
     }
@@ -500,13 +514,57 @@ fn handle_edit_key(
     Ok(false)
 }
 
+fn handle_mouse(
+    mouse: MouseEvent,
+    app: &mut App,
+    estimator: &mut SourceModelEstimator,
+) -> Result<()> {
+    if mouse.kind != MouseEventKind::Down(event::MouseButton::Left) {
+        return Ok(());
+    }
+    let (width, height) = size()?;
+    let area = Rect::new(0, 0, width, height);
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(10), Constraint::Length(2)])
+        .split(area);
+
+    if app.mode == Mode::Location {
+        if location_cancel_hit(vertical[1], mouse.column, mouse.row) {
+            app.cancel_location_search();
+            return Ok(());
+        }
+        if let Some(index) = location_result_index_at(vertical[0], mouse.column, mouse.row)
+            && index < app.location_results.len()
+        {
+            app.location_selected = index;
+            app.apply_selected_location(estimator);
+        }
+        return Ok(());
+    }
+
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(45), Constraint::Min(40)])
+        .split(vertical[0]);
+    let fields_inner = Block::default().borders(Borders::ALL).inner(body[0]);
+    if mouse.column >= fields_inner.x
+        && mouse.column < fields_inner.x.saturating_add(fields_inner.width)
+        && mouse.row == fields_inner.y
+    {
+        app.selected = 0;
+        app.open_location_search();
+    }
+    Ok(())
+}
+
 fn handle_location_key(
     key: KeyEvent,
     app: &mut App,
     estimator: &mut SourceModelEstimator,
 ) -> Result<bool> {
     match key.code {
-        KeyCode::Esc => app.mode = Mode::Normal,
+        KeyCode::Esc => app.cancel_location_search(),
         KeyCode::Enter => app.apply_selected_location(estimator),
         KeyCode::Up => app.location_selected = app.location_selected.saturating_sub(1),
         KeyCode::Down | KeyCode::Tab => {
@@ -548,6 +606,12 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(10), Constraint::Length(2)])
         .split(area);
+
+    if app.mode == Mode::Location {
+        render_location_search(frame, vertical[0], app);
+        render_footer(frame, vertical[1], app);
+        return;
+    }
 
     let body = Layout::default()
         .direction(Direction::Horizontal)
@@ -662,44 +726,6 @@ fn render_fields(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             }
         }
     }
-    lines.push(Line::from(""));
-    let search_style = if app.mode == Mode::Location {
-        Style::default().fg(Color::Black).bg(Color::Yellow)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    let location_view = field_value_view(
-        &app.location_query,
-        field_value_width(inner),
-        app.mode == Mode::Location,
-    );
-    lines.push(Line::from(vec![
-        Span::styled(
-            format!("{:<width$}", "Location", width = FIELD_LABEL_WIDTH as usize),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled(location_view.value, search_style),
-    ]));
-    for (row, location) in app.location_results.iter().take(6).enumerate() {
-        let selected = app.mode == Mode::Location && row == app.location_selected;
-        let style = if selected {
-            Style::default().fg(Color::Black).bg(Color::Cyan)
-        } else {
-            Style::default()
-        };
-        lines.push(Line::from(vec![Span::styled(city_label(location), style)]));
-    }
-    if app.location_results.is_empty() {
-        let message = if app.location_query.value.is_empty() {
-            "Type at least 2 characters"
-        } else {
-            "No matching locations"
-        };
-        lines.push(Line::from(Span::styled(
-            message,
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
     frame.render_widget(Paragraph::new(lines), inner);
 
     if app.mode == Mode::Edit {
@@ -711,17 +737,107 @@ fn render_fields(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             .saturating_add(FIELD_LABEL_WIDTH)
             .saturating_add(value_view.cursor_col.min(u16::MAX as usize) as u16);
         frame.set_cursor_position(Position::new(x, y));
-    } else if app.mode == Mode::Location {
-        let y = inner
-            .y
-            .saturating_add(app.fields.len() as u16 + array_extra_lines + 1);
-        let location_view = field_value_view(&app.location_query, field_value_width(inner), true);
-        let x = inner
-            .x
-            .saturating_add(FIELD_LABEL_WIDTH)
-            .saturating_add(location_view.cursor_col.min(u16::MAX as usize) as u16);
-        frame.set_cursor_position(Position::new(x, y));
     }
+}
+
+fn render_location_search(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Location Search");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let search_view = field_value_view(
+        &app.location_query,
+        inner.width.saturating_sub(SEARCH_LABEL_WIDTH).max(1) as usize,
+        true,
+    );
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("{:<width$}", "Search", width = SEARCH_LABEL_WIDTH as usize),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                search_view.value,
+                Style::default().fg(Color::Black).bg(Color::Yellow),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "City               CC       Lat       Lon",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    let visible_results = location_visible_result_count(inner);
+    for (row, location) in app
+        .location_results
+        .iter()
+        .take(visible_results)
+        .enumerate()
+    {
+        let selected = row == app.location_selected;
+        let style = if selected {
+            Style::default().fg(Color::Black).bg(Color::Cyan)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(vec![Span::styled(city_label(location), style)]));
+    }
+    if app.location_results.is_empty() {
+        let message = if app.location_query.value.is_empty() {
+            "Type at least 2 characters to search"
+        } else {
+            "No matching locations"
+        };
+        lines.push(Line::from(Span::styled(
+            message,
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    frame.render_widget(Paragraph::new(lines), inner);
+    frame.set_cursor_position(location_search_cursor(inner, &app.location_query));
+}
+
+fn location_visible_result_count(inner: Rect) -> usize {
+    inner
+        .height
+        .saturating_sub(LOCATION_RESULT_HEADER_ROWS)
+        .max(1) as usize
+}
+
+fn location_result_index_at(area: Rect, column: u16, row: u16) -> Option<usize> {
+    let inner = location_search_inner(area);
+    if column < inner.x || column >= inner.x.saturating_add(inner.width) {
+        return None;
+    }
+    let first_result_row = inner.y.saturating_add(LOCATION_RESULT_HEADER_ROWS);
+    if row < first_result_row {
+        return None;
+    }
+    let index = row.saturating_sub(first_result_row) as usize;
+    (index < location_visible_result_count(inner)).then_some(index)
+}
+
+fn location_search_inner(area: Rect) -> Rect {
+    Block::default().borders(Borders::ALL).inner(area)
+}
+
+fn location_search_cursor(inner: Rect, field: &Field) -> Position {
+    let search_view = field_value_view(
+        field,
+        inner.width.saturating_sub(SEARCH_LABEL_WIDTH).max(1) as usize,
+        true,
+    );
+    Position::new(
+        inner
+            .x
+            .saturating_add(SEARCH_LABEL_WIDTH)
+            .saturating_add(search_view.cursor_col.min(u16::MAX as usize) as u16),
+        inner.y,
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1058,19 +1174,40 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         Mode::Edit => ("EDIT", "type value  enter apply  esc cancel edit  tab next"),
         Mode::Location => (
             "LOCATION",
-            "type filter  arrows select  enter apply  esc close",
+            "type filter  arrows select  enter apply  esc cancel",
         ),
     };
     let status = Line::from(vec![
         Span::styled("Status ", Style::default().fg(Color::DarkGray)),
         Span::raw(app.status.as_str()),
     ]);
-    let help = Line::from(vec![
-        Span::styled(mode, Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw("  "),
-        Span::raw(help),
-    ]);
+    let help = if app.mode == Mode::Location {
+        Line::from(vec![
+            Span::styled(mode, Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("  "),
+            Span::styled(
+                "[Cancel]",
+                Style::default().fg(Color::Black).bg(Color::Yellow),
+            ),
+            Span::raw("  "),
+            Span::raw(help),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(mode, Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("  "),
+            Span::raw(help),
+        ])
+    };
     frame.render_widget(Paragraph::new(vec![status, help]), area);
+}
+
+fn location_cancel_hit(area: Rect, column: u16, row: u16) -> bool {
+    let cancel_start = "LOCATION  ".len() as u16;
+    let cancel_end = cancel_start + "[Cancel]".len() as u16;
+    row == area.y.saturating_add(1)
+        && column >= area.x.saturating_add(cancel_start)
+        && column < area.x.saturating_add(cancel_end)
 }
 
 fn azimuth_direction_label(value: &str) -> Option<&'static str> {
@@ -1153,6 +1290,20 @@ mod tests {
         app.refresh_location_results();
 
         assert_snapshot("location_search", &render_snapshot(&app));
+    }
+
+    #[test]
+    fn location_search_hit_tests_match_layout() {
+        let search_area = Rect::new(0, 0, 80, 22);
+        assert_eq!(location_result_index_at(search_area, 1, 4), Some(0));
+        assert_eq!(location_result_index_at(search_area, 1, 5), Some(1));
+        assert_eq!(location_result_index_at(search_area, 1, 3), None);
+        assert_eq!(location_result_index_at(search_area, 79, 4), None);
+
+        let footer_area = Rect::new(0, 22, 80, 2);
+        assert!(location_cancel_hit(footer_area, 10, 23));
+        assert!(!location_cancel_hit(footer_area, 18, 23));
+        assert!(!location_cancel_hit(footer_area, 10, 22));
     }
 
     #[test]

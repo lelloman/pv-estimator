@@ -30,7 +30,7 @@ pv-tui [--model-dir <DIR>] [--manifest <NAME>]
 
 The TUI has three main areas:
 
-- System pane: editable location and system fields plus city search results.
+- System pane: editable location and system fields.
 - Estimate pane: annual estimate, uncertainty band, source coverage, and monthly production table.
 - Footer: status messages above the active key bindings.
 
@@ -70,7 +70,7 @@ Normal mode:
 | `Up` / `Down` | Move between fields. |
 | `Tab` / `Shift+Tab` | Move between fields. |
 | `Home` / `End` | Jump to first or last field. |
-| `Enter` | Edit selected field. |
+| `Enter` | Edit selected field. On `Name`, open location search mode. |
 | `l` | Open location search mode. |
 | `e` | Recompute estimate. |
 | `q` | Quit. |
@@ -103,14 +103,19 @@ Location mode:
 
 ## Location Search
 
-The location search uses the same embedded GeoNames catalog as `pv search`.
-Queries shorter than two characters show no results. Selecting a city updates:
+The location search opens as a separate screen with a search bar and results list.
+Open it with `l` from normal mode or by selecting `Name` and pressing `Enter`.
+It uses the same embedded GeoNames catalog as `pv search`. Queries shorter than
+two characters show no results. Selecting a city updates:
 
 - `Name`
 - `Region`
 - `Latitude`
 - `Longitude`
 - internal `location_id`
+
+Press `Esc` or select `[Cancel]` to return to the main screen without changing the
+current location.
 
 ## State File
 
