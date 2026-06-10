@@ -49,6 +49,8 @@ const ARRAY_TABLE_WIDTHS: [u16; 9] = [4, 1, 8, 1, 8, 1, 9, 1, 9];
 const ARRAY_CELL_WIDTHS: [usize; 3] = [8, 8, 9];
 const ARRAY_CELL_STARTS: [u16; 3] = [7, 18, 29];
 const MONTHLY_TABLE_HEADERS: [&str; 7] = ["Month", "mean", "min", "max", "mean", "min", "max"];
+const MONTHLY_TABLE_HEADER_ROWS: usize = 3;
+const ESTIMATE_SCROLL_PAGE_ROWS: usize = 6;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TuiState {
@@ -94,6 +96,7 @@ struct App {
     array_column: usize,
     array_editing: bool,
     array_cell: Field,
+    estimate_scroll: usize,
 }
 
 struct TerminalGuard;
@@ -184,6 +187,7 @@ impl App {
             array_column: 0,
             array_editing: false,
             array_cell: Field::new("Array", ""),
+            estimate_scroll: 0,
         }
     }
 
@@ -446,6 +450,13 @@ impl App {
             self.array_selected = self.array_selected.saturating_sub(1);
         }
     }
+    fn scroll_estimate_down(&mut self, rows: usize) {
+        self.estimate_scroll = self.estimate_scroll.saturating_add(rows);
+    }
+
+    fn scroll_estimate_up(&mut self, rows: usize) {
+        self.estimate_scroll = self.estimate_scroll.saturating_sub(rows);
+    }
 }
 
 fn tui_state_path() -> Option<PathBuf> {
@@ -614,6 +625,8 @@ fn handle_normal_key(
         KeyCode::Enter => app.mode = Mode::Edit,
         KeyCode::Char('l') => app.open_location_search(),
         KeyCode::Char('e') => app.recompute(estimator),
+        KeyCode::PageDown => app.scroll_estimate_down(ESTIMATE_SCROLL_PAGE_ROWS),
+        KeyCode::PageUp => app.scroll_estimate_up(ESTIMATE_SCROLL_PAGE_ROWS),
         _ => {}
     }
     Ok(false)
@@ -671,15 +684,33 @@ fn handle_mouse(
     app: &mut App,
     estimator: &mut SourceModelEstimator,
 ) -> Result<()> {
-    if mouse.kind != MouseEventKind::Down(event::MouseButton::Left) {
-        return Ok(());
-    }
     let (width, height) = size()?;
     let area = Rect::new(0, 0, width, height);
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(10), Constraint::Length(2)])
         .split(area);
+
+    if matches!(
+        mouse.kind,
+        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
+    ) && app.mode != Mode::Location
+        && app.mode != Mode::Arrays
+    {
+        let estimate_area = main_estimate_area(vertical[0]);
+        if rect_contains(estimate_area, mouse.column, mouse.row) {
+            match mouse.kind {
+                MouseEventKind::ScrollDown => app.scroll_estimate_down(1),
+                MouseEventKind::ScrollUp => app.scroll_estimate_up(1),
+                _ => {}
+            }
+        }
+        return Ok(());
+    }
+
+    if mouse.kind != MouseEventKind::Down(event::MouseButton::Left) {
+        return Ok(());
+    }
 
     if app.mode == Mode::Location {
         if location_cancel_hit(vertical[1], mouse.column, mouse.row) {
@@ -721,10 +752,7 @@ fn handle_mouse(
         return Ok(());
     }
 
-    let body = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(45), Constraint::Min(40)])
-        .split(vertical[0]);
+    let body = main_body_areas(vertical[0]);
     let fields_inner = Block::default().borders(Borders::ALL).inner(body[0]);
     if mouse.column >= fields_inner.x
         && mouse.column < fields_inner.x.saturating_add(fields_inner.width)
@@ -863,13 +891,28 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
         return;
     }
 
-    let body = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(45), Constraint::Min(40)])
-        .split(vertical[0]);
+    let body = main_body_areas(vertical[0]);
     render_fields(frame, body[0], app);
     render_estimate(frame, body[1], app);
     render_footer(frame, vertical[1], app);
+}
+
+fn main_body_areas(area: Rect) -> std::rc::Rc<[Rect]> {
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(45), Constraint::Min(40)])
+        .split(area)
+}
+
+fn main_estimate_area(area: Rect) -> Rect {
+    main_body_areas(area)[1]
+}
+
+fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
+    column >= area.x
+        && column < area.x.saturating_add(area.width)
+        && row >= area.y
+        && row < area.y.saturating_add(area.height)
 }
 
 fn estimate_metric_line(label: &'static str, value: String, value_style: Style) -> Line<'static> {
@@ -1398,7 +1441,14 @@ fn render_estimate(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         ]);
     }
 
-    frame.render_widget(Paragraph::new(monthly_table_lines(&rows)), chunks[1]);
+    frame.render_widget(
+        Paragraph::new(monthly_table_lines(
+            &rows,
+            app.estimate_scroll,
+            chunks[1].height,
+        )),
+        chunks[1],
+    );
 }
 
 fn monthly_table_minimums(rows: &[[String; 7]]) -> Option<(f64, f64)> {
@@ -1478,11 +1528,13 @@ fn monthly_table_text_row(row: &[String; 7], column_widths: [usize; 7]) -> Strin
     )
 }
 
-fn monthly_table_lines(rows: &[[String; 7]]) -> Vec<Line<'static>> {
+fn monthly_table_lines(rows: &[[String; 7]], scroll: usize, height: u16) -> Vec<Line<'static>> {
     let column_widths = monthly_table_column_widths(rows);
     let monthly_width = column_widths[1] + column_widths[2] + column_widths[3] + 2;
     let daily_width = column_widths[4] + column_widths[5] + column_widths[6] + 2;
     let header_style = Style::default().fg(Color::DarkGray);
+    let visible_rows = monthly_table_visible_row_count(height);
+    let scroll = monthly_table_scroll_start(scroll, rows.len(), visible_rows);
 
     let mut lines = vec![
         Line::from(""),
@@ -1504,10 +1556,20 @@ fn monthly_table_lines(rows: &[[String; 7]]) -> Vec<Line<'static>> {
         ),
     ];
     let minimums = monthly_table_minimums(rows);
-    for row in rows {
+    for row in rows.iter().skip(scroll).take(visible_rows) {
         lines.push(monthly_table_line(row, column_widths, false, minimums));
     }
     lines
+}
+
+fn monthly_table_visible_row_count(height: u16) -> usize {
+    (height as usize)
+        .saturating_sub(MONTHLY_TABLE_HEADER_ROWS)
+        .max(1)
+}
+
+fn monthly_table_scroll_start(scroll: usize, row_count: usize, visible_rows: usize) -> usize {
+    scroll.min(row_count.saturating_sub(visible_rows))
 }
 
 fn monthly_table_line(
@@ -1725,6 +1787,10 @@ fn truncate(value: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
 
+    use pv_core::prelude::{
+        AnnualPvEnsembleEstimate, Energy, EstimateCoverage, EstimateLocation, EstimateSystem,
+        Irradiation, MonthOfYear, SourceAnnualPvEstimate, SourceMonthlyPvEstimate, WeatherSourceId,
+    };
     use ratatui::backend::TestBackend;
 
     const SNAPSHOT_SIZE: (u16, u16) = (80, 24);
@@ -1734,6 +1800,91 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal.draw(|frame| render(frame, app)).expect("draw TUI");
         terminal.backend().to_string()
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    fn populated_estimate_document() -> SourceEnsembleEstimateDocument {
+        let source_a = source_estimate("fixture-a", 0.0);
+        let source_b = source_estimate("fixture-b", 12.0);
+        let ensemble = AnnualPvEnsembleEstimate::from_source_estimates(vec![source_a, source_b])
+            .expect("fixture has source estimates");
+        SourceEnsembleEstimateDocument {
+            schema_version: 1,
+            location: EstimateLocation {
+                location_id: "fixture".to_string(),
+                name: "Fixture".to_string(),
+                region: "IT".to_string(),
+                latitude: 45.0,
+                longitude: 9.0,
+            },
+            system: EstimateSystem {
+                peak_power_kwp: 3.0,
+                loss_pct: 14.0,
+                tilt_deg: 30.0,
+                aspect_deg: 0.0,
+            },
+            coverage: EstimateCoverage {
+                pvgis_sarah3_applicable: true,
+                applicable_sources: vec![
+                    WeatherSourceId::new("fixture-a").expect("valid source id"),
+                    WeatherSourceId::new("fixture-b").expect("valid source id"),
+                ],
+            },
+            ensemble_estimate: ensemble,
+            references: serde_json::json!({}),
+        }
+    }
+
+    fn source_estimate(source_id: &str, offset: f64) -> SourceAnnualPvEstimate {
+        let monthly = (1..=12)
+            .map(|month| {
+                let energy = 70.0 + month as f64 * 10.0 + offset;
+                let poa = 90.0 + month as f64 * 8.0 + offset;
+                SourceMonthlyPvEstimate {
+                    month: MonthOfYear::new(month).expect("valid month"),
+                    energy: Energy::from_kilowatt_hours(energy),
+                    in_plane_irradiation: Irradiation::from_kilowatt_hours_per_square_meter(poa),
+                    global_horizontal_irradiation:
+                        Irradiation::from_kilowatt_hours_per_square_meter(poa - 15.0),
+                }
+            })
+            .collect::<Vec<_>>();
+        SourceAnnualPvEstimate {
+            weather_source_id: WeatherSourceId::new(source_id).expect("valid source id"),
+            annual_energy: Energy::from_kilowatt_hours(
+                monthly
+                    .iter()
+                    .map(|month| month.energy.as_kilowatt_hours())
+                    .sum(),
+            ),
+            annual_in_plane_irradiation: Irradiation::from_kilowatt_hours_per_square_meter(
+                monthly
+                    .iter()
+                    .map(|month| {
+                        month
+                            .in_plane_irradiation
+                            .as_kilowatt_hours_per_square_meter()
+                    })
+                    .sum(),
+            ),
+            annual_global_horizontal_irradiation: Irradiation::from_kilowatt_hours_per_square_meter(
+                monthly
+                    .iter()
+                    .map(|month| {
+                        month
+                            .global_horizontal_irradiation
+                            .as_kilowatt_hours_per_square_meter()
+                    })
+                    .sum(),
+            ),
+            monthly_estimates: monthly,
+        }
     }
 
     fn assert_snapshot(name: &str, actual: &str) {
@@ -1754,6 +1905,14 @@ mod tests {
         let app = App::new();
 
         assert_snapshot("default_layout", &render_snapshot(&app));
+    }
+
+    #[test]
+    fn populated_estimate_snapshot() {
+        let mut app = App::new();
+        app.estimate = Some(populated_estimate_document());
+
+        assert_snapshot("populated_estimate", &render_snapshot(&app));
     }
 
     #[test]
@@ -1880,6 +2039,45 @@ mod tests {
     }
 
     #[test]
+    fn monthly_table_scrolls_month_rows_below_headers() {
+        let rows = vec![
+            [
+                "Jan".to_string(),
+                "100.0".to_string(),
+                "90".to_string(),
+                "110".to_string(),
+                "3.2".to_string(),
+                "2.9".to_string(),
+                "3.5".to_string(),
+            ],
+            [
+                "Feb".to_string(),
+                "120.0".to_string(),
+                "100".to_string(),
+                "140".to_string(),
+                "4.3".to_string(),
+                "3.6".to_string(),
+                "5.0".to_string(),
+            ],
+            [
+                "Mar".to_string(),
+                "140.0".to_string(),
+                "120".to_string(),
+                "160".to_string(),
+                "4.5".to_string(),
+                "3.9".to_string(),
+                "5.2".to_string(),
+            ],
+        ];
+
+        let lines = monthly_table_lines(&rows, 1, 5);
+
+        assert_eq!(lines.len(), 5);
+        assert!(line_text(&lines[3]).starts_with("Feb"));
+        assert!(line_text(&lines[4]).starts_with("Mar"));
+    }
+
+    #[test]
     fn monthly_table_marks_mean_columns_green_and_min_columns_red() {
         let rows = vec![
             [
@@ -1902,7 +2100,7 @@ mod tests {
             ],
         ];
 
-        let lines = monthly_table_lines(&rows);
+        let lines = monthly_table_lines(&rows, 0, 20);
 
         assert_eq!(lines[2].spans[0].style.fg, Some(Color::DarkGray));
         assert_eq!(lines[2].spans[2].style.fg, Some(Color::Green));
