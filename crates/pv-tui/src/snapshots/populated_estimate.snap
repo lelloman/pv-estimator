@@ -1,4 +1,4 @@
-"┌System────────────────────────────────┐┌Estimate──────────────────────────────┐"
+"┌[1] System────────────────────────────┐┌[4] Estimate──────────────────────────┐"
 "│Name         Custom location          ││Annual kWh 1692 - 1548..1836          │"
 "│Region                                ││Revenue €  372 - 341..404             │"
 "│Latitude     40.650                   ││POA        1776.00 kWh/m2             │"
@@ -21,4 +21,4 @@
 "│                                      ││                                      │"
 "└──────────────────────────────────────┘└──────────────────────────────────────┘"
 "Status Ready                                                                    "
-"NORMAL  arrows/tab select  enter edit  l locations  e estimate  q quit          "
+"NORMAL  1-4 panels  tab/arrows focus  up/down fields  enter edit  e estimate  q "

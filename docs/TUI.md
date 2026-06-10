@@ -28,11 +28,12 @@ pv-tui [--model-dir <DIR>] [--manifest <NAME>]
 
 ## Layout
 
-The TUI has three main areas:
+The TUI starts with two visible panels:
 
-- System pane: editable location and system fields.
-- Estimate pane: annual estimate, uncertainty band, source coverage, and monthly production table.
-- Footer: status messages above the active key bindings.
+- System panel: editable location and system fields.
+- Estimate panel: annual estimate, uncertainty band, source coverage, and monthly production table.
+
+`Consumer` and `Simulation` panels can also be toggled on as the scenario grows. Panels `1` and `2` stack in the left column; panels `3` and `4` stack in the right column. The footer shows status messages above the active key bindings.
 
 ## Fields
 
@@ -70,13 +71,15 @@ Normal mode:
 
 | Key | Action |
 | --- | --- |
-| `Up` / `Down` | Move between fields. |
-| `Tab` / `Shift+Tab` | Move between fields. |
-| `Home` / `End` | Jump to first or last field. |
-| `Enter` | Edit selected field. On `Name`, open location search mode. On `Arrays`, open the arrays editor. |
-| `l` | Open location search mode. |
+| `1` / `2` / `3` / `4` | Toggle System, Consumer, Simulation, or Estimate panels. At least one panel remains visible. |
+| `Tab` / `Shift+Tab` | Move focus between visible panels. |
+| `Left` / `Right` | Move focus between visible panels. |
+| `Up` / `Down` | Move between fields in the focused System panel. |
+| `Home` / `End` | Jump to first or last System field. |
+| `Enter` | Edit selected System field. On `Name`, open location search mode. On `Arrays`, open the arrays editor. |
+| `l` | Open location search mode when System is focused. |
 | `e` | Recompute estimate. |
-| `PageUp` / `PageDown` | Scroll the monthly estimate table. |
+| `PageUp` / `PageDown` | Scroll the monthly estimate table when Estimate is focused. |
 | `q` | Quit. |
 | `Ctrl+C` | Quit. |
 

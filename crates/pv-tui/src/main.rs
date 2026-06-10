@@ -60,12 +60,104 @@ struct TuiState {
     selected_location_id: String,
     location_query: String,
     fields: Vec<TuiFieldState>,
+    #[serde(default)]
+    panel_visibility: PanelVisibility,
+    #[serde(default)]
+    focused_panel: Panel,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TuiFieldState {
     label: String,
     value: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Panel {
+    System,
+    Consumer,
+    Simulation,
+    Estimate,
+}
+
+impl Default for Panel {
+    fn default() -> Self {
+        Self::System
+    }
+}
+
+impl Panel {
+    const ALL: [Self; 4] = [
+        Self::System,
+        Self::Consumer,
+        Self::Simulation,
+        Self::Estimate,
+    ];
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::System => "System",
+            Self::Consumer => "Consumer",
+            Self::Simulation => "Simulation",
+            Self::Estimate => "Estimate",
+        }
+    }
+
+    fn toggle_key(self) -> char {
+        match self {
+            Self::System => '1',
+            Self::Consumer => '2',
+            Self::Simulation => '3',
+            Self::Estimate => '4',
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct PanelVisibility {
+    system: bool,
+    consumer: bool,
+    simulation: bool,
+    estimate: bool,
+}
+
+impl Default for PanelVisibility {
+    fn default() -> Self {
+        Self {
+            system: true,
+            consumer: false,
+            simulation: false,
+            estimate: true,
+        }
+    }
+}
+
+impl PanelVisibility {
+    fn is_visible(self, panel: Panel) -> bool {
+        match panel {
+            Panel::System => self.system,
+            Panel::Consumer => self.consumer,
+            Panel::Simulation => self.simulation,
+            Panel::Estimate => self.estimate,
+        }
+    }
+
+    fn set_visible(&mut self, panel: Panel, visible: bool) {
+        match panel {
+            Panel::System => self.system = visible,
+            Panel::Consumer => self.consumer = visible,
+            Panel::Simulation => self.simulation = visible,
+            Panel::Estimate => self.estimate = visible,
+        }
+    }
+
+    fn visible_count(self) -> usize {
+        Panel::ALL
+            .iter()
+            .filter(|panel| self.is_visible(**panel))
+            .count()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +191,8 @@ struct App {
     array_editing: bool,
     array_cell: Field,
     estimate_scroll: usize,
+    panel_visibility: PanelVisibility,
+    focused_panel: Panel,
 }
 
 struct TerminalGuard;
@@ -192,6 +286,8 @@ impl App {
             array_editing: false,
             array_cell: Field::new("Array", ""),
             estimate_scroll: 0,
+            panel_visibility: PanelVisibility::default(),
+            focused_panel: Panel::System,
         }
     }
 
@@ -234,6 +330,9 @@ impl App {
         }
         self.selected_location_id = state.selected_location_id;
         self.location_query.set_value(&state.location_query);
+        self.panel_visibility = state.panel_visibility;
+        self.focused_panel = state.focused_panel;
+        self.ensure_panel_focus();
         self.refresh_location_results();
         self.status = format!("Loaded {}", path.display());
     }
@@ -255,6 +354,8 @@ impl App {
                     value: field.value.clone(),
                 })
                 .collect(),
+            panel_visibility: self.panel_visibility,
+            focused_panel: self.focused_panel,
         };
         let result = (|| -> Result<()> {
             if let Some(parent) = path.parent() {
@@ -267,6 +368,71 @@ impl App {
         if let Err(error) = result {
             self.status = format!("Could not save state: {error:#}");
         }
+    }
+
+    fn visible_panels(&self) -> Vec<Panel> {
+        Panel::ALL
+            .iter()
+            .copied()
+            .filter(|panel| self.panel_visibility.is_visible(*panel))
+            .collect()
+    }
+
+    fn ensure_panel_focus(&mut self) {
+        if self.panel_visibility.visible_count() == 0 {
+            self.panel_visibility.set_visible(Panel::System, true);
+        }
+        if !self.panel_visibility.is_visible(self.focused_panel) {
+            self.focused_panel = self
+                .visible_panels()
+                .first()
+                .copied()
+                .unwrap_or(Panel::System);
+        }
+    }
+
+    fn toggle_panel(&mut self, panel: Panel) {
+        let visible = self.panel_visibility.is_visible(panel);
+        if visible && self.panel_visibility.visible_count() == 1 {
+            self.status = "At least one panel must stay visible".to_string();
+            return;
+        }
+        self.panel_visibility.set_visible(panel, !visible);
+        if !visible {
+            self.focused_panel = panel;
+        }
+        self.ensure_panel_focus();
+        self.status = format!(
+            "{} panel {}",
+            panel.title(),
+            if visible { "hidden" } else { "shown" }
+        );
+    }
+
+    fn focus_panel(&mut self, panel: Panel) {
+        if self.panel_visibility.is_visible(panel) {
+            self.focused_panel = panel;
+            self.status = format!("{} panel focused", panel.title());
+        }
+    }
+
+    fn focus_next_panel(&mut self, direction: i32) {
+        let panels = self.visible_panels();
+        if panels.is_empty() {
+            self.ensure_panel_focus();
+            return;
+        }
+        let current = panels
+            .iter()
+            .position(|panel| *panel == self.focused_panel)
+            .unwrap_or(0);
+        let next = if direction < 0 {
+            current.checked_sub(1).unwrap_or(panels.len() - 1)
+        } else {
+            (current + 1) % panels.len()
+        };
+        self.focused_panel = panels[next];
+        self.status = format!("{} panel focused", self.focused_panel.title());
     }
 
     fn energy_price_eur_per_kwh(&self) -> Result<Option<f64>> {
@@ -650,18 +816,39 @@ fn handle_normal_key(
 ) -> Result<bool> {
     match key.code {
         KeyCode::Char('q') => return Ok(true),
-        KeyCode::Up => app.selected = app.selected.saturating_sub(1),
-        KeyCode::Down | KeyCode::Tab => app.selected = (app.selected + 1).min(app.fields.len() - 1),
-        KeyCode::BackTab => app.selected = app.selected.saturating_sub(1),
-        KeyCode::Home => app.selected = 0,
-        KeyCode::End => app.selected = app.fields.len() - 1,
-        KeyCode::Enter if app.fields[app.selected].label == "Name" => app.open_location_search(),
-        KeyCode::Enter if app.fields[app.selected].label == "Arrays" => app.open_array_editor(),
-        KeyCode::Enter => app.mode = Mode::Edit,
-        KeyCode::Char('l') => app.open_location_search(),
+        KeyCode::Char('1') if key.modifiers.is_empty() => app.toggle_panel(Panel::System),
+        KeyCode::Char('2') if key.modifiers.is_empty() => app.toggle_panel(Panel::Consumer),
+        KeyCode::Char('3') if key.modifiers.is_empty() => app.toggle_panel(Panel::Simulation),
+        KeyCode::Char('4') if key.modifiers.is_empty() => app.toggle_panel(Panel::Estimate),
+        KeyCode::Left | KeyCode::BackTab => app.focus_next_panel(-1),
+        KeyCode::Right | KeyCode::Tab => app.focus_next_panel(1),
+        KeyCode::Up if app.focused_panel == Panel::System => {
+            app.selected = app.selected.saturating_sub(1)
+        }
+        KeyCode::Down if app.focused_panel == Panel::System => {
+            app.selected = (app.selected + 1).min(app.fields.len() - 1)
+        }
+        KeyCode::Home if app.focused_panel == Panel::System => app.selected = 0,
+        KeyCode::End if app.focused_panel == Panel::System => app.selected = app.fields.len() - 1,
+        KeyCode::Enter
+            if app.focused_panel == Panel::System && app.fields[app.selected].label == "Name" =>
+        {
+            app.open_location_search()
+        }
+        KeyCode::Enter
+            if app.focused_panel == Panel::System && app.fields[app.selected].label == "Arrays" =>
+        {
+            app.open_array_editor()
+        }
+        KeyCode::Enter if app.focused_panel == Panel::System => app.mode = Mode::Edit,
+        KeyCode::Char('l') if app.focused_panel == Panel::System => app.open_location_search(),
         KeyCode::Char('e') => app.recompute(estimator),
-        KeyCode::PageDown => app.scroll_estimate_down(ESTIMATE_SCROLL_PAGE_ROWS),
-        KeyCode::PageUp => app.scroll_estimate_up(ESTIMATE_SCROLL_PAGE_ROWS),
+        KeyCode::PageDown if app.focused_panel == Panel::Estimate => {
+            app.scroll_estimate_down(ESTIMATE_SCROLL_PAGE_ROWS)
+        }
+        KeyCode::PageUp if app.focused_panel == Panel::Estimate => {
+            app.scroll_estimate_up(ESTIMATE_SCROLL_PAGE_ROWS)
+        }
         _ => {}
     }
     Ok(false)
@@ -732,8 +919,8 @@ fn handle_mouse(
     ) && app.mode != Mode::Location
         && app.mode != Mode::Arrays
     {
-        let estimate_area = main_estimate_area(vertical[0]);
-        if rect_contains(estimate_area, mouse.column, mouse.row) {
+        if let Some((Panel::Estimate, _)) = panel_at(vertical[0], app, mouse.column, mouse.row) {
+            app.focus_panel(Panel::Estimate);
             match mouse.kind {
                 MouseEventKind::ScrollDown => app.scroll_estimate_down(1),
                 MouseEventKind::ScrollUp => app.scroll_estimate_up(1),
@@ -787,19 +974,24 @@ fn handle_mouse(
         return Ok(());
     }
 
-    let body = main_body_areas(vertical[0]);
-    let fields_inner = Block::default().borders(Borders::ALL).inner(body[0]);
-    if mouse.column >= fields_inner.x
-        && mouse.column < fields_inner.x.saturating_add(fields_inner.width)
-        && mouse.row >= fields_inner.y
-    {
-        let row = mouse.row.saturating_sub(fields_inner.y) as usize;
-        if row < app.fields.len() {
-            app.selected = row;
-            match app.fields[row].label {
-                "Name" => app.open_location_search(),
-                "Arrays" => app.open_array_editor(),
-                _ => {}
+    let Some((panel, panel_area)) = panel_at(vertical[0], app, mouse.column, mouse.row) else {
+        return Ok(());
+    };
+    app.focus_panel(panel);
+    if panel == Panel::System {
+        let fields_inner = Block::default().borders(Borders::ALL).inner(panel_area);
+        if mouse.column >= fields_inner.x
+            && mouse.column < fields_inner.x.saturating_add(fields_inner.width)
+            && mouse.row >= fields_inner.y
+        {
+            let row = mouse.row.saturating_sub(fields_inner.y) as usize;
+            if row < app.fields.len() {
+                app.selected = row;
+                match app.fields[row].label {
+                    "Name" => app.open_location_search(),
+                    "Arrays" => app.open_array_editor(),
+                    _ => {}
+                }
             }
         }
     }
@@ -926,21 +1118,65 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
         return;
     }
 
-    let body = main_body_areas(vertical[0]);
-    render_fields(frame, body[0], app);
-    render_estimate(frame, body[1], app);
+    for (panel, panel_area) in panel_layout(vertical[0], app) {
+        render_panel(frame, panel_area, app, panel);
+    }
     render_footer(frame, vertical[1], app);
 }
 
-fn main_body_areas(area: Rect) -> std::rc::Rc<[Rect]> {
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(45), Constraint::Min(40)])
-        .split(area)
+fn panel_layout(area: Rect, app: &App) -> Vec<(Panel, Rect)> {
+    let left_panels = [Panel::System, Panel::Consumer]
+        .into_iter()
+        .filter(|panel| app.panel_visibility.is_visible(*panel))
+        .collect::<Vec<_>>();
+    let right_panels = [Panel::Simulation, Panel::Estimate]
+        .into_iter()
+        .filter(|panel| app.panel_visibility.is_visible(*panel))
+        .collect::<Vec<_>>();
+
+    match (left_panels.is_empty(), right_panels.is_empty()) {
+        (true, true) => vec![(Panel::System, area)],
+        (false, true) => stack_panel_column(area, &left_panels),
+        (true, false) => stack_panel_column(area, &right_panels),
+        (false, false) => {
+            let columns = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(area);
+            let mut output = stack_panel_column(columns[0], &left_panels);
+            output.extend(stack_panel_column(columns[1], &right_panels));
+            output
+        }
+    }
 }
 
-fn main_estimate_area(area: Rect) -> Rect {
-    main_body_areas(area)[1]
+fn stack_panel_column(area: Rect, panels: &[Panel]) -> Vec<(Panel, Rect)> {
+    match panels {
+        [] => Vec::new(),
+        [panel] => vec![(*panel, area)],
+        [top, bottom, ..] => {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(area);
+            vec![(*top, rows[0]), (*bottom, rows[1])]
+        }
+    }
+}
+
+fn panel_at(area: Rect, app: &App, column: u16, row: u16) -> Option<(Panel, Rect)> {
+    panel_layout(area, app)
+        .into_iter()
+        .find(|(_, panel_area)| rect_contains(*panel_area, column, row))
+}
+
+fn render_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App, panel: Panel) {
+    match panel {
+        Panel::System => render_fields(frame, area, app, app.focused_panel == panel),
+        Panel::Consumer => render_consumer(frame, area, app.focused_panel == panel),
+        Panel::Simulation => render_simulation(frame, area, app.focused_panel == panel),
+        Panel::Estimate => render_estimate(frame, area, app, app.focused_panel == panel),
+    }
 }
 
 fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
@@ -948,6 +1184,21 @@ fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
         && column < area.x.saturating_add(area.width)
         && row >= area.y
         && row < area.y.saturating_add(area.height)
+}
+
+fn panel_block(title: &'static str, toggle_key: char, focused: bool) -> Block<'static> {
+    let title = format!("[{toggle_key}] {title}");
+    let style = if focused {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(style)
 }
 
 fn estimate_metric_line(label: &'static str, value: String, value_style: Style) -> Line<'static> {
@@ -1013,8 +1264,8 @@ fn annual_revenue_line(document: &SourceEnsembleEstimateDocument, price: f64) ->
     )
 }
 
-fn render_fields(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let block = Block::default().borders(Borders::ALL).title("System");
+fn render_fields(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App, focused: bool) {
+    let block = panel_block("System", Panel::System.toggle_key(), focused);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1023,7 +1274,7 @@ fn render_fields(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         app.fields.len() + array_extra_lines as usize + app.location_results.len().min(6) + 3,
     );
     for (index, field) in app.fields.iter().enumerate() {
-        let selected = index == app.selected;
+        let selected = focused && index == app.selected;
         let style = match (selected, app.mode) {
             (true, Mode::Edit) => Style::default().fg(Color::Black).bg(Color::Yellow),
             (true, Mode::Normal) => Style::default().fg(Color::Black).bg(Color::Cyan),
@@ -1063,7 +1314,7 @@ fn render_fields(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     }
     frame.render_widget(Paragraph::new(lines), inner);
 
-    if app.mode == Mode::Edit {
+    if focused && app.mode == Mode::Edit {
         let field = &app.fields[app.selected];
         let value_view = field_value_view(field, field_value_width(inner), true);
         let y = inner.y.saturating_add(app.selected as u16);
@@ -1420,8 +1671,37 @@ fn field_value_view(field: &Field, max_width: usize, keep_cursor_visible: bool) 
     }
 }
 
-fn render_estimate(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let block = Block::default().borders(Borders::ALL).title("Estimate");
+fn render_consumer(frame: &mut ratatui::Frame<'_>, area: Rect, focused: bool) {
+    let block = panel_block("Consumer", Panel::Consumer.toggle_key(), focused);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(
+        Paragraph::new(vec![
+            estimate_metric_line("Annual kWh", "-".to_string(), Style::default()),
+            estimate_metric_line("Daily kWh", "-".to_string(), Style::default()),
+            estimate_metric_line("Shape", "residential_default".to_string(), Style::default()),
+        ]),
+        inner,
+    );
+}
+
+fn render_simulation(frame: &mut ratatui::Frame<'_>, area: Rect, focused: bool) {
+    let block = panel_block("Simulation", Panel::Simulation.toggle_key(), focused);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(
+        Paragraph::new(vec![
+            estimate_metric_line("Runs", "10000".to_string(), Style::default()),
+            estimate_metric_line("Import", "-".to_string(), Style::default()),
+            estimate_metric_line("Export", "-".to_string(), Style::default()),
+            estimate_metric_line("Self use", "-".to_string(), Style::default()),
+        ]),
+        inner,
+    );
+}
+
+fn render_estimate(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App, focused: bool) {
+    let block = panel_block("Estimate", Panel::Estimate.toggle_key(), focused);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1749,7 +2029,7 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let (mode, help) = match app.mode {
         Mode::Normal => (
             "NORMAL",
-            "arrows/tab select  enter edit  l locations  e estimate  q quit",
+            "1-4 panels  tab/arrows focus  up/down fields  enter edit  e estimate  q",
         ),
         Mode::Edit if app.fields[app.selected].label == "Arrays" => {
             ("EDIT", "enter/tab apply estimate  esc close edit")
@@ -1965,6 +2245,73 @@ mod tests {
     }
 
     #[test]
+    fn panel_visibility_defaults_to_system_and_estimate() {
+        let app = App::new();
+
+        assert_eq!(app.visible_panels(), vec![Panel::System, Panel::Estimate]);
+        assert_eq!(app.focused_panel, Panel::System);
+    }
+
+    #[test]
+    fn panel_toggles_keep_one_panel_visible_and_focus_new_panel() {
+        let mut app = App::new();
+        app.toggle_panel(Panel::Consumer);
+
+        assert!(app.panel_visibility.is_visible(Panel::Consumer));
+        assert_eq!(app.focused_panel, Panel::Consumer);
+
+        app.toggle_panel(Panel::System);
+        app.toggle_panel(Panel::Estimate);
+        app.toggle_panel(Panel::Consumer);
+
+        assert!(app.panel_visibility.is_visible(Panel::Consumer));
+        assert_eq!(app.status, "At least one panel must stay visible");
+    }
+
+    #[test]
+    fn panel_layout_adapts_to_visible_panel_count() {
+        let area = Rect::new(0, 0, 80, 22);
+        let mut app = App::new();
+
+        assert_eq!(panel_layout(area, &app).len(), 2);
+        app.toggle_panel(Panel::Consumer);
+        assert_eq!(panel_layout(area, &app).len(), 3);
+        app.toggle_panel(Panel::Simulation);
+        let layout = panel_layout(area, &app);
+        assert_eq!(layout.len(), 4);
+        assert_eq!(layout[0].0, Panel::System);
+        assert_eq!(layout[1].0, Panel::Consumer);
+        assert_eq!(layout[2].0, Panel::Simulation);
+        assert_eq!(layout[3].0, Panel::Estimate);
+        assert_eq!(layout[0].1.x, 0);
+        assert_eq!(layout[1].1.x, 0);
+        assert!(layout[1].1.y > layout[0].1.y);
+        assert!(layout[2].1.x > layout[0].1.x);
+        assert_eq!(layout[2].1.y, 0);
+        assert_eq!(layout[3].1.x, layout[2].1.x);
+        assert!(layout[3].1.y > layout[2].1.y);
+        app.toggle_panel(Panel::System);
+        app.toggle_panel(Panel::Estimate);
+        app.toggle_panel(Panel::Consumer);
+        assert_eq!(panel_layout(area, &app).len(), 1);
+    }
+
+    #[test]
+    fn panel_focus_cycles_with_visible_panel_order() {
+        let mut app = App::new();
+        app.toggle_panel(Panel::Consumer);
+        app.toggle_panel(Panel::Simulation);
+
+        app.focused_panel = Panel::System;
+        app.focus_next_panel(1);
+        assert_eq!(app.focused_panel, Panel::Consumer);
+        app.focus_next_panel(1);
+        assert_eq!(app.focused_panel, Panel::Simulation);
+        app.focus_next_panel(-1);
+        assert_eq!(app.focused_panel, Panel::Consumer);
+    }
+
+    #[test]
     fn default_layout_snapshot() {
         let app = App::new();
 
@@ -1996,6 +2343,15 @@ mod tests {
         app.fields[ARRAY_FIELD_INDEX].set_value("1.50,30,0; 2.25,20,-90; 3.75,15,90; 4.50,10,45");
 
         assert_snapshot("long_arrays_edit", &render_snapshot(&app));
+    }
+
+    #[test]
+    fn four_panel_layout_snapshot() {
+        let mut app = App::new();
+        app.toggle_panel(Panel::Consumer);
+        app.toggle_panel(Panel::Simulation);
+
+        assert_snapshot("four_panel_layout", &render_snapshot(&app));
     }
 
     #[test]
@@ -2252,6 +2608,8 @@ mod tests {
                     value: "2.0,30,0".to_string(),
                 },
             ],
+            panel_visibility: PanelVisibility::default(),
+            focused_panel: Panel::System,
         };
 
         for field in &mut app.fields {
