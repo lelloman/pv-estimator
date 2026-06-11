@@ -416,7 +416,7 @@ impl App {
                     std::cmp::Ordering::Equal => {}
                 }
             }
-            Panel::Consumer => match self.validate_consumer_fields() {
+            Panel::Consumer => match self.sync_consumer_energy_fields() {
                 Ok(()) => {
                     self.mode = Mode::Normal;
                     self.status = "Consumer updated".to_string();
@@ -543,7 +543,45 @@ impl App {
         }
     }
 
-    fn validate_consumer_fields(&self) -> Result<()> {
+    fn sync_consumer_energy_fields(&mut self) -> Result<()> {
+        let _ = consumer_load_shape(&self.consumer_fields[CONSUMER_SHAPE_FIELD_INDEX])?;
+        match self.consumer_selected {
+            CONSUMER_ANNUAL_FIELD_INDEX => {
+                let annual_kwh =
+                    parse_positive_f64(&self.consumer_fields[CONSUMER_ANNUAL_FIELD_INDEX])?;
+                let daily_kwh = annual_kwh / 365.0;
+                self.consumer_fields[CONSUMER_DAILY_FIELD_INDEX]
+                    .set_value(&format_energy_field_value(daily_kwh));
+            }
+            CONSUMER_DAILY_FIELD_INDEX => {
+                let daily_kwh =
+                    parse_positive_f64(&self.consumer_fields[CONSUMER_DAILY_FIELD_INDEX])?;
+                let annual_kwh = daily_kwh * 365.0;
+                self.consumer_fields[CONSUMER_ANNUAL_FIELD_INDEX]
+                    .set_value(&format_energy_field_value(annual_kwh));
+            }
+            CONSUMER_SHAPE_FIELD_INDEX => {
+                let annual = parse_optional_positive_f64(
+                    &self.consumer_fields[CONSUMER_ANNUAL_FIELD_INDEX],
+                )?;
+                let daily =
+                    parse_optional_positive_f64(&self.consumer_fields[CONSUMER_DAILY_FIELD_INDEX])?;
+                match (annual, daily) {
+                    (Some(annual_kwh), _) => {
+                        self.consumer_fields[CONSUMER_DAILY_FIELD_INDEX]
+                            .set_value(&format_energy_field_value(annual_kwh / 365.0));
+                    }
+                    (None, Some(daily_kwh)) => {
+                        self.consumer_fields[CONSUMER_ANNUAL_FIELD_INDEX]
+                            .set_value(&format_energy_field_value(daily_kwh * 365.0));
+                    }
+                    (None, None) => {
+                        anyhow::bail!("Consumer Annual kWh or Daily kWh is required");
+                    }
+                }
+            }
+            _ => {}
+        }
         let _ = self.consumer_load_profile()?;
         Ok(())
     }
@@ -554,12 +592,9 @@ impl App {
             parse_optional_positive_f64(&self.consumer_fields[CONSUMER_ANNUAL_FIELD_INDEX])?;
         let daily = parse_optional_positive_f64(&self.consumer_fields[CONSUMER_DAILY_FIELD_INDEX])?;
         match (annual, daily) {
-            (Some(_), Some(_)) => {
-                anyhow::bail!("Consumer Annual kWh and Daily kWh cannot both be set")
-            }
-            (None, None) => anyhow::bail!("Consumer Annual kWh or Daily kWh is required"),
-            (Some(annual_kwh), None) => Ok(LoadProfile::AnnualKwh { annual_kwh, shape }),
+            (Some(annual_kwh), _) => Ok(LoadProfile::AnnualKwh { annual_kwh, shape }),
             (None, Some(daily_kwh)) => Ok(LoadProfile::DailyKwh { daily_kwh, shape }),
+            (None, None) => anyhow::bail!("Consumer Annual kWh or Daily kWh is required"),
         }
     }
 
@@ -809,6 +844,11 @@ fn parse_optional_f64(field: &Field) -> Result<Option<f64>> {
         .with_context(|| format!("{} must be empty or a number", field.label))
 }
 
+fn parse_positive_f64(field: &Field) -> Result<f64> {
+    parse_optional_positive_f64(field)?
+        .ok_or_else(|| anyhow::anyhow!("{} must be positive", field.label))
+}
+
 fn parse_optional_positive_f64(field: &Field) -> Result<Option<f64>> {
     let Some(value) = parse_optional_f64(field)? else {
         return Ok(None);
@@ -817,6 +857,15 @@ fn parse_optional_positive_f64(field: &Field) -> Result<Option<f64>> {
         anyhow::bail!("{} must be empty or positive", field.label);
     }
     Ok(Some(value))
+}
+
+fn format_energy_field_value(value: f64) -> String {
+    let rounded = (value * 100.0).round() / 100.0;
+    if (rounded - rounded.round()).abs() < 1.0e-9 {
+        format!("{rounded:.0}")
+    } else {
+        format!("{rounded:.2}")
+    }
 }
 
 fn consumer_load_shape(field: &Field) -> Result<LoadShape> {
@@ -2436,11 +2485,17 @@ mod tests {
     }
 
     #[test]
-    fn consumer_load_profile_rejects_conflicting_energy_fields() {
+    fn consumer_load_profile_prefers_annual_when_both_energy_fields_are_set() {
         let mut app = App::new();
         app.consumer_fields[CONSUMER_DAILY_FIELD_INDEX].set_value("12");
 
-        assert!(app.consumer_load_profile().is_err());
+        assert!(matches!(
+            app.consumer_load_profile().expect("annual profile"),
+            LoadProfile::AnnualKwh {
+                annual_kwh: 4200.0,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -2456,6 +2511,39 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn consumer_annual_edit_updates_daily_energy() {
+        let mut app = App::new();
+        app.focused_panel = Panel::Consumer;
+        app.consumer_selected = CONSUMER_ANNUAL_FIELD_INDEX;
+        app.mode = Mode::Edit;
+        app.consumer_fields[CONSUMER_ANNUAL_FIELD_INDEX].set_value("3650");
+        let mut estimator = SourceModelEstimator::load_embedded().expect("embedded estimator");
+
+        app.apply_active_edit(&mut estimator, 0);
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.consumer_fields[CONSUMER_DAILY_FIELD_INDEX].value, "10");
+    }
+
+    #[test]
+    fn consumer_daily_edit_updates_annual_energy() {
+        let mut app = App::new();
+        app.focused_panel = Panel::Consumer;
+        app.consumer_selected = CONSUMER_DAILY_FIELD_INDEX;
+        app.mode = Mode::Edit;
+        app.consumer_fields[CONSUMER_DAILY_FIELD_INDEX].set_value("12");
+        let mut estimator = SourceModelEstimator::load_embedded().expect("embedded estimator");
+
+        app.apply_active_edit(&mut estimator, 0);
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(
+            app.consumer_fields[CONSUMER_ANNUAL_FIELD_INDEX].value,
+            "4380"
+        );
     }
 
     #[test]

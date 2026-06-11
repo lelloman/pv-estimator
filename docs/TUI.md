@@ -54,8 +54,8 @@ Consumer panel fields:
 
 | Field | Meaning |
 | --- | --- |
-| `Annual kWh` | Annual household consumption. Leave empty when using `Daily kWh`. |
-| `Daily kWh` | Daily household consumption. Leave empty when using `Annual kWh`. |
+| `Annual kWh` | Annual household consumption. Updating it refreshes `Daily kWh`. |
+| `Daily kWh` | Daily household consumption. Updating it refreshes `Annual kWh`. |
 | `Shape` | Load shape identifier. Currently `residential_default`. |
 
 Editing `Name`, `Region`, `Latitude`, or `Longitude` marks the location as
