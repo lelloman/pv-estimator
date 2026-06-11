@@ -82,11 +82,12 @@ Normal mode:
 | `1` / `2` / `3` / `4` | Toggle System, Consumer, Simulation, or Estimate panels. At least one panel remains visible. |
 | `Tab` / `Shift+Tab` | Move focus between visible panels. |
 | `Left` / `Right` | Move focus between visible panels. |
-| `Up` / `Down` | Move between fields in the focused System or Consumer panel. |
-| `Home` / `End` | Jump to first or last field in the focused System or Consumer panel. |
-| `Enter` | Edit the selected field. On `Name`, open location search mode. On `Arrays`, open the arrays editor. On Consumer `Shape`, open the shape editor. |
+| `Up` / `Down` | Move between rows in the focused System, Consumer, or Simulation panel. |
+| `Home` / `End` | Jump to first or last row in the focused System, Consumer, or Simulation panel. |
+| `Enter` | Edit the selected field. On `Name`, open location search mode. On `Arrays`, open the arrays editor. On Consumer `Shape`, open the shape editor. On Simulation `Run`, open the run screen. |
 | `l` | Open location search mode when System is focused. |
 | `e` | Recompute estimate. |
+| `r` | Run simulation from the current System and Consumer inputs. |
 | `PageUp` / `PageDown` | Scroll the monthly estimate table when Estimate is focused. |
 | `q` / `Esc` | Quit from normal mode. |
 | `Ctrl+C` | Quit. |
@@ -138,6 +139,12 @@ Location mode:
 | `Backspace` / `Delete` | Remove query text and refresh results. |
 | `Enter` | Apply selected city and recompute. |
 | `Esc` | Return to normal mode. |
+
+## Simulation Panel
+
+The Simulation panel uses the current system arrays, consumer load profile, and optional `Storage kWh` value. It has editable `Runs` and `Seed` fields plus a `Run` row. Leave `Seed` empty for the default stochastic seed.
+
+Press `r` from normal mode, or focus the Simulation panel, select `Run`, and press `Enter`. The run opens a dedicated progress screen with completed runs, progress, elapsed time, and ETA. Press `Esc` or `c` while running to cancel; completed or cancelled runs return partial or final summaries to the Simulation panel. Results show mean values with `p10..p90` bands.
 
 ## Estimate Table
 

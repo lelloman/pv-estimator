@@ -138,12 +138,20 @@ impl fmt::Display for SimulationError {
 impl Error for SimulationError {}
 
 pub fn simulate(request: &SimulationRequest) -> Result<SimulationResult, SimulationError> {
-    simulate_with_cancellation(request, || false)
+    simulate_with_progress(request, || false, |_| {})
 }
 
 pub fn simulate_with_cancellation(
     request: &SimulationRequest,
+    cancelled: impl FnMut() -> bool,
+) -> Result<SimulationResult, SimulationError> {
+    simulate_with_progress(request, cancelled, |_| {})
+}
+
+pub fn simulate_with_progress(
+    request: &SimulationRequest,
     mut cancelled: impl FnMut() -> bool,
+    mut progress: impl FnMut(usize),
 ) -> Result<SimulationResult, SimulationError> {
     validate_request(request)?;
     let load = hourly_load_profile(&request.load)?;
@@ -165,6 +173,7 @@ pub fn simulate_with_cancellation(
         }
         let production = stochastic_hourly_production(&request.production, &mut rng);
         runs.push(dispatch_run(&production, &load, capacity));
+        progress(runs.len());
     }
 
     Ok(SimulationResult {
@@ -560,6 +569,18 @@ mod tests {
 
         assert!(result.cancelled);
         assert_eq!(result.completed_runs, 1);
+    }
+
+    #[test]
+    fn progress_reports_completed_runs() {
+        let request = request(flat_profile(100.0), None);
+        let expected_runs = request.options.runs;
+        let mut completed = Vec::new();
+        let result = simulate_with_progress(&request, || false, |runs| completed.push(runs))
+            .expect("simulation succeeds");
+
+        assert_eq!(result.completed_runs, expected_runs);
+        assert_eq!(completed, (1..=expected_runs).collect::<Vec<_>>());
     }
 
     #[test]

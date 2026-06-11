@@ -1,8 +1,10 @@
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -15,7 +17,10 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, size,
 };
 use directories::ProjectDirs;
-use pv_core::simulation::{BuiltInLoadShapeId, LoadProfile, LoadShape};
+use pv_core::simulation::{
+    BuiltInLoadShapeId, LoadProfile, LoadShape, MetricSummary, SimulationMetricSummaries,
+    SimulationOptions, SimulationRequest, SimulationResult, StorageConfig, simulate_with_progress,
+};
 use pv_core::source_model::SourceEnsembleEstimateDocument;
 use pv_data::CitySearchResult;
 use pv_model::{
@@ -47,6 +52,9 @@ const FIELD_LABEL_WIDTH: u16 = 13;
 const CONSUMER_ANNUAL_FIELD_INDEX: usize = 0;
 const CONSUMER_DAILY_FIELD_INDEX: usize = 1;
 const CONSUMER_SHAPE_FIELD_INDEX: usize = 2;
+const SIMULATION_RUNS_FIELD_INDEX: usize = 0;
+const SIMULATION_SEED_FIELD_INDEX: usize = 1;
+const SIMULATION_RUN_ROW_INDEX: usize = 2;
 const ESTIMATE_LABEL_WIDTH: usize = 11;
 const SEARCH_LABEL_WIDTH: u16 = 8;
 const LOCATION_RESULT_HEADER_ROWS: u16 = 3;
@@ -96,6 +104,8 @@ struct TuiState {
     consumer_fields: Vec<TuiFieldState>,
     #[serde(default)]
     consumer_shape: ConsumerShapeState,
+    #[serde(default)]
+    simulation_fields: Vec<TuiFieldState>,
     #[serde(default)]
     panel_visibility: PanelVisibility,
     #[serde(default)]
@@ -203,6 +213,7 @@ enum Mode {
     Location,
     Arrays,
     Shape,
+    SimulationRun,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -268,11 +279,15 @@ struct Field {
 struct App {
     fields: Vec<Field>,
     consumer_fields: Vec<Field>,
+    simulation_fields: Vec<Field>,
     selected: usize,
     consumer_selected: usize,
+    simulation_selected: usize,
     mode: Mode,
     status: String,
     estimate: Option<SourceEnsembleEstimateDocument>,
+    simulation_result: Option<SimulationResult>,
+    simulation_run: Option<SimulationRunState>,
     selected_location_id: String,
     location_query: Field,
     location_results: Vec<CitySearchResult>,
@@ -290,6 +305,19 @@ struct App {
     estimate_scroll: usize,
     panel_visibility: PanelVisibility,
     focused_panel: Panel,
+}
+
+#[derive(Debug)]
+struct SimulationRunState {
+    requested_runs: usize,
+    completed_runs: Arc<AtomicUsize>,
+    cancel: Arc<AtomicBool>,
+    started_at: Instant,
+    finished_at: Option<Instant>,
+    receiver: mpsc::Receiver<Result<SimulationResult, String>>,
+    finished: bool,
+    cancelling: bool,
+    error: Option<String>,
 }
 
 struct TerminalGuard;
@@ -341,6 +369,7 @@ fn run_app(
     estimator: &mut SourceModelEstimator,
 ) -> Result<()> {
     loop {
+        app.poll_simulation_run();
         terminal.draw(|frame| render(frame, app))?;
         if event::poll(Duration::from_millis(200))? {
             match event::read()? {
@@ -375,11 +404,15 @@ impl App {
                 Field::new("Daily kWh", ""),
                 Field::new("Shape", "residential_default"),
             ],
+            simulation_fields: vec![Field::new("Runs", "10000"), Field::new("Seed", "")],
             selected: 2,
             consumer_selected: 0,
+            simulation_selected: 0,
             mode: Mode::Normal,
             status: "Ready".to_string(),
             estimate: None,
+            simulation_result: None,
+            simulation_run: None,
             selected_location_id: "custom".to_string(),
             location_query: Field::new("Find", ""),
             location_results: Vec::new(),
@@ -401,6 +434,7 @@ impl App {
     }
 
     fn recompute(&mut self, estimator: &mut SourceModelEstimator) {
+        self.simulation_result = None;
         match self
             .energy_price_eur_per_kwh()
             .and_then(|_| self.request_and_arrays())
@@ -450,6 +484,15 @@ impl App {
         self.location_query.set_value(&state.location_query);
         self.consumer_shape = state.consumer_shape;
         self.sync_consumer_shape_field();
+        for field in &mut self.simulation_fields {
+            if let Some(saved) = state
+                .simulation_fields
+                .iter()
+                .find(|saved| saved.label == field.label)
+            {
+                field.set_value(&saved.value);
+            }
+        }
         self.panel_visibility = state.panel_visibility;
         self.focused_panel = state.focused_panel;
         self.ensure_panel_focus();
@@ -483,6 +526,14 @@ impl App {
                 })
                 .collect(),
             consumer_shape: self.consumer_shape.clone(),
+            simulation_fields: self
+                .simulation_fields
+                .iter()
+                .map(|field| TuiFieldState {
+                    label: field.label.to_string(),
+                    value: field.value.clone(),
+                })
+                .collect(),
             panel_visibility: self.panel_visibility,
             focused_panel: self.focused_panel,
         };
@@ -517,6 +568,7 @@ impl App {
             Panel::Consumer => match self.sync_consumer_energy_fields() {
                 Ok(()) => {
                     self.mode = Mode::Normal;
+                    self.simulation_result = None;
                     self.status = "Consumer updated".to_string();
                     self.save_state();
                     match movement.cmp(&0) {
@@ -526,6 +578,27 @@ impl App {
                         }
                         std::cmp::Ordering::Less => {
                             self.consumer_selected = self.consumer_selected.saturating_sub(1);
+                        }
+                        std::cmp::Ordering::Equal => {}
+                    }
+                }
+                Err(error) => {
+                    self.status = format!("{error:#}");
+                }
+            },
+            Panel::Simulation => match self.simulation_options() {
+                Ok(_) => {
+                    self.mode = Mode::Normal;
+                    self.simulation_result = None;
+                    self.status = "Simulation options updated".to_string();
+                    self.save_state();
+                    match movement.cmp(&0) {
+                        std::cmp::Ordering::Greater => {
+                            self.simulation_selected =
+                                (self.simulation_selected + 1).min(SIMULATION_RUN_ROW_INDEX);
+                        }
+                        std::cmp::Ordering::Less => {
+                            self.simulation_selected = self.simulation_selected.saturating_sub(1);
                         }
                         std::cmp::Ordering::Equal => {}
                     }
@@ -640,6 +713,10 @@ impl App {
                 Some(&mut self.consumer_fields[self.consumer_selected])
             }
             Panel::Consumer => None,
+            Panel::Simulation if self.simulation_selected < self.simulation_fields.len() => {
+                Some(&mut self.simulation_fields[self.simulation_selected])
+            }
+            Panel::Simulation => None,
             _ => None,
         }
     }
@@ -695,6 +772,144 @@ impl App {
             (Some(annual_kwh), _) => Ok(LoadProfile::AnnualKwh { annual_kwh, shape }),
             (None, Some(daily_kwh)) => Ok(LoadProfile::DailyKwh { daily_kwh, shape }),
             (None, None) => anyhow::bail!("Consumer Annual kWh or Daily kWh is required"),
+        }
+    }
+
+    fn simulation_options(&self) -> Result<SimulationOptions> {
+        let runs = self.simulation_fields[SIMULATION_RUNS_FIELD_INDEX]
+            .value
+            .trim()
+            .parse::<usize>()
+            .with_context(|| "Runs must be a positive integer")?;
+        if runs == 0 {
+            anyhow::bail!("Runs must be a positive integer");
+        }
+        let seed_value = self.simulation_fields[SIMULATION_SEED_FIELD_INDEX]
+            .value
+            .trim();
+        let seed = if seed_value.is_empty() {
+            None
+        } else {
+            Some(
+                seed_value
+                    .parse::<u64>()
+                    .with_context(|| "Seed must be empty or a non-negative integer")?,
+            )
+        };
+        Ok(SimulationOptions { runs, seed })
+    }
+
+    fn simulation_request(
+        &self,
+        estimator: &mut SourceModelEstimator,
+    ) -> Result<SimulationRequest> {
+        let (request, arrays) = self.request_and_arrays()?;
+        let production = estimator.production_profile_arrays(&request, &arrays)?;
+        let load = self.consumer_load_profile()?;
+        let storage = self
+            .storage_usable_kwh()?
+            .map(|usable_capacity_kwh| StorageConfig {
+                usable_capacity_kwh,
+            });
+        Ok(SimulationRequest {
+            production,
+            load,
+            storage,
+            options: self.simulation_options()?,
+        })
+    }
+
+    fn start_simulation_run(&mut self, estimator: &mut SourceModelEstimator) {
+        self.simulation_result = None;
+        let request = match self.simulation_request(estimator) {
+            Ok(request) => request,
+            Err(error) => {
+                self.status = format!("{error:#}");
+                return;
+            }
+        };
+        let requested_runs = request.options.runs;
+        let completed_runs = Arc::new(AtomicUsize::new(0));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let thread_completed = Arc::clone(&completed_runs);
+        let thread_cancel = Arc::clone(&cancel);
+        let (sender, receiver) = mpsc::channel();
+
+        thread::spawn(move || {
+            let result = simulate_with_progress(
+                &request,
+                || thread_cancel.load(Ordering::Relaxed),
+                |runs| thread_completed.store(runs, Ordering::Relaxed),
+            )
+            .map_err(|error| error.to_string());
+            let _ = sender.send(result);
+        });
+
+        self.simulation_run = Some(SimulationRunState {
+            requested_runs,
+            completed_runs,
+            cancel,
+            started_at: Instant::now(),
+            finished_at: None,
+            receiver,
+            finished: false,
+            cancelling: false,
+            error: None,
+        });
+        self.mode = Mode::SimulationRun;
+        self.status = "Simulation running".to_string();
+    }
+
+    fn poll_simulation_run(&mut self) {
+        let Some(run) = self.simulation_run.as_mut() else {
+            return;
+        };
+        if run.finished {
+            return;
+        }
+        let message = match run.receiver.try_recv() {
+            Ok(message) => message,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                run.finished = true;
+                run.finished_at = Some(Instant::now());
+                run.error = Some("Simulation worker disconnected".to_string());
+                self.status = "Simulation failed".to_string();
+                return;
+            }
+        };
+        run.finished = true;
+        run.finished_at = Some(Instant::now());
+        match message {
+            Ok(result) => {
+                run.completed_runs
+                    .store(result.completed_runs, Ordering::Relaxed);
+                self.status = if result.cancelled {
+                    "Simulation cancelled".to_string()
+                } else {
+                    "Simulation completed".to_string()
+                };
+                self.simulation_result = Some(result);
+            }
+            Err(error) => {
+                run.error = Some(error);
+                self.status = "Simulation failed".to_string();
+            }
+        }
+    }
+
+    fn cancel_or_close_simulation_run(&mut self) {
+        let Some(run) = self.simulation_run.as_mut() else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        if run.finished {
+            self.mode = Mode::Normal;
+            self.simulation_run = None;
+        } else {
+            run.cancelling = true;
+            run.cancel.store(true, Ordering::Relaxed);
+            self.status = "Cancelling simulation".to_string();
         }
     }
 
@@ -790,6 +1005,7 @@ impl App {
 
     fn set_shape_preset(&mut self, shape_id: BuiltInLoadShapeId) {
         self.consumer_shape = ConsumerShapeState::BuiltIn { shape_id };
+        self.simulation_result = None;
         self.shape_editing = false;
         self.shape_preset_selecting = false;
         self.sync_consumer_shape_field();
@@ -840,6 +1056,7 @@ impl App {
                 weights: self.consumer_shape.weights(),
             };
         }
+        self.simulation_result = None;
         self.shape_editing = false;
         self.shape_preset_selecting = false;
         self.sync_consumer_shape_field();
@@ -890,6 +1107,7 @@ impl App {
             return;
         }
         *weights = next;
+        self.simulation_result = None;
         self.shape_editing = false;
         self.sync_consumer_shape_field();
         self.status = "Shape weight updated".to_string();
@@ -1232,6 +1450,7 @@ fn handle_key(key: KeyEvent, app: &mut App, estimator: &mut SourceModelEstimator
         Mode::Location => handle_location_key(key, app, estimator),
         Mode::Arrays => handle_arrays_key(key, app, estimator),
         Mode::Shape => handle_shape_key(key, app),
+        Mode::SimulationRun => handle_simulation_run_key(key, app),
     }
 }
 
@@ -1260,11 +1479,21 @@ fn handle_normal_key(
         KeyCode::Down if app.focused_panel == Panel::Consumer => {
             app.consumer_selected = (app.consumer_selected + 1).min(app.consumer_fields.len() - 1)
         }
+        KeyCode::Up if app.focused_panel == Panel::Simulation => {
+            app.simulation_selected = app.simulation_selected.saturating_sub(1)
+        }
+        KeyCode::Down if app.focused_panel == Panel::Simulation => {
+            app.simulation_selected = (app.simulation_selected + 1).min(SIMULATION_RUN_ROW_INDEX)
+        }
         KeyCode::Home if app.focused_panel == Panel::System => app.selected = 0,
         KeyCode::End if app.focused_panel == Panel::System => app.selected = app.fields.len() - 1,
         KeyCode::Home if app.focused_panel == Panel::Consumer => app.consumer_selected = 0,
         KeyCode::End if app.focused_panel == Panel::Consumer => {
             app.consumer_selected = app.consumer_fields.len() - 1
+        }
+        KeyCode::Home if app.focused_panel == Panel::Simulation => app.simulation_selected = 0,
+        KeyCode::End if app.focused_panel == Panel::Simulation => {
+            app.simulation_selected = SIMULATION_RUN_ROW_INDEX
         }
         KeyCode::Enter
             if app.focused_panel == Panel::System && app.fields[app.selected].label == "Name" =>
@@ -1284,8 +1513,16 @@ fn handle_normal_key(
         }
         KeyCode::Enter if app.focused_panel == Panel::System => app.mode = Mode::Edit,
         KeyCode::Enter if app.focused_panel == Panel::Consumer => app.mode = Mode::Edit,
+        KeyCode::Enter
+            if app.focused_panel == Panel::Simulation
+                && app.simulation_selected == SIMULATION_RUN_ROW_INDEX =>
+        {
+            app.start_simulation_run(estimator)
+        }
+        KeyCode::Enter if app.focused_panel == Panel::Simulation => app.mode = Mode::Edit,
         KeyCode::Char('l') if app.focused_panel == Panel::System => app.open_location_search(),
         KeyCode::Char('e') => app.recompute(estimator),
+        KeyCode::Char('r') if key.modifiers.is_empty() => app.start_simulation_run(estimator),
         KeyCode::PageDown if app.focused_panel == Panel::Estimate => {
             app.scroll_estimate_down(ESTIMATE_SCROLL_PAGE_ROWS)
         }
@@ -1370,6 +1607,7 @@ fn handle_mouse(
     ) && app.mode != Mode::Location
         && app.mode != Mode::Arrays
         && app.mode != Mode::Shape
+        && app.mode != Mode::SimulationRun
     {
         if let Some((Panel::Estimate, _)) = panel_at(vertical[0], app, mouse.column, mouse.row) {
             app.focus_panel(Panel::Estimate);
@@ -1449,6 +1687,11 @@ fn handle_mouse(
         return Ok(());
     }
 
+    if app.mode == Mode::SimulationRun {
+        app.cancel_or_close_simulation_run();
+        return Ok(());
+    }
+
     let Some((panel, panel_area)) = panel_at(vertical[0], app, mouse.column, mouse.row) else {
         return Ok(());
     };
@@ -1480,6 +1723,22 @@ fn handle_mouse(
                 app.consumer_selected = row;
                 if row == CONSUMER_SHAPE_FIELD_INDEX {
                     app.open_shape_editor();
+                } else {
+                    app.mode = Mode::Edit;
+                }
+            }
+        }
+    } else if panel == Panel::Simulation {
+        let fields_inner = Block::default().borders(Borders::ALL).inner(panel_area);
+        if mouse.column >= fields_inner.x
+            && mouse.column < fields_inner.x.saturating_add(fields_inner.width)
+            && mouse.row >= fields_inner.y
+        {
+            let row = mouse.row.saturating_sub(fields_inner.y) as usize;
+            if row <= SIMULATION_RUN_ROW_INDEX {
+                app.simulation_selected = row;
+                if row == SIMULATION_RUN_ROW_INDEX {
+                    app.start_simulation_run(estimator);
                 } else {
                     app.mode = Mode::Edit;
                 }
@@ -1657,6 +1916,23 @@ fn handle_shape_key(key: KeyEvent, app: &mut App) -> Result<bool> {
     Ok(false)
 }
 
+fn handle_simulation_run_key(key: KeyEvent, app: &mut App) -> Result<bool> {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('c') => app.cancel_or_close_simulation_run(),
+        KeyCode::Enter
+            if app
+                .simulation_run
+                .as_ref()
+                .map(|run| run.finished)
+                .unwrap_or(false) =>
+        {
+            app.cancel_or_close_simulation_run()
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
 fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
     let area = frame.area();
     let vertical = Layout::default()
@@ -1676,6 +1952,11 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
     }
     if app.mode == Mode::Shape {
         render_shape_editor(frame, vertical[0], app);
+        render_footer(frame, vertical[1], app);
+        return;
+    }
+    if app.mode == Mode::SimulationRun {
+        render_simulation_run(frame, vertical[0], app);
         render_footer(frame, vertical[1], app);
         return;
     }
@@ -1736,7 +2017,7 @@ fn render_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App, panel: Pa
     match panel {
         Panel::System => render_fields(frame, area, app, app.focused_panel == panel),
         Panel::Consumer => render_consumer(frame, area, app, app.focused_panel == panel),
-        Panel::Simulation => render_simulation(frame, area, app.focused_panel == panel),
+        Panel::Simulation => render_simulation(frame, area, app, app.focused_panel == panel),
         Panel::Estimate => render_estimate(frame, area, app, app.focused_panel == panel),
     }
 }
@@ -2467,19 +2748,275 @@ fn render_consumer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App, focuse
     }
 }
 
-fn render_simulation(frame: &mut ratatui::Frame<'_>, area: Rect, focused: bool) {
+fn render_simulation(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App, focused: bool) {
     let block = panel_block("Simulation", Panel::Simulation.toggle_key(), focused);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    frame.render_widget(
-        Paragraph::new(vec![
-            estimate_metric_line("Runs", "10000".to_string(), Style::default()),
-            estimate_metric_line("Import", "-".to_string(), Style::default()),
-            estimate_metric_line("Export", "-".to_string(), Style::default()),
-            estimate_metric_line("Self use", "-".to_string(), Style::default()),
-        ]),
-        inner,
+
+    let value_width = field_value_width(inner);
+    let mut lines = app
+        .simulation_fields
+        .iter()
+        .enumerate()
+        .map(|(index, field)| simulation_field_line(app, focused, index, field, value_width))
+        .collect::<Vec<_>>();
+    lines.push(simulation_run_line(app, focused, value_width));
+    lines.push(Line::from(""));
+    lines.extend(
+        app.simulation_result
+            .as_ref()
+            .map(simulation_result_lines)
+            .unwrap_or_else(simulation_empty_lines),
     );
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+
+    if focused && app.mode == Mode::Edit && app.simulation_selected < app.simulation_fields.len() {
+        let field = &app.simulation_fields[app.simulation_selected];
+        let value_view = field_value_view(field, value_width, true);
+        let y = inner.y.saturating_add(app.simulation_selected as u16);
+        let x = inner
+            .x
+            .saturating_add(FIELD_LABEL_WIDTH)
+            .saturating_add(value_view.cursor_col.min(u16::MAX as usize) as u16);
+        frame.set_cursor_position(Position::new(x, y));
+    }
+}
+
+fn simulation_field_line(
+    app: &App,
+    focused: bool,
+    index: usize,
+    field: &Field,
+    value_width: usize,
+) -> Line<'static> {
+    let selected = focused && app.simulation_selected == index;
+    let style = match (selected, app.mode) {
+        (true, Mode::Edit) => Style::default().fg(Color::Black).bg(Color::Yellow),
+        (true, Mode::Normal) => Style::default().fg(Color::Black).bg(Color::Cyan),
+        _ => Style::default(),
+    };
+    let label_style = if selected {
+        style
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let value = if index == SIMULATION_SEED_FIELD_INDEX && field.value.trim().is_empty() {
+        "default".to_string()
+    } else {
+        field_value_view(field, value_width, selected).value
+    };
+    Line::from(vec![
+        Span::styled(
+            format!(
+                "{:<width$}",
+                field.label,
+                width = FIELD_LABEL_WIDTH as usize
+            ),
+            label_style,
+        ),
+        Span::styled(format!("{:<width$}", value, width = value_width), style),
+    ])
+}
+
+fn simulation_run_line(app: &App, focused: bool, value_width: usize) -> Line<'static> {
+    let selected = focused && app.simulation_selected == SIMULATION_RUN_ROW_INDEX;
+    let style = if selected {
+        Style::default().fg(Color::Black).bg(Color::Cyan)
+    } else {
+        Style::default()
+    };
+    let label_style = if selected {
+        style
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    Line::from(vec![
+        Span::styled(
+            format!("{:<width$}", "Run", width = FIELD_LABEL_WIDTH as usize),
+            label_style,
+        ),
+        Span::styled(format!("{:<width$}", "[Run]", width = value_width), style),
+    ])
+}
+
+fn simulation_empty_lines() -> Vec<Line<'static>> {
+    vec![
+        estimate_metric_line(
+            "Status",
+            "Select Run or press r".to_string(),
+            Style::default(),
+        ),
+        estimate_metric_line("Import", "-".to_string(), Style::default()),
+        estimate_metric_line("Export", "-".to_string(), Style::default()),
+        estimate_metric_line("Self use", "-".to_string(), Style::default()),
+    ]
+}
+
+fn simulation_result_lines(result: &SimulationResult) -> Vec<Line<'static>> {
+    let summaries = &result.summaries;
+    vec![
+        estimate_metric_line(
+            "Import",
+            format_kwh_summary(summaries.grid_import_kwh),
+            Style::default().fg(Color::Green),
+        ),
+        estimate_metric_line(
+            "Export",
+            format_kwh_summary(summaries.grid_export_kwh),
+            Style::default(),
+        ),
+        estimate_metric_line(
+            "Self use",
+            format_kwh_summary(summaries.self_consumed_kwh),
+            Style::default(),
+        ),
+        estimate_metric_line(
+            "Self suff",
+            format_ratio_summary(summaries.self_sufficiency_ratio),
+            Style::default().fg(Color::Green),
+        ),
+        estimate_metric_line(
+            "Self cons",
+            format_ratio_summary(summaries.self_consumption_ratio),
+            Style::default(),
+        ),
+        estimate_metric_line(
+            "Losses",
+            format_kwh_summary(summaries.battery_losses_kwh),
+            Style::default(),
+        ),
+    ]
+}
+
+fn format_kwh_summary(summary: MetricSummary) -> String {
+    format!(
+        "{:.0} ({:.0}..{:.0}) kWh",
+        summary.mean, summary.p10, summary.p90
+    )
+}
+
+fn format_ratio_summary(summary: MetricSummary) -> String {
+    format!(
+        "{:.0}% ({:.0}..{:.0})",
+        summary.mean * 100.0,
+        summary.p10 * 100.0,
+        summary.p90 * 100.0
+    )
+}
+
+fn simulation_run_elapsed(run: &SimulationRunState) -> Duration {
+    run.finished_at
+        .map(|finished_at| finished_at.saturating_duration_since(run.started_at))
+        .unwrap_or_else(|| run.started_at.elapsed())
+}
+
+fn render_simulation_run(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Simulation Run");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let Some(run) = &app.simulation_run else {
+        frame.render_widget(Paragraph::new("No simulation is running"), inner);
+        return;
+    };
+
+    let completed = run.completed_runs.load(Ordering::Relaxed);
+    let progress = if run.requested_runs == 0 {
+        0.0
+    } else {
+        completed as f64 / run.requested_runs as f64
+    };
+    let elapsed = simulation_run_elapsed(run);
+    let eta = simulation_eta(elapsed, completed, run.requested_runs, run.finished);
+    let state = if let Some(error) = &run.error {
+        format!("Failed: {error}")
+    } else if run.finished {
+        app.simulation_result
+            .as_ref()
+            .map(|result| {
+                if result.cancelled {
+                    "Cancelled"
+                } else {
+                    "Completed"
+                }
+            })
+            .unwrap_or("Finished")
+            .to_string()
+    } else if run.cancelling {
+        "Cancelling".to_string()
+    } else {
+        "Running".to_string()
+    };
+
+    let mut lines = vec![
+        estimate_metric_line("Status", state, Style::default().fg(Color::Green)),
+        estimate_metric_line(
+            "Runs",
+            format!("{completed}/{}", run.requested_runs),
+            Style::default(),
+        ),
+        estimate_metric_line("Progress", progress_bar(progress, 24), Style::default()),
+        estimate_metric_line("Elapsed", format_duration(elapsed), Style::default()),
+        estimate_metric_line(
+            "ETA",
+            eta.unwrap_or_else(|| "-".to_string()),
+            Style::default(),
+        ),
+        Line::from(""),
+    ];
+
+    if run.finished {
+        if let Some(result) = &app.simulation_result {
+            lines.extend(simulation_result_lines(result));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from("Enter or Esc returns to the main screen"));
+    } else {
+        lines.push(Line::from("Esc or c cancels the run"));
+    }
+
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+}
+
+fn progress_bar(progress: f64, width: usize) -> String {
+    let progress = progress.clamp(0.0, 1.0);
+    let filled = (progress * width as f64).round() as usize;
+    format!(
+        "[{}{}] {:>3}%",
+        "#".repeat(filled),
+        ".".repeat(width.saturating_sub(filled)),
+        (progress * 100.0).round() as usize
+    )
+}
+
+fn simulation_eta(
+    elapsed: Duration,
+    completed: usize,
+    requested: usize,
+    finished: bool,
+) -> Option<String> {
+    if finished {
+        return Some("0s".to_string());
+    }
+    if completed == 0 || completed >= requested {
+        return None;
+    }
+    let seconds_per_run = elapsed.as_secs_f64() / completed as f64;
+    let remaining = seconds_per_run * (requested - completed) as f64;
+    Some(format_duration(Duration::from_secs_f64(remaining.max(0.0))))
+}
+
+fn format_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    let minutes = seconds / 60;
+    let seconds = seconds % 60;
+    if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 fn render_estimate(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App, focused: bool) {
@@ -2846,7 +3383,7 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let (mode, help) = match app.mode {
         Mode::Normal => (
             "NORMAL",
-            "1-4 panels  tab/arrows focus  up/down fields  enter edit  e estimate  q/esc",
+            "1-4 panels  tab focus  enter edit/run  e estimate  r simulate  q/esc",
         ),
         Mode::Edit if app.fields[app.selected].label == "Arrays" => {
             ("EDIT", "enter/tab apply estimate  esc close edit")
@@ -2873,6 +3410,16 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             "SHAPE",
             "arrows select  enter edit  p presets  c custom  esc",
         ),
+        Mode::SimulationRun
+            if app
+                .simulation_run
+                .as_ref()
+                .map(|run| run.finished)
+                .unwrap_or(false) =>
+        {
+            ("SIM", "enter/esc return")
+        }
+        Mode::SimulationRun => ("SIM", "progress live  esc/c cancel"),
     };
     let status = Line::from(vec![
         Span::styled("Status ", Style::default().fg(Color::DarkGray)),
@@ -3029,6 +3576,31 @@ mod tests {
             },
             ensemble_estimate: ensemble,
             references: serde_json::json!({}),
+        }
+    }
+
+    fn populated_simulation_result() -> SimulationResult {
+        let summary = |mean, p10, p90| MetricSummary {
+            mean,
+            p10,
+            p90,
+            p50: mean,
+        };
+        SimulationResult {
+            requested_runs: 10_000,
+            completed_runs: 10_000,
+            cancelled: false,
+            summaries: SimulationMetricSummaries {
+                production_kwh: summary(1700.0, 1500.0, 1900.0),
+                load_kwh: summary(4200.0, 4200.0, 4200.0),
+                self_consumed_kwh: summary(1100.0, 1000.0, 1200.0),
+                grid_import_kwh: summary(3100.0, 3000.0, 3200.0),
+                grid_export_kwh: summary(600.0, 500.0, 700.0),
+                battery_losses_kwh: summary(0.0, 0.0, 0.0),
+                ending_soc_kwh: summary(0.0, 0.0, 0.0),
+                self_consumption_ratio: summary(0.65, 0.60, 0.70),
+                self_sufficiency_ratio: summary(0.26, 0.24, 0.29),
+            },
         }
     }
 
@@ -3334,6 +3906,151 @@ mod tests {
     }
 
     #[test]
+    fn parses_simulation_options_from_fields() {
+        let mut app = App::new();
+        app.simulation_fields[SIMULATION_RUNS_FIELD_INDEX].set_value("250");
+        app.simulation_fields[SIMULATION_SEED_FIELD_INDEX].set_value("42");
+
+        let options = app.simulation_options().expect("valid simulation options");
+
+        assert_eq!(options.runs, 250);
+        assert_eq!(options.seed, Some(42));
+    }
+
+    #[test]
+    fn simulation_options_reject_invalid_runs_and_seed() {
+        let mut app = App::new();
+        app.simulation_fields[SIMULATION_RUNS_FIELD_INDEX].set_value("0");
+        assert!(app.simulation_options().is_err());
+
+        app.simulation_fields[SIMULATION_RUNS_FIELD_INDEX].set_value("10");
+        app.simulation_fields[SIMULATION_SEED_FIELD_INDEX].set_value("abc");
+        assert!(app.simulation_options().is_err());
+    }
+
+    #[test]
+    fn simulation_panel_enter_edits_options_and_uses_run_row() {
+        let mut app = App::new();
+        app.panel_visibility.set_visible(Panel::Simulation, true);
+        app.focused_panel = Panel::Simulation;
+        app.simulation_selected = SIMULATION_RUNS_FIELD_INDEX;
+        let mut estimator = SourceModelEstimator::load_embedded().expect("embedded estimator");
+
+        let quit = handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &mut app,
+            &mut estimator,
+        )
+        .expect("key handled");
+
+        assert!(!quit);
+        assert_eq!(app.mode, Mode::Edit);
+
+        app.mode = Mode::Normal;
+        app.simulation_selected = SIMULATION_RUN_ROW_INDEX;
+        app.simulation_fields[SIMULATION_RUNS_FIELD_INDEX].set_value("0");
+
+        let quit = handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &mut app,
+            &mut estimator,
+        )
+        .expect("key handled");
+
+        assert!(!quit);
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.status.contains("Runs must be a positive integer"));
+    }
+
+    #[test]
+    fn simulation_run_key_cancels_without_enter_while_running() {
+        let mut app = App::new();
+        let (sender, receiver) = mpsc::channel();
+        drop(sender);
+        let cancel = Arc::new(AtomicBool::new(false));
+        app.mode = Mode::SimulationRun;
+        app.simulation_run = Some(SimulationRunState {
+            requested_runs: 100,
+            completed_runs: Arc::new(AtomicUsize::new(25)),
+            cancel: Arc::clone(&cancel),
+            started_at: Instant::now(),
+            finished_at: None,
+            receiver,
+            finished: false,
+            cancelling: false,
+            error: None,
+        });
+
+        handle_simulation_run_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &mut app,
+        )
+        .expect("enter handled");
+        assert!(!cancel.load(Ordering::Relaxed));
+        assert_eq!(app.mode, Mode::SimulationRun);
+
+        handle_simulation_run_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()), &mut app)
+            .expect("esc handled");
+        assert!(cancel.load(Ordering::Relaxed));
+        assert_eq!(app.status, "Cancelling simulation");
+    }
+
+    #[test]
+    fn simulation_run_screen_shows_progress_and_cancel_hint() {
+        let mut app = App::new();
+        let (sender, receiver) = mpsc::channel();
+        drop(sender);
+        app.mode = Mode::SimulationRun;
+        app.simulation_run = Some(SimulationRunState {
+            requested_runs: 100,
+            completed_runs: Arc::new(AtomicUsize::new(25)),
+            cancel: Arc::new(AtomicBool::new(false)),
+            started_at: Instant::now(),
+            finished_at: None,
+            receiver,
+            finished: false,
+            cancelling: false,
+            error: None,
+        });
+
+        let snapshot = render_snapshot(&app);
+
+        assert!(snapshot.contains("Simulation Run"));
+        assert!(snapshot.contains("25/100"));
+        assert!(snapshot.contains("Esc or c cancels the run"));
+    }
+
+    #[test]
+    fn simulation_progress_helpers_are_stable() {
+        assert_eq!(progress_bar(0.25, 8), "[##......]  25%");
+        assert_eq!(format_duration(Duration::from_secs(65)), "1m 5s");
+        assert_eq!(
+            simulation_eta(Duration::from_secs(10), 25, 100, false),
+            Some("30s".to_string())
+        );
+        assert_eq!(
+            simulation_eta(Duration::from_secs(10), 100, 100, true),
+            Some("0s".to_string())
+        );
+
+        let (sender, receiver) = mpsc::channel();
+        drop(sender);
+        let started_at = Instant::now();
+        let run = SimulationRunState {
+            requested_runs: 100,
+            completed_runs: Arc::new(AtomicUsize::new(100)),
+            cancel: Arc::new(AtomicBool::new(false)),
+            started_at,
+            finished_at: Some(started_at + Duration::from_secs(12)),
+            receiver,
+            finished: true,
+            cancelling: false,
+            error: None,
+        };
+        assert_eq!(simulation_run_elapsed(&run), Duration::from_secs(12));
+    }
+
+    #[test]
     fn panel_visibility_defaults_to_system_and_estimate() {
         let app = App::new();
 
@@ -3456,6 +4173,15 @@ mod tests {
         app.toggle_panel(Panel::Simulation);
 
         assert_snapshot("four_panel_layout", &render_snapshot(&app));
+    }
+
+    #[test]
+    fn simulation_result_snapshot() {
+        let mut app = App::new();
+        app.toggle_panel(Panel::Simulation);
+        app.simulation_result = Some(populated_simulation_result());
+
+        assert_snapshot("simulation_result", &render_snapshot(&app));
     }
 
     #[test]
@@ -3671,6 +4397,25 @@ mod tests {
     }
 
     #[test]
+    fn simulation_summary_formatting_uses_mean_and_p10_p90() {
+        let kwh = MetricSummary {
+            mean: 1234.4,
+            p10: 1000.0,
+            p50: 1200.0,
+            p90: 1500.0,
+        };
+        let ratio = MetricSummary {
+            mean: 0.26,
+            p10: 0.24,
+            p50: 0.25,
+            p90: 0.29,
+        };
+
+        assert_eq!(format_kwh_summary(kwh), "1234 (1000..1500) kWh");
+        assert_eq!(format_ratio_summary(ratio), "26% (24..29)");
+    }
+
+    #[test]
     fn monthly_table_marks_mean_columns_green_and_min_columns_red() {
         let rows = vec![
             [
@@ -3774,6 +4519,7 @@ mod tests {
             ],
             consumer_fields: Vec::new(),
             consumer_shape: ConsumerShapeState::default(),
+            simulation_fields: Vec::new(),
             panel_visibility: PanelVisibility::default(),
             focused_panel: Panel::System,
         };
