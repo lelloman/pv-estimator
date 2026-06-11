@@ -69,7 +69,7 @@ User-facing inputs:
 
 - Latitude and longitude in decimal degrees.
 - System loss percent.
-- One or more PV arrays, each with peak power in kWp, tilt in degrees, and
+- One or more PV arrays, each with optional name, peak power in kWp, tilt in degrees, and
   PVGIS-style azimuth in degrees.
 
 For multi-array systems, the estimator runs each submitted orientation against

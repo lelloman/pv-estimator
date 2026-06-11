@@ -54,7 +54,7 @@ Optional options:
 | `--tilt-deg <DEG>` | `30.0` | Panel tilt in degrees from horizontal, from `0` to `90`. |
 | `--azimuth-deg <DEG>` | `0.0` | PVGIS-style azimuth for the default single array. `0` is south, `-90` east, `90` west. |
 | `--storage-kwh <KWH>` | none | Optional usable battery storage capacity metadata. Must be positive when set. It does not change PV estimate math. |
-| `--array <KWP,TILT,AZIMUTH>` | none | Add one or more arrays. Can be repeated or contain semicolon-separated entries. When present, `--array` entries define the system instead of `--kwp`, `--tilt-deg`, and `--azimuth-deg`. |
+| `--array <[NAME,]KWP,TILT,AZIMUTH>` | none | Add one or more arrays, optionally prefixed with a display name. Can be repeated or contain semicolon-separated entries. When present, `--array` entries define the system instead of `--kwp`, `--tilt-deg`, and `--azimuth-deg`. |
 | `--model-dir <DIR>` | embedded | Directory containing `source-model-artifacts.json` and ONNX files. |
 | `--manifest <NAME>` | `source-model-artifacts.json` | Manifest filename inside `--model-dir`. |
 | `--format <table|json>` | `table` | Output format. |
@@ -86,13 +86,13 @@ pv estimate \
   --lat 45.4642 \
   --lon 9.1900 \
   --array 1.5,30,0 \
-  --array 2.0,20,-90 \
+  --array "west roof,2.0,20,-90" \
   --format json
 
 pv estimate \
   --lat 45.4642 \
   --lon 9.1900 \
-  --array "1.5,30,0; 2.0,20,-90" \
+  --array "south roof,1.5,30,0; west roof,2.0,20,-90" \
   --format json
 ```
 
@@ -123,7 +123,7 @@ The top-level object is stable for local v1:
   "ensemble_estimate": {},
   "references": {
     "arrays": [
-      {"peak_power_kwp": 1.0, "tilt_deg": 30.0, "azimuth_deg": 0.0}
+      {"name": "south roof", "peak_power_kwp": 1.0, "tilt_deg": 30.0, "azimuth_deg": 0.0}
     ]
   }
 }
@@ -132,7 +132,7 @@ The top-level object is stable for local v1:
 `system.peak_power_kwp` is the total installed kWp used for the estimate. For
 multi-array estimates, `system.tilt_deg` and `system.aspect_deg` are
 capacity-weighted display values; the exact submitted arrays are preserved in
-`references.arrays` with `peak_power_kwp`, `tilt_deg`, and `azimuth_deg` for each
+`references.arrays` with optional `name`, `peak_power_kwp`, `tilt_deg`, and `azimuth_deg` for each
 array. For single-array estimates, `references.arrays` contains one entry that
 matches `--kwp`, `--tilt-deg`, and `--azimuth-deg`.
 

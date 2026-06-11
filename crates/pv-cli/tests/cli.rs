@@ -162,7 +162,7 @@ fn estimate_accepts_multiple_arrays() {
             "--array",
             "1.5,30,0",
             "--array",
-            "2.25,20,-90",
+            "west roof,2.25,20,-90",
             "--format",
             "json",
         ])
@@ -173,6 +173,8 @@ fn estimate_accepts_multiple_arrays() {
 
     assert_eq!(document["system"]["peak_power_kwp"], 3.75);
     assert_eq!(document["references"]["arrays"][0]["peak_power_kwp"], 1.5);
+    assert!(document["references"]["arrays"][0].get("name").is_none());
+    assert_eq!(document["references"]["arrays"][1]["name"], "west roof");
     assert_eq!(document["references"]["arrays"][1]["azimuth_deg"], -90.0);
 }
 
@@ -216,7 +218,7 @@ fn estimate_rejects_malformed_arrays() {
     );
 
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("array 1 must be KWP,TILT,AZIMUTH"),
+        String::from_utf8_lossy(&output.stderr).contains("array 1 must be [NAME,]KWP,TILT,AZIMUTH"),
         "stderr:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
