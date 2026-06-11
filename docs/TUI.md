@@ -50,6 +50,14 @@ Editable fields:
 | `Storage kWh` | Optional usable battery storage capacity metadata. Leave empty when no storage is modeled. |
 | `Arrays` | One or more array definitions. The main screen shows an `[Edit]` summary plus a parsed table preview. Azimuth uses the PVGIS convention: `0` south, `-90` east, `90` west. |
 
+Consumer panel fields:
+
+| Field | Meaning |
+| --- | --- |
+| `Annual kWh` | Annual household consumption. Leave empty when using `Daily kWh`. |
+| `Daily kWh` | Daily household consumption. Leave empty when using `Annual kWh`. |
+| `Shape` | Load shape identifier. Currently `residential_default`. |
+
 Editing `Name`, `Region`, `Latitude`, or `Longitude` marks the location as
 `custom`. Applying a city search result sets a GeoNames-backed location id.
 
