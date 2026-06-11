@@ -56,7 +56,7 @@ Consumer panel fields:
 | --- | --- |
 | `Annual kWh` | Annual household consumption. Updating it refreshes `Daily kWh`. |
 | `Daily kWh` | Daily household consumption. Updating it refreshes `Annual kWh`. |
-| `Shape` | Load shape identifier. Currently `residential_default`. |
+| `Shape` | Opens the load shape editor. Built-in presets are `residential_default`, `flat`, `daytime`, and `evening`; any preset can be copied into custom 24-hour weights. |
 
 Editing `Name`, `Region`, `Latitude`, or `Longitude` marks the location as
 `custom`. Applying a city search result sets a GeoNames-backed location id.
@@ -82,13 +82,13 @@ Normal mode:
 | `1` / `2` / `3` / `4` | Toggle System, Consumer, Simulation, or Estimate panels. At least one panel remains visible. |
 | `Tab` / `Shift+Tab` | Move focus between visible panels. |
 | `Left` / `Right` | Move focus between visible panels. |
-| `Up` / `Down` | Move between fields in the focused System panel. |
-| `Home` / `End` | Jump to first or last System field. |
-| `Enter` | Edit selected System field. On `Name`, open location search mode. On `Arrays`, open the arrays editor. |
+| `Up` / `Down` | Move between fields in the focused System or Consumer panel. |
+| `Home` / `End` | Jump to first or last field in the focused System or Consumer panel. |
+| `Enter` | Edit the selected field. On `Name`, open location search mode. On `Arrays`, open the arrays editor. On Consumer `Shape`, open the shape editor. |
 | `l` | Open location search mode when System is focused. |
 | `e` | Recompute estimate. |
 | `PageUp` / `PageDown` | Scroll the monthly estimate table when Estimate is focused. |
-| `q` | Quit. |
+| `q` / `Esc` | Quit from normal mode. |
 | `Ctrl+C` | Quit. |
 
 Edit mode:
@@ -114,6 +114,17 @@ Arrays mode:
 | `a` | Add a new default array. |
 | `d` / `Delete` | Remove the selected array. |
 | `Esc` | Leave arrays mode, or cancel the current cell edit. |
+
+Shape mode:
+
+| Key | Action |
+| --- | --- |
+| `p` | Open the preset picker. Use `Enter` to apply a preset or `Esc` to dismiss it without changing the current shape. |
+| `c` | Switch to custom hourly weights, copying the current preset weights when needed. |
+| `Up` / `Down` / `Left` / `Right` | Move between hourly weight cells. |
+| `Enter` | Edit the selected weight, or apply a weight edit. From a preset, this first copies the preset into a custom shape. |
+| `Tab` / `Shift+Tab` | Move between hourly weight cells. While editing, apply and move. |
+| `Esc` | Leave shape mode, or cancel the current weight edit. |
 
 Location mode:
 

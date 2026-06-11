@@ -40,6 +40,9 @@ pub enum LoadShape {
 #[serde(rename_all = "snake_case")]
 pub enum BuiltInLoadShapeId {
     ResidentialDefault,
+    Flat,
+    Daytime,
+    Evening,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -246,9 +249,9 @@ fn hourly_load_profile(load: &LoadProfile) -> Result<Vec<f64>, SimulationError> 
 
 fn yearly_shape_weights(shape: &LoadShape) -> Result<Vec<f64>, SimulationError> {
     match shape {
-        LoadShape::BuiltIn {
-            shape_id: BuiltInLoadShapeId::ResidentialDefault,
-        } => Ok(repeat_daily_weights(&RESIDENTIAL_DEFAULT_WEIGHTS)),
+        LoadShape::BuiltIn { shape_id } => {
+            Ok(repeat_daily_weights(built_in_daily_weights(*shape_id)))
+        }
         LoadShape::HourlyWeights { weights } if weights.len() == 24 => {
             Ok(repeat_daily_weights(weights))
         }
@@ -432,9 +435,27 @@ impl SmallRng {
     }
 }
 
+fn built_in_daily_weights(shape_id: BuiltInLoadShapeId) -> &'static [f64; 24] {
+    match shape_id {
+        BuiltInLoadShapeId::ResidentialDefault => &RESIDENTIAL_DEFAULT_WEIGHTS,
+        BuiltInLoadShapeId::Flat => &FLAT_WEIGHTS,
+        BuiltInLoadShapeId::Daytime => &DAYTIME_WEIGHTS,
+        BuiltInLoadShapeId::Evening => &EVENING_WEIGHTS,
+    }
+}
+
 const RESIDENTIAL_DEFAULT_WEIGHTS: [f64; 24] = [
     0.55, 0.45, 0.40, 0.38, 0.40, 0.55, 0.85, 1.05, 0.95, 0.80, 0.72, 0.70, 0.76, 0.78, 0.82, 0.90,
     1.08, 1.35, 1.55, 1.45, 1.20, 0.95, 0.78, 0.65,
+];
+const FLAT_WEIGHTS: [f64; 24] = [1.0; 24];
+const DAYTIME_WEIGHTS: [f64; 24] = [
+    0.35, 0.30, 0.28, 0.28, 0.30, 0.45, 0.70, 1.00, 1.20, 1.35, 1.45, 1.50, 1.50, 1.45, 1.35, 1.25,
+    1.10, 0.90, 0.75, 0.65, 0.55, 0.48, 0.42, 0.38,
+];
+const EVENING_WEIGHTS: [f64; 24] = [
+    0.45, 0.38, 0.34, 0.32, 0.35, 0.50, 0.75, 0.85, 0.65, 0.50, 0.45, 0.45, 0.50, 0.55, 0.65, 0.80,
+    1.05, 1.45, 1.80, 1.75, 1.45, 1.10, 0.80, 0.60,
 ];
 
 #[cfg(test)]
@@ -539,6 +560,27 @@ mod tests {
 
         assert!(result.cancelled);
         assert_eq!(result.completed_runs, 1);
+    }
+
+    #[test]
+    fn built_in_load_shapes_are_available_and_valid() {
+        let shapes = [
+            BuiltInLoadShapeId::ResidentialDefault,
+            BuiltInLoadShapeId::Flat,
+            BuiltInLoadShapeId::Daytime,
+            BuiltInLoadShapeId::Evening,
+        ];
+
+        for shape_id in shapes {
+            let weights = built_in_daily_weights(shape_id);
+            assert_eq!(weights.len(), 24);
+            assert!(
+                weights
+                    .iter()
+                    .all(|weight| weight.is_finite() && *weight >= 0.0)
+            );
+            assert!(weights.iter().sum::<f64>() > 0.0);
+        }
     }
 
     #[test]
