@@ -26,7 +26,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Parser)]
@@ -54,6 +54,34 @@ const ARRAY_EDITOR_HEADER_ROWS: u16 = 3;
 const ARRAY_TABLE_WIDTHS: [u16; 9] = [4, 1, 8, 1, 8, 1, 9, 1, 9];
 const ARRAY_CELL_WIDTHS: [usize; 3] = [8, 8, 9];
 const ARRAY_CELL_STARTS: [u16; 3] = [7, 18, 29];
+const SHAPE_EDITOR_HEADER_ROWS: u16 = 4;
+const SHAPE_EDITOR_COLUMNS: usize = 4;
+const SHAPE_EDITOR_ROWS: usize = 6;
+const SHAPE_CELL_WIDTH: usize = 13;
+const SHAPE_VALUE_WIDTH: usize = 8;
+const SHAPE_CELL_STARTS: [u16; SHAPE_EDITOR_COLUMNS] = [0, 18, 36, 54];
+const SHAPE_VALUE_OFFSET: u16 = 4;
+const SHAPE_PRESET_PICKER_WIDTH: u16 = 28;
+const SHAPE_PRESET_PICKER_HEIGHT: u16 = 6;
+const BUILT_IN_LOAD_SHAPES: [BuiltInLoadShapeId; 4] = [
+    BuiltInLoadShapeId::ResidentialDefault,
+    BuiltInLoadShapeId::Flat,
+    BuiltInLoadShapeId::Daytime,
+    BuiltInLoadShapeId::Evening,
+];
+const RESIDENTIAL_DEFAULT_WEIGHTS: [f64; 24] = [
+    0.55, 0.45, 0.40, 0.38, 0.40, 0.55, 0.85, 1.05, 0.95, 0.80, 0.72, 0.70, 0.76, 0.78, 0.82, 0.90,
+    1.08, 1.35, 1.55, 1.45, 1.20, 0.95, 0.78, 0.65,
+];
+const FLAT_WEIGHTS: [f64; 24] = [1.0; 24];
+const DAYTIME_WEIGHTS: [f64; 24] = [
+    0.35, 0.30, 0.28, 0.28, 0.30, 0.45, 0.70, 1.00, 1.20, 1.35, 1.45, 1.50, 1.50, 1.45, 1.35, 1.25,
+    1.10, 0.90, 0.75, 0.65, 0.55, 0.48, 0.42, 0.38,
+];
+const EVENING_WEIGHTS: [f64; 24] = [
+    0.45, 0.38, 0.34, 0.32, 0.35, 0.50, 0.75, 0.85, 0.65, 0.50, 0.45, 0.45, 0.50, 0.55, 0.65, 0.80,
+    1.05, 1.45, 1.80, 1.75, 1.45, 1.10, 0.80, 0.60,
+];
 const MONTHLY_TABLE_HEADERS: [&str; 7] = ["Month", "mean", "min", "max", "mean", "min", "max"];
 const MONTHLY_TABLE_HEADER_ROWS: usize = 3;
 const ESTIMATE_SCROLL_PAGE_ROWS: usize = 6;
@@ -66,6 +94,8 @@ struct TuiState {
     fields: Vec<TuiFieldState>,
     #[serde(default)]
     consumer_fields: Vec<TuiFieldState>,
+    #[serde(default)]
+    consumer_shape: ConsumerShapeState,
     #[serde(default)]
     panel_visibility: PanelVisibility,
     #[serde(default)]
@@ -172,6 +202,59 @@ enum Mode {
     Edit,
     Location,
     Arrays,
+    Shape,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ConsumerShapeState {
+    BuiltIn { shape_id: BuiltInLoadShapeId },
+    HourlyWeights { weights: Vec<f64> },
+}
+
+impl Default for ConsumerShapeState {
+    fn default() -> Self {
+        Self::BuiltIn {
+            shape_id: BuiltInLoadShapeId::ResidentialDefault,
+        }
+    }
+}
+
+impl ConsumerShapeState {
+    fn label(&self) -> String {
+        match self {
+            Self::BuiltIn { shape_id } => format!("[Edit]  {}", built_in_shape_label(*shape_id)),
+            Self::HourlyWeights { .. } => "[Edit]  custom hourly".to_string(),
+        }
+    }
+
+    fn mode_label(&self) -> &'static str {
+        match self {
+            Self::BuiltIn { .. } => "Preset",
+            Self::HourlyWeights { .. } => "Custom",
+        }
+    }
+
+    fn load_shape(&self) -> Result<LoadShape> {
+        match self {
+            Self::BuiltIn { shape_id } => Ok(LoadShape::BuiltIn {
+                shape_id: *shape_id,
+            }),
+            Self::HourlyWeights { weights } => {
+                validate_shape_weights(weights)?;
+                Ok(LoadShape::HourlyWeights {
+                    weights: weights.clone(),
+                })
+            }
+        }
+    }
+
+    fn weights(&self) -> Vec<f64> {
+        match self {
+            Self::BuiltIn { shape_id } => built_in_shape_weights(*shape_id).to_vec(),
+            Self::HourlyWeights { weights } => weights.clone(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -198,6 +281,12 @@ struct App {
     array_column: usize,
     array_editing: bool,
     array_cell: Field,
+    consumer_shape: ConsumerShapeState,
+    shape_selected_hour: usize,
+    shape_editing: bool,
+    shape_preset_selecting: bool,
+    shape_preset_selected: usize,
+    shape_cell: Field,
     estimate_scroll: usize,
     panel_visibility: PanelVisibility,
     focused_panel: Panel,
@@ -299,6 +388,12 @@ impl App {
             array_column: 0,
             array_editing: false,
             array_cell: Field::new("Array", ""),
+            consumer_shape: ConsumerShapeState::default(),
+            shape_selected_hour: 0,
+            shape_editing: false,
+            shape_preset_selecting: false,
+            shape_preset_selected: 0,
+            shape_cell: Field::new("Weight", ""),
             estimate_scroll: 0,
             panel_visibility: PanelVisibility::default(),
             focused_panel: Panel::System,
@@ -353,6 +448,8 @@ impl App {
         }
         self.selected_location_id = state.selected_location_id;
         self.location_query.set_value(&state.location_query);
+        self.consumer_shape = state.consumer_shape;
+        self.sync_consumer_shape_field();
         self.panel_visibility = state.panel_visibility;
         self.focused_panel = state.focused_panel;
         self.ensure_panel_focus();
@@ -385,6 +482,7 @@ impl App {
                     value: field.value.clone(),
                 })
                 .collect(),
+            consumer_shape: self.consumer_shape.clone(),
             panel_visibility: self.panel_visibility,
             focused_panel: self.focused_panel,
         };
@@ -538,13 +636,15 @@ impl App {
     fn active_field_mut(&mut self) -> Option<&mut Field> {
         match self.focused_panel {
             Panel::System => Some(&mut self.fields[self.selected]),
-            Panel::Consumer => Some(&mut self.consumer_fields[self.consumer_selected]),
+            Panel::Consumer if self.consumer_selected != CONSUMER_SHAPE_FIELD_INDEX => {
+                Some(&mut self.consumer_fields[self.consumer_selected])
+            }
+            Panel::Consumer => None,
             _ => None,
         }
     }
 
     fn sync_consumer_energy_fields(&mut self) -> Result<()> {
-        let _ = consumer_load_shape(&self.consumer_fields[CONSUMER_SHAPE_FIELD_INDEX])?;
         match self.consumer_selected {
             CONSUMER_ANNUAL_FIELD_INDEX => {
                 let annual_kwh =
@@ -587,7 +687,7 @@ impl App {
     }
 
     fn consumer_load_profile(&self) -> Result<LoadProfile> {
-        let shape = consumer_load_shape(&self.consumer_fields[CONSUMER_SHAPE_FIELD_INDEX])?;
+        let shape = self.consumer_shape.load_shape()?;
         let annual =
             parse_optional_positive_f64(&self.consumer_fields[CONSUMER_ANNUAL_FIELD_INDEX])?;
         let daily = parse_optional_positive_f64(&self.consumer_fields[CONSUMER_DAILY_FIELD_INDEX])?;
@@ -665,6 +765,143 @@ impl App {
         self.mode = Mode::Normal;
         self.array_editing = false;
         self.status = "Arrays editor closed".to_string();
+    }
+
+    fn open_shape_editor(&mut self) {
+        self.mode = Mode::Shape;
+        self.shape_editing = false;
+        self.shape_preset_selecting = false;
+        self.shape_selected_hour = self.shape_selected_hour.min(23);
+        self.status = "Edit consumer load shape".to_string();
+    }
+
+    fn close_shape_editor(&mut self) {
+        self.mode = Mode::Normal;
+        self.shape_editing = false;
+        self.shape_preset_selecting = false;
+        self.sync_consumer_shape_field();
+        self.status = "Shape editor closed".to_string();
+        self.save_state();
+    }
+
+    fn sync_consumer_shape_field(&mut self) {
+        self.consumer_fields[CONSUMER_SHAPE_FIELD_INDEX].set_value(&self.consumer_shape.label());
+    }
+
+    fn set_shape_preset(&mut self, shape_id: BuiltInLoadShapeId) {
+        self.consumer_shape = ConsumerShapeState::BuiltIn { shape_id };
+        self.shape_editing = false;
+        self.shape_preset_selecting = false;
+        self.sync_consumer_shape_field();
+        self.status = format!("Using {} shape", built_in_shape_label(shape_id));
+        self.save_state();
+    }
+
+    fn open_shape_preset_picker(&mut self) {
+        self.shape_editing = false;
+        self.shape_preset_selecting = true;
+        self.shape_preset_selected = match self.consumer_shape {
+            ConsumerShapeState::BuiltIn { shape_id } => BUILT_IN_LOAD_SHAPES
+                .iter()
+                .position(|candidate| *candidate == shape_id)
+                .unwrap_or(0),
+            ConsumerShapeState::HourlyWeights { .. } => 0,
+        };
+        self.status = "Select a load shape preset".to_string();
+    }
+
+    fn dismiss_shape_preset_picker(&mut self) {
+        self.shape_preset_selecting = false;
+        self.status = "Preset selection dismissed".to_string();
+    }
+
+    fn apply_shape_preset_picker(&mut self) {
+        let shape_id = BUILT_IN_LOAD_SHAPES[self
+            .shape_preset_selected
+            .min(BUILT_IN_LOAD_SHAPES.len() - 1)];
+        self.set_shape_preset(shape_id);
+    }
+
+    fn move_shape_preset_selection(&mut self, movement: i32) {
+        let last = BUILT_IN_LOAD_SHAPES.len() - 1;
+        if movement < 0 {
+            self.shape_preset_selected = self.shape_preset_selected.saturating_sub(1);
+        } else if movement > 0 {
+            self.shape_preset_selected = (self.shape_preset_selected + 1).min(last);
+        }
+    }
+
+    fn set_shape_custom(&mut self) {
+        if !matches!(
+            self.consumer_shape,
+            ConsumerShapeState::HourlyWeights { .. }
+        ) {
+            self.consumer_shape = ConsumerShapeState::HourlyWeights {
+                weights: self.consumer_shape.weights(),
+            };
+        }
+        self.shape_editing = false;
+        self.shape_preset_selecting = false;
+        self.sync_consumer_shape_field();
+        self.status = "Using custom hourly shape".to_string();
+        self.save_state();
+    }
+
+    fn start_shape_cell_edit(&mut self) {
+        if !matches!(
+            self.consumer_shape,
+            ConsumerShapeState::HourlyWeights { .. }
+        ) {
+            self.consumer_shape = ConsumerShapeState::HourlyWeights {
+                weights: self.consumer_shape.weights(),
+            };
+            self.sync_consumer_shape_field();
+        }
+        self.shape_preset_selecting = false;
+        let weights = self.consumer_shape.weights();
+        let Some(value) = weights.get(self.shape_selected_hour) else {
+            return;
+        };
+        self.shape_cell.set_value(&format_shape_weight(*value));
+        self.shape_editing = true;
+        self.status = "Editing hourly weight".to_string();
+    }
+
+    fn apply_shape_cell_edit(&mut self) {
+        let value = match self.shape_cell.value.parse::<f64>() {
+            Ok(value) if value.is_finite() && value >= 0.0 => value,
+            _ => {
+                self.status = "Shape weight must be finite and non-negative".to_string();
+                return;
+            }
+        };
+        let ConsumerShapeState::HourlyWeights { weights } = &mut self.consumer_shape else {
+            self.shape_editing = false;
+            return;
+        };
+        if self.shape_selected_hour >= weights.len() {
+            self.status = "Shape must contain 24 hourly weights".to_string();
+            return;
+        }
+        let mut next = weights.clone();
+        next[self.shape_selected_hour] = value;
+        if let Err(error) = validate_shape_weights(&next) {
+            self.status = format!("{error:#}");
+            return;
+        }
+        *weights = next;
+        self.shape_editing = false;
+        self.sync_consumer_shape_field();
+        self.status = "Shape weight updated".to_string();
+        self.save_state();
+    }
+
+    fn move_shape_cell_forward(&mut self) {
+        self.shape_selected_hour = (self.shape_selected_hour + 1).min(23);
+    }
+
+    fn move_shape_cell_backward(&mut self) {
+        self.shape_selected_hour = self.shape_selected_hour.saturating_sub(1);
     }
 
     fn current_arrays(&self) -> Vec<EstimateArray> {
@@ -868,12 +1105,46 @@ fn format_energy_field_value(value: f64) -> String {
     }
 }
 
-fn consumer_load_shape(field: &Field) -> Result<LoadShape> {
-    match field.value.trim() {
-        "residential_default" => Ok(LoadShape::BuiltIn {
-            shape_id: BuiltInLoadShapeId::ResidentialDefault,
-        }),
-        _ => anyhow::bail!("Shape must be residential_default"),
+fn built_in_shape_label(shape_id: BuiltInLoadShapeId) -> &'static str {
+    match shape_id {
+        BuiltInLoadShapeId::ResidentialDefault => "residential_default",
+        BuiltInLoadShapeId::Flat => "flat",
+        BuiltInLoadShapeId::Daytime => "daytime",
+        BuiltInLoadShapeId::Evening => "evening",
+    }
+}
+
+fn built_in_shape_weights(shape_id: BuiltInLoadShapeId) -> &'static [f64; 24] {
+    match shape_id {
+        BuiltInLoadShapeId::ResidentialDefault => &RESIDENTIAL_DEFAULT_WEIGHTS,
+        BuiltInLoadShapeId::Flat => &FLAT_WEIGHTS,
+        BuiltInLoadShapeId::Daytime => &DAYTIME_WEIGHTS,
+        BuiltInLoadShapeId::Evening => &EVENING_WEIGHTS,
+    }
+}
+
+fn validate_shape_weights(weights: &[f64]) -> Result<()> {
+    if weights.len() != 24 {
+        anyhow::bail!("Shape must contain 24 hourly weights");
+    }
+    if weights
+        .iter()
+        .any(|value| !value.is_finite() || *value < 0.0)
+    {
+        anyhow::bail!("Shape weights must be finite and non-negative");
+    }
+    if weights.iter().sum::<f64>() <= 0.0 {
+        anyhow::bail!("Shape weights must contain at least one positive value");
+    }
+    Ok(())
+}
+
+fn format_shape_weight(value: f64) -> String {
+    let rounded = (value * 100.0).round() / 100.0;
+    if (rounded - rounded.round()).abs() < 1.0e-9 {
+        format!("{rounded:.0}")
+    } else {
+        format!("{rounded:.2}")
     }
 }
 
@@ -960,6 +1231,7 @@ fn handle_key(key: KeyEvent, app: &mut App, estimator: &mut SourceModelEstimator
         Mode::Edit => handle_edit_key(key, app, estimator),
         Mode::Location => handle_location_key(key, app, estimator),
         Mode::Arrays => handle_arrays_key(key, app, estimator),
+        Mode::Shape => handle_shape_key(key, app),
     }
 }
 
@@ -969,7 +1241,7 @@ fn handle_normal_key(
     estimator: &mut SourceModelEstimator,
 ) -> Result<bool> {
     match key.code {
-        KeyCode::Char('q') => return Ok(true),
+        KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
         KeyCode::Char('1') if key.modifiers.is_empty() => app.toggle_panel(Panel::System),
         KeyCode::Char('2') if key.modifiers.is_empty() => app.toggle_panel(Panel::Consumer),
         KeyCode::Char('3') if key.modifiers.is_empty() => app.toggle_panel(Panel::Simulation),
@@ -1003,6 +1275,12 @@ fn handle_normal_key(
             if app.focused_panel == Panel::System && app.fields[app.selected].label == "Arrays" =>
         {
             app.open_array_editor()
+        }
+        KeyCode::Enter
+            if app.focused_panel == Panel::Consumer
+                && app.consumer_selected == CONSUMER_SHAPE_FIELD_INDEX =>
+        {
+            app.open_shape_editor()
         }
         KeyCode::Enter if app.focused_panel == Panel::System => app.mode = Mode::Edit,
         KeyCode::Enter if app.focused_panel == Panel::Consumer => app.mode = Mode::Edit,
@@ -1091,6 +1369,7 @@ fn handle_mouse(
         MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
     ) && app.mode != Mode::Location
         && app.mode != Mode::Arrays
+        && app.mode != Mode::Shape
     {
         if let Some((Panel::Estimate, _)) = panel_at(vertical[0], app, mouse.column, mouse.row) {
             app.focus_panel(Panel::Estimate);
@@ -1147,6 +1426,29 @@ fn handle_mouse(
         return Ok(());
     }
 
+    if app.mode == Mode::Shape {
+        match shape_footer_hit(vertical[1], mouse.column, mouse.row) {
+            Some(ShapeFooterAction::Done) => app.close_shape_editor(),
+            Some(ShapeFooterAction::Preset) => app.open_shape_preset_picker(),
+            Some(ShapeFooterAction::Custom) => app.set_shape_custom(),
+            None if app.shape_preset_selecting => {
+                if let Some(index) = shape_preset_option_at(vertical[0], mouse.column, mouse.row) {
+                    app.shape_preset_selected = index;
+                    app.apply_shape_preset_picker();
+                } else {
+                    app.dismiss_shape_preset_picker();
+                }
+            }
+            None => {
+                if let Some(hour) = shape_cell_at(vertical[0], mouse.column, mouse.row) {
+                    app.shape_selected_hour = hour;
+                    app.start_shape_cell_edit();
+                }
+            }
+        }
+        return Ok(());
+    }
+
     let Some((panel, panel_area)) = panel_at(vertical[0], app, mouse.column, mouse.row) else {
         return Ok(());
     };
@@ -1176,7 +1478,11 @@ fn handle_mouse(
             let row = mouse.row.saturating_sub(fields_inner.y) as usize;
             if row < app.consumer_fields.len() {
                 app.consumer_selected = row;
-                app.mode = Mode::Edit;
+                if row == CONSUMER_SHAPE_FIELD_INDEX {
+                    app.open_shape_editor();
+                } else {
+                    app.mode = Mode::Edit;
+                }
             }
         }
     }
@@ -1285,6 +1591,72 @@ fn handle_arrays_key(
     Ok(false)
 }
 
+fn handle_shape_key(key: KeyEvent, app: &mut App) -> Result<bool> {
+    if app.shape_preset_selecting {
+        match key.code {
+            KeyCode::Esc => app.dismiss_shape_preset_picker(),
+            KeyCode::Enter => app.apply_shape_preset_picker(),
+            KeyCode::Up | KeyCode::BackTab => app.move_shape_preset_selection(-1),
+            KeyCode::Down | KeyCode::Tab => app.move_shape_preset_selection(1),
+            KeyCode::Char('p') if key.modifiers.is_empty() => app.dismiss_shape_preset_picker(),
+            _ => {}
+        }
+        return Ok(false);
+    }
+
+    if app.shape_editing {
+        match key.code {
+            KeyCode::Esc => {
+                app.shape_editing = false;
+                app.status = "Shape edit cancelled".to_string();
+            }
+            KeyCode::Enter => app.apply_shape_cell_edit(),
+            KeyCode::Tab => {
+                app.apply_shape_cell_edit();
+                if !app.shape_editing {
+                    app.move_shape_cell_forward();
+                }
+            }
+            KeyCode::BackTab => {
+                app.apply_shape_cell_edit();
+                if !app.shape_editing {
+                    app.move_shape_cell_backward();
+                }
+            }
+            KeyCode::Backspace => app.shape_cell.backspace(),
+            KeyCode::Delete => app.shape_cell.delete(),
+            KeyCode::Left => app.shape_cell.move_left(),
+            KeyCode::Right => app.shape_cell.move_right(),
+            KeyCode::Home => app.shape_cell.cursor = 0,
+            KeyCode::End => app.shape_cell.cursor = app.shape_cell.value.len(),
+            KeyCode::Char(character)
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                app.shape_cell.insert(character);
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
+
+    match key.code {
+        KeyCode::Esc => app.close_shape_editor(),
+        KeyCode::Enter => app.start_shape_cell_edit(),
+        KeyCode::Up => {
+            app.shape_selected_hour = app.shape_selected_hour.saturating_sub(SHAPE_EDITOR_COLUMNS)
+        }
+        KeyCode::Down => {
+            app.shape_selected_hour = (app.shape_selected_hour + SHAPE_EDITOR_COLUMNS).min(23)
+        }
+        KeyCode::Left | KeyCode::BackTab => app.move_shape_cell_backward(),
+        KeyCode::Right | KeyCode::Tab => app.move_shape_cell_forward(),
+        KeyCode::Char('p') if key.modifiers.is_empty() => app.open_shape_preset_picker(),
+        KeyCode::Char('c') if key.modifiers.is_empty() => app.set_shape_custom(),
+        _ => {}
+    }
+    Ok(false)
+}
+
 fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
     let area = frame.area();
     let vertical = Layout::default()
@@ -1299,6 +1671,11 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
     }
     if app.mode == Mode::Arrays {
         render_array_editor(frame, vertical[0], app);
+        render_footer(frame, vertical[1], app);
+        return;
+    }
+    if app.mode == Mode::Shape {
+        render_shape_editor(frame, vertical[0], app);
         render_footer(frame, vertical[1], app);
         return;
     }
@@ -1521,6 +1898,17 @@ fn arrays_field_summary(field: &Field) -> String {
         .unwrap_or_else(|_| "[Edit]  invalid arrays".to_string())
 }
 
+fn consumer_shape_summary(shape: &ConsumerShapeState, max_width: usize) -> String {
+    let full = shape.label();
+    if full.chars().count() <= max_width {
+        return full;
+    }
+    match shape {
+        ConsumerShapeState::BuiltIn { .. } => "[Edit]  preset".to_string(),
+        ConsumerShapeState::HourlyWeights { .. } => truncate(&full, max_width),
+    }
+}
+
 fn array_summary_lines(arrays: &[EstimateArray]) -> Vec<Line<'static>> {
     let label_style = Style::default().fg(Color::DarkGray);
     let total_style = Style::default().fg(Color::Green);
@@ -1705,6 +2093,175 @@ fn array_visible_start(selected: usize, total: usize, visible_count: usize) -> u
         .min(total.saturating_sub(visible_count))
 }
 
+fn render_shape_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let block = Block::default().borders(Borders::ALL).title("Load Shape");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let weights = app.consumer_shape.weights();
+    let sum = weights.iter().sum::<f64>();
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("Mode         ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                app.consumer_shape.mode_label(),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Shape        ", Style::default().fg(Color::DarkGray)),
+            Span::raw(match &app.consumer_shape {
+                ConsumerShapeState::BuiltIn { shape_id } => {
+                    built_in_shape_label(*shape_id).to_string()
+                }
+                ConsumerShapeState::HourlyWeights { .. } => {
+                    format!("custom hourly  total {sum:.2}")
+                }
+            }),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Hourly weights",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    for row in 0..SHAPE_EDITOR_ROWS {
+        let mut spans = Vec::new();
+        for column in 0..SHAPE_EDITOR_COLUMNS {
+            let hour = row * SHAPE_EDITOR_COLUMNS + column;
+            let selected = hour == app.shape_selected_hour;
+            let style = match (selected, app.shape_editing) {
+                (true, true) => Style::default().fg(Color::Black).bg(Color::Yellow),
+                (true, false) => Style::default().fg(Color::Black).bg(Color::Cyan),
+                _ => Style::default(),
+            };
+            let value = if selected && app.shape_editing {
+                field_value_view(&app.shape_cell, SHAPE_VALUE_WIDTH, true).value
+            } else {
+                format_shape_weight(weights[hour])
+            };
+            spans.push(Span::styled(
+                format!("{hour:02}: {:<width$}", value, width = SHAPE_VALUE_WIDTH),
+                style,
+            ));
+            if column + 1 < SHAPE_EDITOR_COLUMNS {
+                spans.push(Span::raw("     "));
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+
+    frame.render_widget(Paragraph::new(lines), inner);
+    if app.shape_preset_selecting {
+        render_shape_preset_picker(frame, area, app);
+    }
+    if app.shape_editing {
+        frame.set_cursor_position(shape_editor_cursor(inner, app));
+    }
+}
+
+fn render_shape_preset_picker(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let picker = shape_preset_picker_area(area);
+    frame.render_widget(Clear, picker);
+    let block = Block::default().borders(Borders::ALL).title("Preset");
+    let inner = block.inner(picker);
+    frame.render_widget(block, picker);
+
+    let lines = BUILT_IN_LOAD_SHAPES
+        .iter()
+        .enumerate()
+        .map(|(index, shape_id)| {
+            let selected = index == app.shape_preset_selected;
+            let active = matches!(
+                app.consumer_shape,
+                ConsumerShapeState::BuiltIn { shape_id: active } if active == *shape_id
+            );
+            let style = if selected {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::default()
+            };
+            let marker = if active { "*" } else { " " };
+            Line::from(Span::styled(
+                format!("{marker} {}", built_in_shape_label(*shape_id)),
+                style,
+            ))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn shape_preset_picker_area(area: Rect) -> Rect {
+    let inner = shape_editor_inner(area);
+    Rect::new(
+        inner.x.saturating_add(13),
+        inner.y.saturating_add(1),
+        SHAPE_PRESET_PICKER_WIDTH.min(inner.width.saturating_sub(13).max(1)),
+        SHAPE_PRESET_PICKER_HEIGHT.min(inner.height.max(1)),
+    )
+}
+
+fn shape_preset_option_at(area: Rect, column: u16, row: u16) -> Option<usize> {
+    let picker = shape_preset_picker_area(area);
+    let inner = Block::default().borders(Borders::ALL).inner(picker);
+    if column < inner.x || column >= inner.x.saturating_add(inner.width) {
+        return None;
+    }
+    if row < inner.y || row >= inner.y.saturating_add(inner.height) {
+        return None;
+    }
+    let index = row.saturating_sub(inner.y) as usize;
+    (index < BUILT_IN_LOAD_SHAPES.len()).then_some(index)
+}
+
+fn shape_editor_inner(area: Rect) -> Rect {
+    Block::default().borders(Borders::ALL).inner(area)
+}
+
+fn shape_editor_cursor(inner: Rect, app: &App) -> Position {
+    let row = app.shape_selected_hour / SHAPE_EDITOR_COLUMNS;
+    let column = app.shape_selected_hour % SHAPE_EDITOR_COLUMNS;
+    let value_view = field_value_view(&app.shape_cell, SHAPE_VALUE_WIDTH, true);
+    Position::new(
+        inner
+            .x
+            .saturating_add(SHAPE_CELL_STARTS[column])
+            .saturating_add(SHAPE_VALUE_OFFSET)
+            .saturating_add(value_view.cursor_col.min(u16::MAX as usize) as u16),
+        inner
+            .y
+            .saturating_add(SHAPE_EDITOR_HEADER_ROWS)
+            .saturating_add(row.min(u16::MAX as usize) as u16),
+    )
+}
+
+fn shape_cell_at(area: Rect, column: u16, row: u16) -> Option<usize> {
+    let inner = shape_editor_inner(area);
+    if column < inner.x || column >= inner.x.saturating_add(inner.width) {
+        return None;
+    }
+    let first_row = inner.y.saturating_add(SHAPE_EDITOR_HEADER_ROWS);
+    if row < first_row {
+        return None;
+    }
+    let rel_row = row.saturating_sub(first_row) as usize;
+    if rel_row >= SHAPE_EDITOR_ROWS {
+        return None;
+    }
+    let rel_col = column.saturating_sub(inner.x);
+    let cell_column = SHAPE_CELL_STARTS
+        .iter()
+        .enumerate()
+        .find_map(|(index, start)| {
+            let end = start.saturating_add(SHAPE_CELL_WIDTH as u16);
+            (rel_col >= *start && rel_col < end).then_some(index)
+        })?;
+    Some(rel_row * SHAPE_EDITOR_COLUMNS + cell_column)
+}
+
 fn render_location_search(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1878,7 +2435,11 @@ fn render_consumer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App, focuse
             } else {
                 Style::default().fg(Color::DarkGray)
             };
-            let value = field_value_view(field, value_width, selected).value;
+            let value = if index == CONSUMER_SHAPE_FIELD_INDEX {
+                consumer_shape_summary(&app.consumer_shape, value_width)
+            } else {
+                field_value_view(field, value_width, selected).value
+            };
             Line::from(vec![
                 Span::styled(
                     format!(
@@ -1894,7 +2455,7 @@ fn render_consumer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App, focuse
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(lines), inner);
 
-    if focused && app.mode == Mode::Edit {
+    if focused && app.mode == Mode::Edit && app.consumer_selected != CONSUMER_SHAPE_FIELD_INDEX {
         let field = &app.consumer_fields[app.consumer_selected];
         let value_view = field_value_view(field, value_width, true);
         let y = inner.y.saturating_add(app.consumer_selected as u16);
@@ -2218,6 +2779,13 @@ enum ArrayFooterAction {
     Remove,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShapeFooterAction {
+    Done,
+    Preset,
+    Custom,
+}
+
 fn array_footer_hit(area: Rect, column: u16, row: u16) -> Option<ArrayFooterAction> {
     if row != area.y.saturating_add(1) {
         return None;
@@ -2246,11 +2814,39 @@ fn array_footer_hit(area: Rect, column: u16, row: u16) -> Option<ArrayFooterActi
     })
 }
 
+fn shape_footer_hit(area: Rect, column: u16, row: u16) -> Option<ShapeFooterAction> {
+    if row != area.y.saturating_add(1) {
+        return None;
+    }
+    let hits = [
+        (
+            "SHAPE  ".len() as u16,
+            "[Done]".len() as u16,
+            ShapeFooterAction::Done,
+        ),
+        (
+            "SHAPE  [Done]  ".len() as u16,
+            "[Preset]".len() as u16,
+            ShapeFooterAction::Preset,
+        ),
+        (
+            "SHAPE  [Done]  [Preset]  ".len() as u16,
+            "[Custom]".len() as u16,
+            ShapeFooterAction::Custom,
+        ),
+    ];
+    hits.into_iter().find_map(|(start, width, action)| {
+        let start = area.x.saturating_add(start);
+        let end = start.saturating_add(width);
+        (column >= start && column < end).then_some(action)
+    })
+}
+
 fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let (mode, help) = match app.mode {
         Mode::Normal => (
             "NORMAL",
-            "1-4 panels  tab/arrows focus  up/down fields  enter edit  e estimate  q",
+            "1-4 panels  tab/arrows focus  up/down fields  enter edit  e estimate  q/esc",
         ),
         Mode::Edit if app.fields[app.selected].label == "Arrays" => {
             ("EDIT", "enter/tab apply estimate  esc close edit")
@@ -2267,6 +2863,15 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         Mode::Arrays => (
             "ARRAYS",
             "arrows select  enter edit  a add  d remove  esc done",
+        ),
+        Mode::Shape if app.shape_preset_selecting => ("SHAPE", "arrows enter apply  esc dismiss"),
+        Mode::Shape if app.shape_editing => (
+            "SHAPE",
+            "type value  enter apply  tab next  esc cancel edit",
+        ),
+        Mode::Shape => (
+            "SHAPE",
+            "arrows select  enter edit  p presets  c custom  esc",
         ),
     };
     let status = Line::from(vec![
@@ -2297,6 +2902,27 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             Span::raw("  "),
             Span::styled(
                 "[Remove]",
+                Style::default().fg(Color::Black).bg(Color::Yellow),
+            ),
+            Span::raw("  "),
+            Span::raw(help),
+        ])
+    } else if app.mode == Mode::Shape {
+        Line::from(vec![
+            Span::styled(mode, Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("  "),
+            Span::styled(
+                "[Done]",
+                Style::default().fg(Color::Black).bg(Color::Yellow),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                "[Preset]",
+                Style::default().fg(Color::Black).bg(Color::Yellow),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                "[Custom]",
                 Style::default().fg(Color::Black).bg(Color::Yellow),
             ),
             Span::raw("  "),
@@ -2514,6 +3140,152 @@ mod tests {
     }
 
     #[test]
+    fn consumer_load_profile_uses_custom_hourly_shape() {
+        let mut app = App::new();
+        let mut weights = vec![0.0; 24];
+        weights[18] = 1.0;
+        app.consumer_shape = ConsumerShapeState::HourlyWeights {
+            weights: weights.clone(),
+        };
+
+        let profile = app.consumer_load_profile().expect("custom profile");
+
+        match profile {
+            LoadProfile::AnnualKwh { shape, .. } => {
+                assert_eq!(shape, LoadShape::HourlyWeights { weights });
+            }
+            _ => panic!("expected annual load profile"),
+        }
+    }
+
+    #[test]
+    fn custom_shape_weights_require_24_finite_non_negative_values_with_positive_sum() {
+        assert!(validate_shape_weights(&[1.0; 24]).is_ok());
+        assert!(validate_shape_weights(&[0.0; 24]).is_err());
+        assert!(validate_shape_weights(&[1.0; 23]).is_err());
+
+        let mut weights = [1.0; 24];
+        weights[3] = -1.0;
+        assert!(validate_shape_weights(&weights).is_err());
+
+        let mut weights = [1.0; 24];
+        weights[3] = f64::NAN;
+        assert!(validate_shape_weights(&weights).is_err());
+    }
+
+    #[test]
+    fn shape_editor_opens_from_consumer_shape_row() {
+        let mut app = App::new();
+        app.panel_visibility.set_visible(Panel::Consumer, true);
+        app.focused_panel = Panel::Consumer;
+        app.consumer_selected = CONSUMER_SHAPE_FIELD_INDEX;
+        let mut estimator = SourceModelEstimator::load_embedded().expect("embedded estimator");
+
+        let quit = handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &mut app,
+            &mut estimator,
+        )
+        .expect("key handled");
+
+        assert!(!quit);
+        assert_eq!(app.mode, Mode::Shape);
+    }
+
+    #[test]
+    fn editing_preset_shape_copies_it_to_custom_first() {
+        let mut app = App::new();
+        app.shape_selected_hour = 18;
+
+        app.start_shape_cell_edit();
+
+        assert!(app.shape_editing);
+        assert_eq!(app.shape_cell.value, "1.55");
+        assert_eq!(
+            app.consumer_shape,
+            ConsumerShapeState::HourlyWeights {
+                weights: RESIDENTIAL_DEFAULT_WEIGHTS.to_vec(),
+            }
+        );
+    }
+
+    #[test]
+    fn switching_to_custom_shape_copies_preset_weights() {
+        let mut app = App::new();
+
+        app.set_shape_custom();
+
+        assert_eq!(
+            app.consumer_shape,
+            ConsumerShapeState::HourlyWeights {
+                weights: RESIDENTIAL_DEFAULT_WEIGHTS.to_vec(),
+            }
+        );
+    }
+
+    #[test]
+    fn preset_picker_does_not_apply_until_confirmed() {
+        let mut app = App::new();
+        app.set_shape_custom();
+        let custom = app.consumer_shape.clone();
+
+        app.open_shape_preset_picker();
+        app.move_shape_preset_selection(1);
+
+        assert_eq!(app.consumer_shape, custom);
+        assert!(app.shape_preset_selecting);
+
+        app.apply_shape_preset_picker();
+        assert_eq!(
+            app.consumer_shape,
+            ConsumerShapeState::BuiltIn {
+                shape_id: BuiltInLoadShapeId::Flat,
+            }
+        );
+        assert!(!app.shape_preset_selecting);
+    }
+
+    #[test]
+    fn preset_picker_can_be_dismissed_without_replacing_custom_weights() {
+        let mut app = App::new();
+        app.set_shape_custom();
+        let custom = app.consumer_shape.clone();
+
+        app.open_shape_preset_picker();
+        app.move_shape_preset_selection(1);
+        app.dismiss_shape_preset_picker();
+
+        assert_eq!(app.consumer_shape, custom);
+        assert!(!app.shape_preset_selecting);
+    }
+
+    #[test]
+    fn built_in_shape_weights_support_all_presets() {
+        for shape_id in BUILT_IN_LOAD_SHAPES {
+            let weights = built_in_shape_weights(shape_id);
+            assert_eq!(weights.len(), 24);
+            assert!(validate_shape_weights(weights).is_ok());
+        }
+    }
+
+    #[test]
+    fn applying_custom_shape_weight_updates_selected_hour() {
+        let mut app = App::new();
+        app.set_shape_custom();
+        app.shape_selected_hour = 18;
+        app.shape_cell.set_value("2.5");
+        app.shape_editing = true;
+
+        app.apply_shape_cell_edit();
+
+        let ConsumerShapeState::HourlyWeights { weights } = app.consumer_shape else {
+            panic!("expected custom shape");
+        };
+        assert_eq!(weights[18], 2.5);
+        assert!(!app.shape_editing);
+    }
+
+    #[test]
     fn consumer_annual_edit_updates_daily_energy() {
         let mut app = App::new();
         app.focused_panel = Panel::Consumer;
@@ -2629,6 +3401,21 @@ mod tests {
     }
 
     #[test]
+    fn normal_mode_escape_quits() {
+        let mut app = App::new();
+        let mut estimator = SourceModelEstimator::load_embedded().expect("embedded estimator");
+
+        let quit = handle_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+            &mut app,
+            &mut estimator,
+        )
+        .expect("key handled");
+
+        assert!(quit);
+    }
+
+    #[test]
     fn default_layout_snapshot() {
         let app = App::new();
 
@@ -2694,6 +3481,32 @@ mod tests {
     }
 
     #[test]
+    fn shape_editor_snapshot() {
+        let mut app = App::new();
+        app.mode = Mode::Shape;
+        app.shape_selected_hour = 18;
+        app.consumer_shape = ConsumerShapeState::HourlyWeights {
+            weights: RESIDENTIAL_DEFAULT_WEIGHTS.to_vec(),
+        };
+        app.sync_consumer_shape_field();
+
+        assert_snapshot("shape_editor", &render_snapshot(&app));
+    }
+
+    #[test]
+    fn shape_preset_picker_snapshot() {
+        let mut app = App::new();
+        app.mode = Mode::Shape;
+        app.consumer_shape = ConsumerShapeState::HourlyWeights {
+            weights: RESIDENTIAL_DEFAULT_WEIGHTS.to_vec(),
+        };
+        app.open_shape_preset_picker();
+        app.shape_preset_selected = 2;
+
+        assert_snapshot("shape_preset_picker", &render_snapshot(&app));
+    }
+
+    #[test]
     fn arrays_editor_hit_tests_match_layout() {
         let area = Rect::new(0, 0, 80, 22);
         assert_eq!(array_cell_at(area, 8, 4, 0), Some((0, 0)));
@@ -2716,6 +3529,40 @@ mod tests {
             Some(ArrayFooterAction::Remove)
         );
         assert_eq!(array_footer_hit(footer_area, 33, 23), None);
+    }
+
+    #[test]
+    fn shape_editor_hit_tests_match_layout() {
+        let area = Rect::new(0, 0, 80, 22);
+        assert_eq!(shape_cell_at(area, 1, 5), Some(0));
+        assert_eq!(shape_cell_at(area, 19, 5), Some(1));
+        assert_eq!(shape_cell_at(area, 37, 9), Some(18));
+        assert_eq!(shape_cell_at(area, 1, 4), None);
+        assert_eq!(shape_cell_at(area, 79, 5), None);
+
+        let footer_area = Rect::new(0, 22, 80, 2);
+        assert_eq!(
+            shape_footer_hit(footer_area, 8, 23),
+            Some(ShapeFooterAction::Done)
+        );
+        assert_eq!(
+            shape_footer_hit(footer_area, 17, 23),
+            Some(ShapeFooterAction::Preset)
+        );
+        assert_eq!(
+            shape_footer_hit(footer_area, 28, 23),
+            Some(ShapeFooterAction::Custom)
+        );
+        assert_eq!(shape_footer_hit(footer_area, 36, 23), None);
+    }
+
+    #[test]
+    fn shape_preset_picker_hit_tests_match_layout() {
+        let area = Rect::new(0, 0, 80, 22);
+        assert_eq!(shape_preset_option_at(area, 15, 3), Some(0));
+        assert_eq!(shape_preset_option_at(area, 15, 6), Some(3));
+        assert_eq!(shape_preset_option_at(area, 15, 7), None);
+        assert_eq!(shape_preset_option_at(area, 1, 3), None);
     }
 
     #[test]
@@ -2926,6 +3773,7 @@ mod tests {
                 },
             ],
             consumer_fields: Vec::new(),
+            consumer_shape: ConsumerShapeState::default(),
             panel_visibility: PanelVisibility::default(),
             focused_panel: Panel::System,
         };
