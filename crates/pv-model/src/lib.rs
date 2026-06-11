@@ -56,8 +56,9 @@ pub struct EstimateRequest {
     pub storage_usable_kwh: Option<f64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EstimateArray {
+    pub name: Option<String>,
     pub peak_power_kwp: f64,
     pub tilt_deg: f64,
     pub azimuth_deg: f64,
@@ -83,6 +84,7 @@ impl Default for EstimateRequest {
 impl EstimateRequest {
     pub fn single_array(&self) -> EstimateArray {
         EstimateArray {
+            name: None,
             peak_power_kwp: self.peak_power_kwp,
             tilt_deg: self.tilt_deg,
             azimuth_deg: self.azimuth_deg,
@@ -376,11 +378,15 @@ impl SourceModelEstimator {
                 "temporal_bins": self.temporal_bins,
                 "target_names": self.target_names,
                 "arrays": arrays.iter().map(|array| {
-                    json!({
+                    let mut reference = json!({
                         "peak_power_kwp": array.peak_power_kwp,
                         "tilt_deg": array.tilt_deg,
                         "azimuth_deg": array.azimuth_deg,
-                    })
+                    });
+                    if let Some(name) = &array.name {
+                        reference["name"] = json!(name);
+                    }
+                    reference
                 }).collect::<Vec<_>>(),
             }),
         })
@@ -406,7 +412,7 @@ pub fn short_month_name(month: u8) -> Option<&'static str> {
 
 pub fn validate_request(request: &EstimateRequest) -> Result<()> {
     validate_request_location_and_loss(request)?;
-    validate_array(request.single_array(), "system")
+    validate_array(&request.single_array(), "system")
 }
 
 fn validate_request_location_and_loss(request: &EstimateRequest) -> Result<()> {
@@ -431,13 +437,13 @@ pub fn validate_arrays(arrays: &[EstimateArray]) -> Result<()> {
     if arrays.is_empty() {
         bail!("at least one array is required");
     }
-    for (index, array) in arrays.iter().copied().enumerate() {
+    for (index, array) in arrays.iter().enumerate() {
         validate_array(array, &format!("array {}", index + 1))?;
     }
     Ok(())
 }
 
-fn validate_array(array: EstimateArray, label: &str) -> Result<()> {
+fn validate_array(array: &EstimateArray, label: &str) -> Result<()> {
     if array.peak_power_kwp <= 0.0 {
         bail!("{label} peak power must be positive");
     }
@@ -451,11 +457,11 @@ fn total_peak_power_kwp(arrays: &[EstimateArray]) -> f64 {
     arrays.iter().map(|array| array.peak_power_kwp).sum()
 }
 
-fn weighted_array_value(arrays: &[EstimateArray], value: impl Fn(EstimateArray) -> f64) -> f64 {
+fn weighted_array_value(arrays: &[EstimateArray], value: impl Fn(&EstimateArray) -> f64) -> f64 {
     let total_kwp = total_peak_power_kwp(arrays);
     arrays
         .iter()
-        .map(|array| array.peak_power_kwp * value(*array))
+        .map(|array| array.peak_power_kwp * value(array))
         .sum::<f64>()
         / total_kwp
 }
@@ -1059,7 +1065,7 @@ fn estimate_pv_from_climate(
     let total_kwp = total_peak_power_kwp(arrays);
     let predictions = arrays
         .iter()
-        .map(|array| estimate_array_pv_from_climate(climate, request, *array))
+        .map(|array| estimate_array_pv_from_climate(climate, request, array))
         .collect::<Vec<_>>();
 
     let monthly = (0..12)
@@ -1114,7 +1120,7 @@ fn estimate_pv_from_climate(
 fn estimate_array_pv_from_climate(
     climate: &[[f64; TARGETS]; TEMPORAL_BINS],
     request: &EstimateRequest,
-    array: EstimateArray,
+    array: &EstimateArray,
 ) -> PvPrediction {
     let lat_rad = request.latitude.to_radians();
     let tilt = array.tilt_deg.to_radians();
@@ -1187,7 +1193,7 @@ fn estimate_hourly_pv_from_climate(
     let mut month_hour = [[0.0; 24]; 12];
     for array in arrays {
         let array_month_hour =
-            estimate_array_month_hour_energy_from_climate(climate, request, *array);
+            estimate_array_month_hour_energy_from_climate(climate, request, array);
         for month in 0..12 {
             for hour in 0..24 {
                 month_hour[month][hour] += array_month_hour[month][hour];
@@ -1207,7 +1213,7 @@ fn estimate_hourly_pv_from_climate(
 fn estimate_array_month_hour_energy_from_climate(
     climate: &[[f64; TARGETS]; TEMPORAL_BINS],
     request: &EstimateRequest,
-    array: EstimateArray,
+    array: &EstimateArray,
 ) -> [[f64; 24]; 12] {
     let lat_rad = request.latitude.to_radians();
     let tilt = array.tilt_deg.to_radians();
@@ -1403,11 +1409,13 @@ mod tests {
     fn validates_array_inputs() {
         validate_arrays(&[
             EstimateArray {
+                name: None,
                 peak_power_kwp: 1.5,
                 tilt_deg: 30.0,
                 azimuth_deg: 0.0,
             },
             EstimateArray {
+                name: None,
                 peak_power_kwp: 2.0,
                 tilt_deg: 15.0,
                 azimuth_deg: -90.0,
@@ -1418,6 +1426,7 @@ mod tests {
         assert!(validate_arrays(&[]).is_err());
         assert!(
             validate_arrays(&[EstimateArray {
+                name: None,
                 peak_power_kwp: 1.0,
                 tilt_deg: 91.0,
                 azimuth_deg: 0.0,
@@ -1463,11 +1472,13 @@ mod tests {
         let request = EstimateRequest::default();
         let arrays = [
             EstimateArray {
+                name: None,
                 peak_power_kwp: 1.5,
                 tilt_deg: 30.0,
                 azimuth_deg: 0.0,
             },
             EstimateArray {
+                name: None,
                 peak_power_kwp: 2.0,
                 tilt_deg: 15.0,
                 azimuth_deg: -90.0,

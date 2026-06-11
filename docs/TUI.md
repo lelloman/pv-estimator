@@ -48,7 +48,7 @@ Editable fields:
 | `Loss %` | System loss percent. |
 | `EUR/kWh` | Optional energy value used to show estimated annual revenue. Leave empty to hide revenue. |
 | `Storage kWh` | Optional usable battery storage capacity metadata. Leave empty when no storage is modeled. |
-| `Arrays` | One or more array definitions. The main screen shows an `[Edit]` summary plus a parsed table preview. Azimuth uses the PVGIS convention: `0` south, `-90` east, `90` west. |
+| `Arrays` | One or more array definitions as `[name,]kWp,tilt,azimuth`. The optional name is shown in array tables and JSON references. Azimuth uses the PVGIS convention: `0` south, `-90` east, `90` west. |
 
 Consumer panel fields:
 
@@ -64,7 +64,7 @@ Editing `Name`, `Region`, `Latitude`, or `Longitude` marks the location as
 Example `Arrays` value:
 
 ```text
-1.5,30,0; 2.0,20,-90; 1.0,10,90
+south roof,1.5,30,0; west roof,2.0,20,-90; 1.0,10,90
 ```
 
 The TUI shows the parsed total kWp and per-array summary table below the
@@ -109,7 +109,7 @@ Arrays mode:
 | Key | Action |
 | --- | --- |
 | `Up` / `Down` | Move between arrays. |
-| `Left` / `Right` | Move between `kWp`, `Tilt`, and `Azimuth` cells. |
+| `Left` / `Right` | Move between `Name`, `kWp`, `Tilt`, and `Azimuth` cells. |
 | `Enter` | Edit the selected cell, or apply a cell edit. |
 | `Tab` / `Shift+Tab` | Move between cells. While editing, apply and move. |
 | `a` | Add a new default array. |

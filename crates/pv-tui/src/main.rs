@@ -59,9 +59,9 @@ const ESTIMATE_LABEL_WIDTH: usize = 11;
 const SEARCH_LABEL_WIDTH: u16 = 8;
 const LOCATION_RESULT_HEADER_ROWS: u16 = 3;
 const ARRAY_EDITOR_HEADER_ROWS: u16 = 3;
-const ARRAY_TABLE_WIDTHS: [u16; 9] = [4, 1, 8, 1, 8, 1, 9, 1, 9];
-const ARRAY_CELL_WIDTHS: [usize; 3] = [8, 8, 9];
-const ARRAY_CELL_STARTS: [u16; 3] = [7, 18, 29];
+const ARRAY_TABLE_WIDTHS: [u16; 9] = [12, 1, 8, 1, 8, 1, 9, 1, 9];
+const ARRAY_CELL_WIDTHS: [usize; 4] = [12, 8, 8, 9];
+const ARRAY_CELL_STARTS: [u16; 4] = [0, 15, 26, 37];
 const SHAPE_EDITOR_HEADER_ROWS: u16 = 4;
 const SHAPE_EDITOR_COLUMNS: usize = 4;
 const SHAPE_EDITOR_ROWS: usize = 6;
@@ -688,7 +688,7 @@ impl App {
 
     fn request_and_arrays(&self) -> Result<(EstimateRequest, Vec<EstimateArray>)> {
         let arrays = parse_arrays(&self.fields[ARRAY_FIELD_INDEX])?;
-        let first_array = arrays[0];
+        let first_array = &arrays[0];
         Ok((
             EstimateRequest {
                 location_id: self.selected_location_id.clone(),
@@ -1133,7 +1133,7 @@ impl App {
         } else {
             self.array_selected = self.array_selected.min(arrays.len() - 1);
         }
-        self.array_column = self.array_column.min(2);
+        self.array_column = self.array_column.min(3);
     }
 
     fn set_arrays(&mut self, arrays: &[EstimateArray]) {
@@ -1170,26 +1170,34 @@ impl App {
         self.array_cell
             .set_value(&array_cell_value(array, self.array_column));
         self.array_editing = true;
-        self.status = "Editing array value".to_string();
+        self.status = if self.array_column == 0 {
+            "Editing array name".to_string()
+        } else {
+            "Editing array value".to_string()
+        };
     }
 
     fn apply_array_cell_edit(&mut self, estimator: &mut SourceModelEstimator) {
-        let value = match self.array_cell.value.parse::<f64>() {
-            Ok(value) => value,
-            Err(_) => {
-                self.status = "Array value must be a number".to_string();
-                return;
-            }
-        };
         let mut arrays = self.current_arrays();
         let Some(array) = arrays.get_mut(self.array_selected) else {
             return;
         };
-        match self.array_column {
-            0 => array.peak_power_kwp = value,
-            1 => array.tilt_deg = value,
-            2 => array.azimuth_deg = value,
-            _ => {}
+        if self.array_column == 0 {
+            array.name = optional_array_name(&self.array_cell.value);
+        } else {
+            let value = match self.array_cell.value.parse::<f64>() {
+                Ok(value) => value,
+                Err(_) => {
+                    self.status = "Array value must be a number".to_string();
+                    return;
+                }
+            };
+            match self.array_column {
+                1 => array.peak_power_kwp = value,
+                2 => array.tilt_deg = value,
+                3 => array.azimuth_deg = value,
+                _ => {}
+            }
         }
         self.array_editing = false;
         self.set_arrays(&arrays);
@@ -1197,7 +1205,7 @@ impl App {
     }
 
     fn move_array_cell_forward(&mut self) {
-        if self.array_column < 2 {
+        if self.array_column < 3 {
             self.array_column += 1;
         } else {
             self.array_column = 0;
@@ -1375,6 +1383,7 @@ fn parse_f64(field: &Field) -> Result<f64> {
 
 fn default_array() -> EstimateArray {
     EstimateArray {
+        name: None,
         peak_power_kwp: 1.0,
         tilt_deg: 30.0,
         azimuth_deg: 0.0,
@@ -1384,11 +1393,15 @@ fn default_array() -> EstimateArray {
 fn arrays_to_field_value(arrays: &[EstimateArray]) -> String {
     arrays
         .iter()
-        .map(|array| {
-            format!(
+        .map(|array| match &array.name {
+            Some(name) => format!(
+                "{},{:.2},{:.1},{:.1}",
+                name, array.peak_power_kwp, array.tilt_deg, array.azimuth_deg
+            ),
+            None => format!(
                 "{:.2},{:.1},{:.1}",
                 array.peak_power_kwp, array.tilt_deg, array.azimuth_deg
-            )
+            ),
         })
         .collect::<Vec<_>>()
         .join("; ")
@@ -1396,9 +1409,10 @@ fn arrays_to_field_value(arrays: &[EstimateArray]) -> String {
 
 fn array_cell_value(array: &EstimateArray, column: usize) -> String {
     match column {
-        0 => format!("{:.2}", array.peak_power_kwp),
-        1 => format!("{:.1}", array.tilt_deg),
-        2 => format!("{:.1}", array.azimuth_deg),
+        0 => array.name.clone().unwrap_or_default(),
+        1 => format!("{:.2}", array.peak_power_kwp),
+        2 => format!("{:.1}", array.tilt_deg),
+        3 => format!("{:.1}", array.azimuth_deg),
         _ => String::new(),
     }
 }
@@ -1411,7 +1425,7 @@ fn parse_arrays(field: &Field) -> Result<Vec<EstimateArray>> {
         .filter(|entry| !entry.is_empty())
         .collect::<Vec<_>>();
     if entries.is_empty() {
-        anyhow::bail!("Arrays must contain at least one kWp,tilt,azimuth entry");
+        anyhow::bail!("Arrays must contain at least one [name,]kWp,tilt,azimuth entry");
     }
 
     entries
@@ -1423,20 +1437,28 @@ fn parse_arrays(field: &Field) -> Result<Vec<EstimateArray>> {
 
 fn parse_array_entry(index: usize, entry: &str) -> Result<EstimateArray> {
     let parts = entry.split(',').map(str::trim).collect::<Vec<_>>();
-    if parts.len() != 3 {
-        anyhow::bail!("array {index} must be kWp,tilt,azimuth");
-    }
+    let (name, numeric) = match parts.as_slice() {
+        [kwp, tilt, azimuth] => (None, [*kwp, *tilt, *azimuth]),
+        [name, kwp, tilt, azimuth] => (optional_array_name(name), [*kwp, *tilt, *azimuth]),
+        _ => anyhow::bail!("array {index} must be [name,]kWp,tilt,azimuth"),
+    };
     Ok(EstimateArray {
-        peak_power_kwp: parts[0]
+        name,
+        peak_power_kwp: numeric[0]
             .parse::<f64>()
             .with_context(|| format!("array {index} kWp must be a number"))?,
-        tilt_deg: parts[1]
+        tilt_deg: numeric[1]
             .parse::<f64>()
             .with_context(|| format!("array {index} tilt must be a number"))?,
-        azimuth_deg: parts[2]
+        azimuth_deg: numeric[2]
             .parse::<f64>()
             .with_context(|| format!("array {index} azimuth must be a number"))?,
     })
+}
+
+fn optional_array_name(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn handle_key(key: KeyEvent, app: &mut App, estimator: &mut SourceModelEstimator) -> Result<bool> {
@@ -2200,19 +2222,25 @@ fn array_summary_lines(arrays: &[EstimateArray]) -> Vec<Line<'static>> {
             Span::styled(format!("{:.2} kWp", total_array_kwp(arrays)), total_style),
         ]),
         Line::from(vec![Span::styled(
-            "  ID | kWp  | Tilt | Az     | Dir",
+            "  Name   | kWp  | Tilt | Az    | Dir",
             label_style,
         )]),
     ];
     for (array_index, array) in arrays.iter().enumerate() {
         let direction = azimuth_direction_label(&array.azimuth_deg.to_string()).unwrap_or("");
         lines.push(Line::from(vec![
-            Span::styled(format!("  A{:<2}| ", array_index + 1), label_style),
+            Span::styled(
+                format!(
+                    "  {:<7}| ",
+                    truncate(&array_display_name(array, array_index), 7)
+                ),
+                label_style,
+            ),
             Span::styled(format!("{:<5.2}", array.peak_power_kwp), value_style),
             Span::styled("| ", label_style),
             Span::styled(format!("{:<5.1}", array.tilt_deg), value_style),
             Span::styled("| ", label_style),
-            Span::styled(format!("{:<7.1}", array.azimuth_deg), value_style),
+            Span::styled(format!("{:<6.1}", array.azimuth_deg), value_style),
             Span::styled("| ", label_style),
             Span::styled(direction.to_string(), value_style),
         ]));
@@ -2256,7 +2284,7 @@ fn render_array_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         .take(visible_count)
         .map(|(index, array)| array_editor_row(app, index, array));
     let header = Row::new(vec![
-        Cell::from("ID"),
+        Cell::from("Name"),
         Cell::from("|"),
         Cell::from("kWp"),
         Cell::from("|"),
@@ -2293,7 +2321,14 @@ fn array_editor_row(app: &App, index: usize, array: &EstimateArray) -> Row<'stat
     };
     let value_for = |column: usize| {
         if selected && app.array_column == column && app.array_editing {
-            field_value_view(&app.array_cell, ARRAY_CELL_WIDTHS[column], true).value
+            let value = field_value_view(&app.array_cell, ARRAY_CELL_WIDTHS[column], true).value;
+            if column == 0 && value.is_empty() {
+                "[name]".to_string()
+            } else {
+                value
+            }
+        } else if column == 0 {
+            array_display_name(array, index)
         } else {
             array_cell_value(array, column)
         }
@@ -2301,16 +2336,23 @@ fn array_editor_row(app: &App, index: usize, array: &EstimateArray) -> Row<'stat
     let direction = azimuth_direction_label(&array.azimuth_deg.to_string()).unwrap_or("");
     let separator = Cell::from("|").style(Style::default().fg(Color::DarkGray));
     Row::new(vec![
-        Cell::from(format!("A{}", index + 1)).style(Style::default().fg(Color::DarkGray)),
-        separator.clone(),
         Cell::from(value_for(0)).style(cell_style(0)),
         separator.clone(),
         Cell::from(value_for(1)).style(cell_style(1)),
         separator.clone(),
         Cell::from(value_for(2)).style(cell_style(2)),
+        separator.clone(),
+        Cell::from(value_for(3)).style(cell_style(3)),
         separator,
         Cell::from(direction.to_string()).style(Style::default().fg(Color::DarkGray)),
     ])
+}
+
+fn array_display_name(array: &EstimateArray, index: usize) -> String {
+    array
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("A{}", index + 1))
 }
 
 fn array_editor_cursor(inner: Rect, field: &Field, row: usize, column: usize) -> Position {
@@ -4295,11 +4337,13 @@ mod tests {
     fn arrays_to_field_value_preserves_structured_rows() {
         let arrays = vec![
             EstimateArray {
+                name: None,
                 peak_power_kwp: 1.5,
                 tilt_deg: 30.0,
                 azimuth_deg: 0.0,
             },
             EstimateArray {
+                name: Some("west roof".to_string()),
                 peak_power_kwp: 2.25,
                 tilt_deg: 20.0,
                 azimuth_deg: -90.0,
@@ -4308,8 +4352,42 @@ mod tests {
 
         assert_eq!(
             arrays_to_field_value(&arrays),
-            "1.50,30.0,0.0; 2.25,20.0,-90.0"
+            "1.50,30.0,0.0; west roof,2.25,20.0,-90.0"
         );
+    }
+
+    #[test]
+    fn applying_array_name_edit_updates_optional_name() {
+        let mut app = App::new();
+        app.fields[ARRAY_FIELD_INDEX].set_value("1.5,30,0");
+        app.array_selected = 0;
+        app.array_column = 0;
+        app.array_cell.set_value("south roof");
+        app.array_editing = true;
+        let mut estimator = SourceModelEstimator::load_embedded().expect("embedded estimator");
+
+        app.apply_array_cell_edit(&mut estimator);
+
+        let arrays = parse_arrays(&app.fields[ARRAY_FIELD_INDEX]).expect("valid arrays");
+        assert_eq!(arrays[0].name.as_deref(), Some("south roof"));
+        assert_eq!(
+            app.fields[ARRAY_FIELD_INDEX].value,
+            "south roof,1.50,30.0,0.0"
+        );
+    }
+
+    #[test]
+    fn array_name_edit_shows_placeholder_when_empty() {
+        let mut app = App::new();
+        app.mode = Mode::Arrays;
+        app.array_selected = 0;
+        app.array_column = 0;
+
+        app.start_array_cell_edit();
+        let snapshot = render_snapshot(&app);
+
+        assert_eq!(app.status, "Editing array name");
+        assert!(snapshot.contains("[name]"));
     }
 
     #[test]
@@ -4549,13 +4627,15 @@ mod tests {
 
     #[test]
     fn parses_multiple_array_entries() {
-        let field = Field::new("Arrays", "1.5,30,0; 2.25,20,-90");
+        let field = Field::new("Arrays", "1.5,30,0; west roof,2.25,20,-90");
         let arrays = parse_arrays(&field).expect("valid arrays");
 
         assert_eq!(arrays.len(), 2);
+        assert_eq!(arrays[0].name, None);
         assert_eq!(arrays[0].peak_power_kwp, 1.5);
         assert_eq!(arrays[0].tilt_deg, 30.0);
         assert_eq!(arrays[0].azimuth_deg, 0.0);
+        assert_eq!(arrays[1].name.as_deref(), Some("west roof"));
         assert_eq!(arrays[1].peak_power_kwp, 2.25);
         assert_eq!(arrays[1].tilt_deg, 20.0);
         assert_eq!(arrays[1].azimuth_deg, -90.0);
@@ -4569,7 +4649,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("array 1 must be kWp,tilt,azimuth")
+                .contains("array 1 must be [name,]kWp,tilt,azimuth")
         );
     }
 

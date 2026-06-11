@@ -44,7 +44,7 @@ struct EstimateArgs {
     azimuth_deg: f64,
     #[arg(long = "storage-kwh")]
     storage_kwh: Option<f64>,
-    #[arg(long = "array", value_name = "KWP,TILT,AZIMUTH")]
+    #[arg(long = "array", value_name = "[NAME,]KWP,TILT,AZIMUTH")]
     arrays: Vec<String>,
     #[arg(long)]
     model_dir: Option<PathBuf>,
@@ -99,6 +99,7 @@ fn run() -> Result<()> {
 fn estimate_arrays(args: &EstimateArgs) -> Result<Vec<EstimateArray>> {
     if args.arrays.is_empty() {
         return Ok(vec![EstimateArray {
+            name: None,
             peak_power_kwp: args.kwp,
             tilt_deg: args.tilt_deg,
             azimuth_deg: args.azimuth_deg,
@@ -122,25 +123,33 @@ fn estimate_arrays(args: &EstimateArgs) -> Result<Vec<EstimateArray>> {
 
 fn parse_array_arg(index: usize, value: &str) -> Result<EstimateArray> {
     let parts = value.split(',').map(str::trim).collect::<Vec<_>>();
-    if parts.len() != 3 {
-        bail!("array {index} must be KWP,TILT,AZIMUTH");
-    }
+    let (name, numeric) = match parts.as_slice() {
+        [kwp, tilt, azimuth] => (None, [*kwp, *tilt, *azimuth]),
+        [name, kwp, tilt, azimuth] => (optional_array_name(name), [*kwp, *tilt, *azimuth]),
+        _ => bail!("array {index} must be [NAME,]KWP,TILT,AZIMUTH"),
+    };
     Ok(EstimateArray {
-        peak_power_kwp: parts[0]
+        name,
+        peak_power_kwp: numeric[0]
             .parse::<f64>()
             .map_err(|_| anyhow::anyhow!("array {index} KWP must be a number"))?,
-        tilt_deg: parts[1]
+        tilt_deg: numeric[1]
             .parse::<f64>()
             .map_err(|_| anyhow::anyhow!("array {index} TILT must be a number"))?,
-        azimuth_deg: parts[2]
+        azimuth_deg: numeric[2]
             .parse::<f64>()
             .map_err(|_| anyhow::anyhow!("array {index} AZIMUTH must be a number"))?,
     })
 }
 
+fn optional_array_name(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
 fn estimate(args: EstimateArgs) -> Result<()> {
     let arrays = estimate_arrays(&args)?;
-    let first_array = arrays[0];
+    let first_array = &arrays[0];
     let request = EstimateRequest {
         latitude: args.lat,
         longitude: args.lon,
