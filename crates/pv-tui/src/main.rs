@@ -15,6 +15,7 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, size,
 };
 use directories::ProjectDirs;
+use pv_core::simulation::{BuiltInLoadShapeId, LoadProfile, LoadShape};
 use pv_core::source_model::SourceEnsembleEstimateDocument;
 use pv_data::CitySearchResult;
 use pv_model::{
@@ -43,6 +44,9 @@ const PRICE_FIELD_INDEX: usize = 5;
 const STORAGE_FIELD_INDEX: usize = 6;
 const ARRAY_FIELD_INDEX: usize = 7;
 const FIELD_LABEL_WIDTH: u16 = 13;
+const CONSUMER_ANNUAL_FIELD_INDEX: usize = 0;
+const CONSUMER_DAILY_FIELD_INDEX: usize = 1;
+const CONSUMER_SHAPE_FIELD_INDEX: usize = 2;
 const ESTIMATE_LABEL_WIDTH: usize = 11;
 const SEARCH_LABEL_WIDTH: u16 = 8;
 const LOCATION_RESULT_HEADER_ROWS: u16 = 3;
@@ -60,6 +64,8 @@ struct TuiState {
     selected_location_id: String,
     location_query: String,
     fields: Vec<TuiFieldState>,
+    #[serde(default)]
+    consumer_fields: Vec<TuiFieldState>,
     #[serde(default)]
     panel_visibility: PanelVisibility,
     #[serde(default)]
@@ -178,7 +184,9 @@ struct Field {
 #[derive(Debug)]
 struct App {
     fields: Vec<Field>,
+    consumer_fields: Vec<Field>,
     selected: usize,
+    consumer_selected: usize,
     mode: Mode,
     status: String,
     estimate: Option<SourceEnsembleEstimateDocument>,
@@ -273,7 +281,13 @@ impl App {
                 Field::new("Storage kWh", ""),
                 Field::new("Arrays", "1.0,30.0,0.0"),
             ],
+            consumer_fields: vec![
+                Field::new("Annual kWh", "4200"),
+                Field::new("Daily kWh", ""),
+                Field::new("Shape", "residential_default"),
+            ],
             selected: 2,
+            consumer_selected: 0,
             mode: Mode::Normal,
             status: "Ready".to_string(),
             estimate: None,
@@ -328,6 +342,15 @@ impl App {
                 field.set_value(&saved.value);
             }
         }
+        for field in &mut self.consumer_fields {
+            if let Some(saved) = state
+                .consumer_fields
+                .iter()
+                .find(|saved| saved.label == field.label)
+            {
+                field.set_value(&saved.value);
+            }
+        }
         self.selected_location_id = state.selected_location_id;
         self.location_query.set_value(&state.location_query);
         self.panel_visibility = state.panel_visibility;
@@ -354,6 +377,14 @@ impl App {
                     value: field.value.clone(),
                 })
                 .collect(),
+            consumer_fields: self
+                .consumer_fields
+                .iter()
+                .map(|field| TuiFieldState {
+                    label: field.label.to_string(),
+                    value: field.value.clone(),
+                })
+                .collect(),
             panel_visibility: self.panel_visibility,
             focused_panel: self.focused_panel,
         };
@@ -367,6 +398,47 @@ impl App {
         })();
         if let Err(error) = result {
             self.status = format!("Could not save state: {error:#}");
+        }
+    }
+
+    fn apply_active_edit(&mut self, estimator: &mut SourceModelEstimator, movement: i32) {
+        match self.focused_panel {
+            Panel::System => {
+                self.mode = Mode::Normal;
+                self.recompute(estimator);
+                match movement.cmp(&0) {
+                    std::cmp::Ordering::Greater => {
+                        self.selected = (self.selected + 1).min(self.fields.len() - 1);
+                    }
+                    std::cmp::Ordering::Less => {
+                        self.selected = self.selected.saturating_sub(1);
+                    }
+                    std::cmp::Ordering::Equal => {}
+                }
+            }
+            Panel::Consumer => match self.validate_consumer_fields() {
+                Ok(()) => {
+                    self.mode = Mode::Normal;
+                    self.status = "Consumer updated".to_string();
+                    self.save_state();
+                    match movement.cmp(&0) {
+                        std::cmp::Ordering::Greater => {
+                            self.consumer_selected =
+                                (self.consumer_selected + 1).min(self.consumer_fields.len() - 1);
+                        }
+                        std::cmp::Ordering::Less => {
+                            self.consumer_selected = self.consumer_selected.saturating_sub(1);
+                        }
+                        std::cmp::Ordering::Equal => {}
+                    }
+                }
+                Err(error) => {
+                    self.status = format!("{error:#}");
+                }
+            },
+            _ => {
+                self.mode = Mode::Normal;
+            }
         }
     }
 
@@ -463,12 +535,36 @@ impl App {
         ))
     }
 
-    fn selected_field_mut(&mut self) -> &mut Field {
-        &mut self.fields[self.selected]
+    fn active_field_mut(&mut self) -> Option<&mut Field> {
+        match self.focused_panel {
+            Panel::System => Some(&mut self.fields[self.selected]),
+            Panel::Consumer => Some(&mut self.consumer_fields[self.consumer_selected]),
+            _ => None,
+        }
+    }
+
+    fn validate_consumer_fields(&self) -> Result<()> {
+        let _ = self.consumer_load_profile()?;
+        Ok(())
+    }
+
+    fn consumer_load_profile(&self) -> Result<LoadProfile> {
+        let shape = consumer_load_shape(&self.consumer_fields[CONSUMER_SHAPE_FIELD_INDEX])?;
+        let annual =
+            parse_optional_positive_f64(&self.consumer_fields[CONSUMER_ANNUAL_FIELD_INDEX])?;
+        let daily = parse_optional_positive_f64(&self.consumer_fields[CONSUMER_DAILY_FIELD_INDEX])?;
+        match (annual, daily) {
+            (Some(_), Some(_)) => {
+                anyhow::bail!("Consumer Annual kWh and Daily kWh cannot both be set")
+            }
+            (None, None) => anyhow::bail!("Consumer Annual kWh or Daily kWh is required"),
+            (Some(annual_kwh), None) => Ok(LoadProfile::AnnualKwh { annual_kwh, shape }),
+            (None, Some(daily_kwh)) => Ok(LoadProfile::DailyKwh { daily_kwh, shape }),
+        }
     }
 
     fn mark_custom_location_if_needed(&mut self) {
-        if self.selected <= 3 {
+        if self.focused_panel == Panel::System && self.selected <= 3 {
             self.selected_location_id = "custom".to_string();
         }
     }
@@ -723,6 +819,15 @@ fn parse_optional_positive_f64(field: &Field) -> Result<Option<f64>> {
     Ok(Some(value))
 }
 
+fn consumer_load_shape(field: &Field) -> Result<LoadShape> {
+    match field.value.trim() {
+        "residential_default" => Ok(LoadShape::BuiltIn {
+            shape_id: BuiltInLoadShapeId::ResidentialDefault,
+        }),
+        _ => anyhow::bail!("Shape must be residential_default"),
+    }
+}
+
 fn parse_f64(field: &Field) -> Result<f64> {
     field
         .value
@@ -828,8 +933,18 @@ fn handle_normal_key(
         KeyCode::Down if app.focused_panel == Panel::System => {
             app.selected = (app.selected + 1).min(app.fields.len() - 1)
         }
+        KeyCode::Up if app.focused_panel == Panel::Consumer => {
+            app.consumer_selected = app.consumer_selected.saturating_sub(1)
+        }
+        KeyCode::Down if app.focused_panel == Panel::Consumer => {
+            app.consumer_selected = (app.consumer_selected + 1).min(app.consumer_fields.len() - 1)
+        }
         KeyCode::Home if app.focused_panel == Panel::System => app.selected = 0,
         KeyCode::End if app.focused_panel == Panel::System => app.selected = app.fields.len() - 1,
+        KeyCode::Home if app.focused_panel == Panel::Consumer => app.consumer_selected = 0,
+        KeyCode::End if app.focused_panel == Panel::Consumer => {
+            app.consumer_selected = app.consumer_fields.len() - 1
+        }
         KeyCode::Enter
             if app.focused_panel == Panel::System && app.fields[app.selected].label == "Name" =>
         {
@@ -841,6 +956,7 @@ fn handle_normal_key(
             app.open_array_editor()
         }
         KeyCode::Enter if app.focused_panel == Panel::System => app.mode = Mode::Edit,
+        KeyCode::Enter if app.focused_panel == Panel::Consumer => app.mode = Mode::Edit,
         KeyCode::Char('l') if app.focused_panel == Panel::System => app.open_location_search(),
         KeyCode::Char('e') => app.recompute(estimator),
         KeyCode::PageDown if app.focused_panel == Panel::Estimate => {
@@ -861,39 +977,47 @@ fn handle_edit_key(
 ) -> Result<bool> {
     match key.code {
         KeyCode::Esc => app.mode = Mode::Normal,
-        KeyCode::Enter => {
-            app.mode = Mode::Normal;
-            app.recompute(estimator);
-        }
-        KeyCode::Tab => {
-            app.mode = Mode::Normal;
-            app.recompute(estimator);
-            app.selected = (app.selected + 1).min(app.fields.len() - 1);
-        }
-        KeyCode::BackTab => {
-            app.mode = Mode::Normal;
-            app.recompute(estimator);
-            app.selected = app.selected.saturating_sub(1);
-        }
+        KeyCode::Enter => app.apply_active_edit(estimator, 0),
+        KeyCode::Tab => app.apply_active_edit(estimator, 1),
+        KeyCode::BackTab => app.apply_active_edit(estimator, -1),
         KeyCode::Backspace => {
-            app.selected_field_mut().backspace();
+            if let Some(field) = app.active_field_mut() {
+                field.backspace();
+            }
             app.mark_custom_location_if_needed();
         }
         KeyCode::Delete => {
-            app.selected_field_mut().delete();
+            if let Some(field) = app.active_field_mut() {
+                field.delete();
+            }
             app.mark_custom_location_if_needed();
         }
-        KeyCode::Left => app.selected_field_mut().move_left(),
-        KeyCode::Right => app.selected_field_mut().move_right(),
-        KeyCode::Home => app.selected_field_mut().cursor = 0,
+        KeyCode::Left => {
+            if let Some(field) = app.active_field_mut() {
+                field.move_left();
+            }
+        }
+        KeyCode::Right => {
+            if let Some(field) = app.active_field_mut() {
+                field.move_right();
+            }
+        }
+        KeyCode::Home => {
+            if let Some(field) = app.active_field_mut() {
+                field.cursor = 0;
+            }
+        }
         KeyCode::End => {
-            let field = app.selected_field_mut();
-            field.cursor = field.value.len();
+            if let Some(field) = app.active_field_mut() {
+                field.cursor = field.value.len();
+            }
         }
         KeyCode::Char(character)
             if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
         {
-            app.selected_field_mut().insert(character);
+            if let Some(field) = app.active_field_mut() {
+                field.insert(character);
+            }
             app.mark_custom_location_if_needed();
         }
         _ => {}
@@ -992,6 +1116,18 @@ fn handle_mouse(
                     "Arrays" => app.open_array_editor(),
                     _ => {}
                 }
+            }
+        }
+    } else if panel == Panel::Consumer {
+        let fields_inner = Block::default().borders(Borders::ALL).inner(panel_area);
+        if mouse.column >= fields_inner.x
+            && mouse.column < fields_inner.x.saturating_add(fields_inner.width)
+            && mouse.row >= fields_inner.y
+        {
+            let row = mouse.row.saturating_sub(fields_inner.y) as usize;
+            if row < app.consumer_fields.len() {
+                app.consumer_selected = row;
+                app.mode = Mode::Edit;
             }
         }
     }
@@ -1173,7 +1309,7 @@ fn panel_at(area: Rect, app: &App, column: u16, row: u16) -> Option<(Panel, Rect
 fn render_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App, panel: Panel) {
     match panel {
         Panel::System => render_fields(frame, area, app, app.focused_panel == panel),
-        Panel::Consumer => render_consumer(frame, area, app.focused_panel == panel),
+        Panel::Consumer => render_consumer(frame, area, app, app.focused_panel == panel),
         Panel::Simulation => render_simulation(frame, area, app.focused_panel == panel),
         Panel::Estimate => render_estimate(frame, area, app, app.focused_panel == panel),
     }
@@ -1671,18 +1807,54 @@ fn field_value_view(field: &Field, max_width: usize, keep_cursor_visible: bool) 
     }
 }
 
-fn render_consumer(frame: &mut ratatui::Frame<'_>, area: Rect, focused: bool) {
+fn render_consumer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App, focused: bool) {
     let block = panel_block("Consumer", Panel::Consumer.toggle_key(), focused);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    frame.render_widget(
-        Paragraph::new(vec![
-            estimate_metric_line("Annual kWh", "-".to_string(), Style::default()),
-            estimate_metric_line("Daily kWh", "-".to_string(), Style::default()),
-            estimate_metric_line("Shape", "residential_default".to_string(), Style::default()),
-        ]),
-        inner,
-    );
+
+    let value_width = field_value_width(inner);
+    let lines = app
+        .consumer_fields
+        .iter()
+        .enumerate()
+        .map(|(index, field)| {
+            let selected = focused && index == app.consumer_selected;
+            let style = match (selected, app.mode) {
+                (true, Mode::Edit) => Style::default().fg(Color::Black).bg(Color::Yellow),
+                (true, Mode::Normal) => Style::default().fg(Color::Black).bg(Color::Cyan),
+                _ => Style::default(),
+            };
+            let label_style = if selected {
+                style
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let value = field_value_view(field, value_width, selected).value;
+            Line::from(vec![
+                Span::styled(
+                    format!(
+                        "{:<width$}",
+                        field.label,
+                        width = FIELD_LABEL_WIDTH as usize
+                    ),
+                    label_style,
+                ),
+                Span::styled(format!("{:<width$}", value, width = value_width), style),
+            ])
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines), inner);
+
+    if focused && app.mode == Mode::Edit {
+        let field = &app.consumer_fields[app.consumer_selected];
+        let value_view = field_value_view(field, value_width, true);
+        let y = inner.y.saturating_add(app.consumer_selected as u16);
+        let x = inner
+            .x
+            .saturating_add(FIELD_LABEL_WIDTH)
+            .saturating_add(value_view.cursor_col.min(u16::MAX as usize) as u16);
+        frame.set_cursor_position(Position::new(x, y));
+    }
 }
 
 fn render_simulation(frame: &mut ratatui::Frame<'_>, area: Rect, focused: bool) {
@@ -2245,6 +2417,63 @@ mod tests {
     }
 
     #[test]
+    fn parses_consumer_load_profile_from_annual_energy() {
+        let app = App::new();
+        let profile = app.consumer_load_profile().expect("valid default consumer");
+
+        match profile {
+            LoadProfile::AnnualKwh { annual_kwh, shape } => {
+                assert_eq!(annual_kwh, 4200.0);
+                assert!(matches!(
+                    shape,
+                    LoadShape::BuiltIn {
+                        shape_id: BuiltInLoadShapeId::ResidentialDefault
+                    }
+                ));
+            }
+            _ => panic!("expected annual load profile"),
+        }
+    }
+
+    #[test]
+    fn consumer_load_profile_rejects_conflicting_energy_fields() {
+        let mut app = App::new();
+        app.consumer_fields[CONSUMER_DAILY_FIELD_INDEX].set_value("12");
+
+        assert!(app.consumer_load_profile().is_err());
+    }
+
+    #[test]
+    fn consumer_load_profile_accepts_daily_energy_when_annual_empty() {
+        let mut app = App::new();
+        app.consumer_fields[CONSUMER_ANNUAL_FIELD_INDEX].set_value("");
+        app.consumer_fields[CONSUMER_DAILY_FIELD_INDEX].set_value("12");
+
+        assert!(matches!(
+            app.consumer_load_profile().expect("daily profile"),
+            LoadProfile::DailyKwh {
+                daily_kwh: 12.0,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn consumer_edit_validation_keeps_invalid_field_in_edit_mode() {
+        let mut app = App::new();
+        app.focused_panel = Panel::Consumer;
+        app.consumer_selected = CONSUMER_ANNUAL_FIELD_INDEX;
+        app.mode = Mode::Edit;
+        app.consumer_fields[CONSUMER_ANNUAL_FIELD_INDEX].set_value("0");
+        let mut estimator = SourceModelEstimator::load_embedded().expect("embedded estimator");
+
+        app.apply_active_edit(&mut estimator, 0);
+
+        assert_eq!(app.mode, Mode::Edit);
+        assert!(app.status.contains("Annual kWh"));
+    }
+
+    #[test]
     fn panel_visibility_defaults_to_system_and_estimate() {
         let app = App::new();
 
@@ -2608,6 +2837,7 @@ mod tests {
                     value: "2.0,30,0".to_string(),
                 },
             ],
+            consumer_fields: Vec::new(),
             panel_visibility: PanelVisibility::default(),
             focused_panel: Panel::System,
         };
