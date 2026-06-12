@@ -1281,7 +1281,16 @@ fn production_profile_from_sources(
         })
         .collect::<Vec<_>>();
     normalize_hourly_profile_to_monthly_bands(&mut hourly_mean_kwh, &monthly)?;
+    let annual_mean_kwh = ensemble.annual_energy.mean.as_kilowatt_hours();
+    let (annual_low_kwh, annual_high_kwh) = ensemble
+        .uncertainty
+        .annual_energy
+        .map(|band| (band.low.as_kilowatt_hours(), band.high.as_kilowatt_hours()))
+        .unwrap_or((annual_mean_kwh, annual_mean_kwh));
     Ok(ProductionProfile {
+        annual_mean_kwh,
+        annual_low_kwh,
+        annual_high_kwh,
         hourly_mean_kwh,
         monthly,
     })
@@ -1502,12 +1511,45 @@ mod tests {
         let hourly = estimate_hourly_pv_from_climate(&climate, &request, &arrays);
         let profile = production_profile_from_sources(&ensemble, &[hourly]).expect("profile");
 
+        assert_eq!(profile.annual_low_kwh, profile.annual_mean_kwh);
+        assert_eq!(profile.annual_high_kwh, profile.annual_mean_kwh);
         assert_eq!(profile.hourly_mean_kwh.len(), 8760);
         assert_eq!(profile.monthly.len(), 12);
         for band in &profile.monthly {
             assert_eq!(band.low_kwh, band.mean_kwh);
             assert_eq!(band.high_kwh, band.mean_kwh);
         }
+    }
+
+    #[test]
+    fn production_profile_uses_calibrated_annual_uncertainty_band() {
+        let climate = test_climate();
+        let request = EstimateRequest::default();
+        let arrays = [request.single_array()];
+        let pv = estimate_pv_from_climate(&climate, &request, &arrays);
+        let lower = source_estimate("lower", pv.clone()).expect("source estimate");
+        let mut higher_pv = pv;
+        higher_pv.annual_energy_kwh *= 1.2;
+        for monthly in &mut higher_pv.monthly {
+            monthly.energy_kwh *= 1.2;
+        }
+        let higher = source_estimate("higher", higher_pv).expect("source estimate");
+        let ensemble = AnnualPvEnsembleEstimate::from_source_estimates(vec![lower, higher])
+            .expect("two sources produce calibrated uncertainty");
+        let hourly = estimate_hourly_pv_from_climate(&climate, &request, &arrays);
+        let higher_hourly = hourly.iter().map(|value| value * 1.2).collect::<Vec<_>>();
+        let profile =
+            production_profile_from_sources(&ensemble, &[hourly, higher_hourly]).expect("profile");
+        let annual_band = ensemble
+            .uncertainty
+            .annual_energy
+            .expect("calibrated annual energy band");
+
+        assert_eq!(profile.annual_low_kwh, annual_band.low.as_kilowatt_hours());
+        assert_eq!(
+            profile.annual_high_kwh,
+            annual_band.high.as_kilowatt_hours()
+        );
     }
 
     #[test]
