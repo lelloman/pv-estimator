@@ -425,10 +425,10 @@ fn validate_request_location_and_loss(request: &EstimateRequest) -> Result<()> {
     if !(0.0..100.0).contains(&request.loss_pct) {
         bail!("loss percent must be in [0, 100)");
     }
-    if let Some(storage_usable_kwh) = request.storage_usable_kwh {
-        if !storage_usable_kwh.is_finite() || storage_usable_kwh <= 0.0 {
-            bail!("storage usable kWh must be positive");
-        }
+    if let Some(storage_usable_kwh) = request.storage_usable_kwh
+        && (!storage_usable_kwh.is_finite() || storage_usable_kwh <= 0.0)
+    {
+        bail!("storage usable kWh must be positive");
     }
     Ok(())
 }
@@ -1224,8 +1224,8 @@ fn estimate_array_month_hour_energy_from_climate(
     let noct_c = 45.0;
     let mut month_hour = [[0.0; 24]; 12];
 
-    for month in 0..12 {
-        for hour in 0..24 {
+    for (month, month_values) in month_hour.iter_mut().enumerate() {
+        for (hour, hour_value) in month_values.iter_mut().enumerate() {
             let idx = month * 24 + hour;
             let ghi = climate[idx][0];
             let dni = climate[idx][1];
@@ -1245,8 +1245,7 @@ fn estimate_array_month_hour_energy_from_climate(
             let poa = (beam + diffuse + ground).max(0.0);
             let cell_temp = temp + poa * (noct_c - 20.0) / 800.0;
             let temp_factor = (1.0 + gamma * (cell_temp - 25.0)).max(0.0);
-            month_hour[month][hour] =
-                array.peak_power_kwp * (poa / 1000.0) * temp_factor * loss_factor;
+            *hour_value = array.peak_power_kwp * (poa / 1000.0) * temp_factor * loss_factor;
         }
     }
 
