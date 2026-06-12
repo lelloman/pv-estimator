@@ -358,12 +358,12 @@ fn validate_request(request: &SimulationRequest) -> Result<(), SimulationError> 
             ));
         }
     }
-    if let Some(storage) = request.storage {
-        if !storage.usable_capacity_kwh.is_finite() || storage.usable_capacity_kwh <= 0.0 {
-            return Err(SimulationError::new(
-                "storage usable capacity must be positive",
-            ));
-        }
+    if let Some(storage) = request.storage
+        && (!storage.usable_capacity_kwh.is_finite() || storage.usable_capacity_kwh <= 0.0)
+    {
+        return Err(SimulationError::new(
+            "storage usable capacity must be positive",
+        ));
     }
     Ok(())
 }
@@ -812,11 +812,7 @@ mod tests {
         assert_eq!(result.completed_runs, SIMULATION_BATCH_RUNS + 2);
         assert_eq!(completed.first(), Some(&1));
         assert_eq!(completed.last(), Some(&(SIMULATION_BATCH_RUNS + 2)));
-        assert!(
-            completed
-                .iter()
-                .any(|runs| *runs >= SIMULATION_BATCH_RUNS + 1)
-        );
+        assert!(completed.iter().any(|runs| *runs > SIMULATION_BATCH_RUNS));
     }
 
     #[test]

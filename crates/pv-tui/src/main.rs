@@ -18,8 +18,8 @@ use crossterm::terminal::{
 };
 use directories::ProjectDirs;
 use pv_core::simulation::{
-    BuiltInLoadShapeId, LoadProfile, LoadShape, MetricSummary, SimulationMetricSummaries,
-    SimulationOptions, SimulationRequest, SimulationResult, StorageConfig, simulate_with_progress,
+    BuiltInLoadShapeId, LoadProfile, LoadShape, MetricSummary, SimulationOptions,
+    SimulationRequest, SimulationResult, StorageConfig, simulate_with_progress,
 };
 use pv_core::source_model::SourceEnsembleEstimateDocument;
 use pv_data::CitySearchResult;
@@ -130,19 +130,14 @@ struct TuiFieldState {
     value: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Panel {
+    #[default]
     System,
     Consumer,
     Simulation,
     Estimate,
-}
-
-impl Default for Panel {
-    fn default() -> Self {
-        Self::System
-    }
 }
 
 impl Panel {
@@ -2849,7 +2844,7 @@ fn field_value_view(field: &Field, max_width: usize, keep_cursor_visible: bool) 
     };
     start = start.min(chars.len().saturating_sub(max_width));
     let end = (start + max_width).min(chars.len());
-    let mut visible = chars[start..end].iter().copied().collect::<Vec<_>>();
+    let mut visible = chars[start..end].to_vec();
     if start > 0 && !visible.is_empty() {
         visible[0] = '<';
     }
@@ -3781,7 +3776,8 @@ mod tests {
 
     use pv_core::prelude::{
         AnnualPvEnsembleEstimate, Energy, EstimateCoverage, EstimateLocation, EstimateSystem,
-        Irradiation, MonthOfYear, SourceAnnualPvEstimate, SourceMonthlyPvEstimate, WeatherSourceId,
+        Irradiation, MonthOfYear, SimulationMetricSummaries, SourceAnnualPvEstimate,
+        SourceMonthlyPvEstimate, WeatherSourceId,
     };
     use ratatui::backend::TestBackend;
 
