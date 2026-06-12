@@ -6,14 +6,20 @@ use std::sync::mpsc;
 use std::thread;
 
 const HOURS_PER_YEAR: usize = 8760;
+#[cfg(test)]
 const MONTH_DAYS: [usize; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 const DEFAULT_RUNS: usize = 10_000;
 const DEFAULT_SEED: u64 = 0x9e37_79b9_7f4a_7c15;
 const ROUND_TRIP_EFFICIENCY: f64 = 0.95;
 const SIMULATION_BATCH_RUNS: usize = 1000;
+const PV_DAILY_VARIABILITY: f64 = 0.35;
+const LOAD_DAILY_VARIABILITY: f64 = 0.20;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProductionProfile {
+    pub annual_mean_kwh: f64,
+    pub annual_low_kwh: f64,
+    pub annual_high_kwh: f64,
     pub hourly_mean_kwh: Vec<f64>,
     pub monthly: Vec<MonthlyProductionBand>,
 }
@@ -266,14 +272,15 @@ fn simulation_worker_count(remaining_runs: usize) -> usize {
 
 fn simulate_run_index(
     profile: &ProductionProfile,
-    load: &[f64],
+    base_load: &[f64],
     capacity_kwh: f64,
     base_seed: u64,
     run_index: usize,
 ) -> SimulationRunMetrics {
     let mut rng = SmallRng::new(run_seed(base_seed, run_index));
     let production = stochastic_hourly_production(profile, &mut rng);
-    dispatch_run(&production, load, capacity_kwh)
+    let load = stochastic_hourly_load(base_load, &mut rng);
+    dispatch_run(&production, &load, capacity_kwh)
 }
 
 fn run_seed(base_seed: u64, run_index: usize) -> u64 {
@@ -301,6 +308,18 @@ fn simulation_result(
 fn validate_request(request: &SimulationRequest) -> Result<(), SimulationError> {
     if request.options.runs == 0 {
         return Err(SimulationError::new("simulation runs must be positive"));
+    }
+    if !request.production.annual_mean_kwh.is_finite()
+        || !request.production.annual_low_kwh.is_finite()
+        || !request.production.annual_high_kwh.is_finite()
+        || request.production.annual_mean_kwh < 0.0
+        || request.production.annual_low_kwh < 0.0
+        || request.production.annual_high_kwh < 0.0
+        || request.production.annual_low_kwh > request.production.annual_high_kwh
+    {
+        return Err(SimulationError::new(
+            "annual production band must be finite, non-negative, and ordered",
+        ));
     }
     if request.production.hourly_mean_kwh.len() != HOURS_PER_YEAR {
         return Err(SimulationError::new(
@@ -413,33 +432,68 @@ fn validate_weights(weights: &[f64]) -> Result<(), SimulationError> {
 
 fn stochastic_hourly_production(profile: &ProductionProfile, rng: &mut SmallRng) -> Vec<f64> {
     let mut output = profile.hourly_mean_kwh.clone();
-    let mut start = 0;
-    for (month_index, days) in MONTH_DAYS.iter().copied().enumerate() {
-        let end = start + days * 24;
-        let band = profile.monthly[month_index];
-        let monthly_target = if band.high_kwh > band.low_kwh {
-            band.low_kwh + (band.high_kwh - band.low_kwh) * rng.next_f64()
-        } else {
-            band.mean_kwh
-        };
-        let current = output[start..end].iter().sum::<f64>();
-        if current > 0.0 {
-            let scale = monthly_target / current;
-            for value in &mut output[start..end] {
-                *value *= scale;
-            }
-            let adjusted = output[start..end].iter().sum::<f64>();
-            if let Some(last) = output[start..end]
-                .iter_mut()
-                .rev()
-                .find(|value| **value > 0.0)
-            {
-                *last = (*last + monthly_target - adjusted).max(0.0);
-            }
-        }
-        start = end;
-    }
+    let run_weight = production_run_weight(profile, rng);
+    apply_daily_variability(&mut output, 365, PV_DAILY_VARIABILITY, rng);
+    scale_slice_by(&mut output, run_weight);
     output
+}
+
+fn production_run_weight(profile: &ProductionProfile, rng: &mut SmallRng) -> f64 {
+    if profile.annual_mean_kwh <= 0.0 || profile.annual_high_kwh <= profile.annual_low_kwh {
+        return 1.0;
+    }
+
+    let low_weight = profile.annual_low_kwh / profile.annual_mean_kwh;
+    let high_weight = profile.annual_high_kwh / profile.annual_mean_kwh;
+    low_weight + (high_weight - low_weight) * rng.next_f64()
+}
+
+fn stochastic_hourly_load(base_load: &[f64], rng: &mut SmallRng) -> Vec<f64> {
+    let mut output = base_load.to_vec();
+    apply_daily_variability(&mut output, 365, LOAD_DAILY_VARIABILITY, rng);
+    scale_slice_to_total(&mut output, base_load.iter().sum::<f64>());
+    output
+}
+
+fn apply_daily_variability(hours: &mut [f64], days: usize, variability: f64, rng: &mut SmallRng) {
+    for day in 0..days {
+        let start = day * 24;
+        let end = start + 24;
+        let multiplier = daily_multiplier(variability, rng);
+        for value in &mut hours[start..end] {
+            *value *= multiplier;
+        }
+    }
+}
+
+fn daily_multiplier(variability: f64, rng: &mut SmallRng) -> f64 {
+    let spread = variability.max(0.0);
+    (1.0 + (rng.next_f64() * 2.0 - 1.0) * spread).max(0.0)
+}
+
+fn scale_slice_by(values: &mut [f64], scale: f64) {
+    for value in values {
+        *value *= scale;
+    }
+}
+
+fn scale_slice_to_total(values: &mut [f64], target: f64) {
+    let current = values.iter().sum::<f64>();
+    if current <= 0.0 {
+        return;
+    }
+    let scale = target / current;
+    for value in values.iter_mut() {
+        *value *= scale;
+    }
+    adjust_slice_to_total(values, target);
+}
+
+fn adjust_slice_to_total(values: &mut [f64], target: f64) {
+    let adjusted = values.iter().sum::<f64>();
+    if let Some(last) = values.iter_mut().rev().find(|value| **value > 0.0) {
+        *last = (*last + target - adjusted).max(0.0);
+    }
 }
 
 fn dispatch_run(production: &[f64], load: &[f64], capacity_kwh: f64) -> SimulationRunMetrics {
@@ -600,6 +654,9 @@ mod tests {
             });
         }
         ProductionProfile {
+            annual_mean_kwh: monthly_kwh * 12.0,
+            annual_low_kwh: monthly_kwh * 12.0,
+            annual_high_kwh: monthly_kwh * 12.0,
             hourly_mean_kwh: hourly,
             monthly,
         }
@@ -670,6 +727,51 @@ mod tests {
         let second = simulate(&request(profile, None)).expect("simulation succeeds");
 
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn stochastic_production_varies_daily_without_monthly_rescale() {
+        let profile = flat_profile(120.0);
+        let mut rng = SmallRng::new(42);
+        let output = stochastic_hourly_production(&profile, &mut rng);
+        let january = &output[..MONTH_DAYS[0] * 24];
+        let january_total = january.iter().sum::<f64>();
+        let first_day = january[..24].iter().sum::<f64>();
+        let has_different_day = january
+            .chunks_exact(24)
+            .map(|day| day.iter().sum::<f64>())
+            .any(|day_total| (day_total - first_day).abs() > 1.0e-9);
+
+        assert!((january_total - 120.0).abs() > 1.0e-6);
+        assert!(has_different_day);
+    }
+
+    #[test]
+    fn stochastic_production_samples_annual_run_weight() {
+        let mut profile = flat_profile(100.0);
+        profile.annual_low_kwh = profile.annual_mean_kwh * 0.8;
+        profile.annual_high_kwh = profile.annual_mean_kwh * 1.2;
+        let mut rng = SmallRng::new(42);
+        let run_weight = production_run_weight(&profile, &mut rng);
+
+        assert!((0.8..=1.2).contains(&run_weight));
+        assert!((run_weight - 1.0).abs() > 1.0e-9);
+    }
+
+    #[test]
+    fn stochastic_load_varies_daily_and_preserves_annual_total() {
+        let base_load = vec![1.0; HOURS_PER_YEAR];
+        let mut rng = SmallRng::new(42);
+        let output = stochastic_hourly_load(&base_load, &mut rng);
+        let annual_total = output.iter().sum::<f64>();
+        let first_day = output[..24].iter().sum::<f64>();
+        let has_different_day = output
+            .chunks_exact(24)
+            .map(|day| day.iter().sum::<f64>())
+            .any(|day_total| (day_total - first_day).abs() > 1.0e-9);
+
+        assert!((annual_total - HOURS_PER_YEAR as f64).abs() < 1.0e-9);
+        assert!(has_different_day);
     }
 
     #[test]

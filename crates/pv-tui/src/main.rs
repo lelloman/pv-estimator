@@ -413,7 +413,7 @@ impl App {
             ],
             consumer_fields: vec![
                 Field::new("Annual kWh", "4200"),
-                Field::new("Daily kWh", ""),
+                Field::new("Daily kWh", "11.51"),
                 Field::new("Shape", "residential_default"),
             ],
             simulation_fields: vec![Field::new("Runs", "10000")],
@@ -497,6 +497,7 @@ impl App {
         self.location_query.set_value(&state.location_query);
         self.consumer_shape = state.consumer_shape;
         self.sync_consumer_shape_field();
+        self.sync_empty_consumer_energy_field();
         for field in &mut self.simulation_fields {
             if let Some(saved) = state
                 .simulation_fields
@@ -514,6 +515,10 @@ impl App {
     }
 
     fn save_state(&mut self) {
+        if cfg!(test) {
+            return;
+        }
+
         let Some(path) = tui_state_path() else {
             self.status = "Could not resolve local state path".to_string();
             return;
@@ -553,6 +558,15 @@ impl App {
         let result = (|| -> Result<()> {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
+            }
+            if path.exists() {
+                let backup_path = path.with_file_name(format!(
+                    "{}.bak",
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("pv-tui-state.json")
+                ));
+                fs::copy(&path, backup_path)?;
             }
             let bytes = serde_json::to_vec_pretty(&state)?;
             fs::write(&path, bytes)?;
@@ -731,6 +745,37 @@ impl App {
             }
             Panel::Simulation => None,
             _ => None,
+        }
+    }
+
+    fn sync_empty_consumer_energy_field(&mut self) {
+        let annual_empty = self.consumer_fields[CONSUMER_ANNUAL_FIELD_INDEX]
+            .value
+            .trim()
+            .is_empty();
+        let daily_empty = self.consumer_fields[CONSUMER_DAILY_FIELD_INDEX]
+            .value
+            .trim()
+            .is_empty();
+
+        match (annual_empty, daily_empty) {
+            (false, true) => {
+                if let Ok(Some(annual_kwh)) =
+                    parse_optional_positive_f64(&self.consumer_fields[CONSUMER_ANNUAL_FIELD_INDEX])
+                {
+                    self.consumer_fields[CONSUMER_DAILY_FIELD_INDEX]
+                        .set_value(&format_energy_field_value(annual_kwh / 365.0));
+                }
+            }
+            (true, false) => {
+                if let Ok(Some(daily_kwh)) =
+                    parse_optional_positive_f64(&self.consumer_fields[CONSUMER_DAILY_FIELD_INDEX])
+                {
+                    self.consumer_fields[CONSUMER_ANNUAL_FIELD_INDEX]
+                        .set_value(&format_energy_field_value(daily_kwh * 365.0));
+                }
+            }
+            _ => {}
         }
     }
 
@@ -3042,6 +3087,7 @@ fn simulation_empty_lines() -> Vec<Line<'static>> {
             "Select Run or press r".to_string(),
             Style::default(),
         ),
+        estimate_metric_line("Production", "-".to_string(), Style::default()),
         estimate_metric_line("Import", "-".to_string(), Style::default()),
         estimate_metric_line("Export", "-".to_string(), Style::default()),
         estimate_metric_line("Self use", "-".to_string(), Style::default()),
@@ -3051,6 +3097,11 @@ fn simulation_empty_lines() -> Vec<Line<'static>> {
 fn simulation_result_lines(result: &SimulationResult) -> Vec<Line<'static>> {
     let summaries = &result.summaries;
     vec![
+        estimate_metric_line(
+            "Production",
+            format_kwh_summary(summaries.production_kwh),
+            Style::default(),
+        ),
         estimate_metric_line(
             "Import",
             format_kwh_summary(summaries.grid_import_kwh),
@@ -4055,6 +4106,29 @@ mod tests {
     }
 
     #[test]
+    fn default_consumer_daily_energy_is_populated() {
+        let app = App::new();
+
+        assert_eq!(
+            app.consumer_fields[CONSUMER_DAILY_FIELD_INDEX].value,
+            "11.51"
+        );
+    }
+
+    #[test]
+    fn blank_consumer_daily_energy_backfills_from_annual() {
+        let mut app = App::new();
+        app.consumer_fields[CONSUMER_DAILY_FIELD_INDEX].set_value("");
+
+        app.sync_empty_consumer_energy_field();
+
+        assert_eq!(
+            app.consumer_fields[CONSUMER_DAILY_FIELD_INDEX].value,
+            "11.51"
+        );
+    }
+
+    #[test]
     fn consumer_annual_edit_updates_daily_energy() {
         let mut app = App::new();
         app.focused_panel = Panel::Consumer;
@@ -4541,6 +4615,16 @@ mod tests {
             arrays_to_field_value(&arrays),
             "1.50,30.0,0.0; west roof,2.25,20.0,-90.0"
         );
+    }
+
+    #[test]
+    fn tests_do_not_write_real_tui_state_file() {
+        let mut app = App::new();
+        app.status = "unchanged".to_string();
+
+        app.save_state();
+
+        assert_eq!(app.status, "unchanged");
     }
 
     #[test]
