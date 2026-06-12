@@ -84,7 +84,7 @@ Normal mode:
 | `Left` / `Right` | Move focus between visible panels. |
 | `Up` / `Down` | Move between rows in the focused System, Consumer, or Simulation panel. |
 | `Home` / `End` | Jump to first or last row in the focused System, Consumer, or Simulation panel. |
-| `Enter` | Edit the selected field. On `Name`, open location search mode. On `Arrays`, open the arrays editor. On Consumer `Shape`, open the shape editor. On Simulation `Run`, open the run screen. |
+| `Enter` | Edit or activate the selected row. On `Name`, open location search mode. On `Arrays`, open the arrays editor. On Consumer `Shape`, open the shape editor. On Simulation `Runs`, open the runs picker. On Simulation `Run`, open the run screen. |
 | `l` | Open location search mode when System is focused. |
 | `e` | Recompute estimate. |
 | `r` | Run simulation from the current System and Consumer inputs. |
@@ -142,7 +142,7 @@ Location mode:
 
 ## Simulation Panel
 
-The Simulation panel uses the current system arrays, consumer load profile, and optional `Storage kWh` value. It has editable `Runs` and `Seed` fields plus a `Run` row. Leave `Seed` empty for the default stochastic seed.
+The Simulation panel uses the current system arrays, consumer load profile, and optional `Storage kWh` value. It has a selectable `Runs` field plus a `Run` row. The runs picker offers `10^3` through `10^9`.
 
 Press `r` from normal mode, or focus the Simulation panel, select `Run`, and press `Enter`. The run opens a dedicated progress screen with completed runs, progress, elapsed time, and ETA. Press `Esc` or `c` while running to cancel; completed or cancelled runs return partial or final summaries to the Simulation panel. Results show mean values with `p10..p90` bands.
 

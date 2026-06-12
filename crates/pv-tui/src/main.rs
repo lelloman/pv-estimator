@@ -53,8 +53,18 @@ const CONSUMER_ANNUAL_FIELD_INDEX: usize = 0;
 const CONSUMER_DAILY_FIELD_INDEX: usize = 1;
 const CONSUMER_SHAPE_FIELD_INDEX: usize = 2;
 const SIMULATION_RUNS_FIELD_INDEX: usize = 0;
-const SIMULATION_SEED_FIELD_INDEX: usize = 1;
-const SIMULATION_RUN_ROW_INDEX: usize = 2;
+const SIMULATION_RUN_ROW_INDEX: usize = 1;
+const SIMULATION_RUN_OPTIONS: [usize; 7] = [
+    1_000,
+    10_000,
+    100_000,
+    1_000_000,
+    10_000_000,
+    100_000_000,
+    1_000_000_000,
+];
+const SIMULATION_RUNS_PICKER_WIDTH: u16 = 24;
+const SIMULATION_RUNS_PICKER_HEIGHT: u16 = 9;
 const ESTIMATE_LABEL_WIDTH: usize = 11;
 const SEARCH_LABEL_WIDTH: u16 = 8;
 const LOCATION_RESULT_HEADER_ROWS: u16 = 3;
@@ -213,6 +223,7 @@ enum Mode {
     Location,
     Arrays,
     Shape,
+    SimulationRuns,
     SimulationRun,
 }
 
@@ -288,6 +299,7 @@ struct App {
     estimate: Option<SourceEnsembleEstimateDocument>,
     simulation_result: Option<SimulationResult>,
     simulation_run: Option<SimulationRunState>,
+    simulation_runs_selected: usize,
     selected_location_id: String,
     location_query: Field,
     location_results: Vec<CitySearchResult>,
@@ -404,7 +416,7 @@ impl App {
                 Field::new("Daily kWh", ""),
                 Field::new("Shape", "residential_default"),
             ],
-            simulation_fields: vec![Field::new("Runs", "10000"), Field::new("Seed", "")],
+            simulation_fields: vec![Field::new("Runs", "10000")],
             selected: 2,
             consumer_selected: 0,
             simulation_selected: 0,
@@ -413,6 +425,7 @@ impl App {
             estimate: None,
             simulation_result: None,
             simulation_run: None,
+            simulation_runs_selected: 1,
             selected_location_id: "custom".to_string(),
             location_query: Field::new("Find", ""),
             location_results: Vec::new(),
@@ -784,19 +797,49 @@ impl App {
         if runs == 0 {
             anyhow::bail!("Runs must be a positive integer");
         }
-        let seed_value = self.simulation_fields[SIMULATION_SEED_FIELD_INDEX]
+        Ok(SimulationOptions { runs, seed: None })
+    }
+
+    fn open_simulation_runs_picker(&mut self) {
+        let current = self.simulation_fields[SIMULATION_RUNS_FIELD_INDEX]
             .value
-            .trim();
-        let seed = if seed_value.is_empty() {
-            None
-        } else {
-            Some(
-                seed_value
-                    .parse::<u64>()
-                    .with_context(|| "Seed must be empty or a non-negative integer")?,
-            )
-        };
-        Ok(SimulationOptions { runs, seed })
+            .trim()
+            .parse::<usize>()
+            .ok();
+        self.simulation_runs_selected = current
+            .and_then(|runs| {
+                SIMULATION_RUN_OPTIONS
+                    .iter()
+                    .position(|candidate| *candidate == runs)
+            })
+            .unwrap_or(1);
+        self.mode = Mode::SimulationRuns;
+        self.status = "Select simulation runs".to_string();
+    }
+
+    fn dismiss_simulation_runs_picker(&mut self) {
+        self.mode = Mode::Normal;
+        self.status = "Runs selection dismissed".to_string();
+    }
+
+    fn apply_simulation_runs_picker(&mut self) {
+        let runs = SIMULATION_RUN_OPTIONS[self
+            .simulation_runs_selected
+            .min(SIMULATION_RUN_OPTIONS.len() - 1)];
+        self.simulation_fields[SIMULATION_RUNS_FIELD_INDEX].set_value(&runs.to_string());
+        self.simulation_result = None;
+        self.mode = Mode::Normal;
+        self.status = format!("Simulation runs set to {}", format_runs(runs));
+        self.save_state();
+    }
+
+    fn move_simulation_runs_selection(&mut self, movement: i32) {
+        let last = SIMULATION_RUN_OPTIONS.len() - 1;
+        if movement < 0 {
+            self.simulation_runs_selected = self.simulation_runs_selected.saturating_sub(1);
+        } else if movement > 0 {
+            self.simulation_runs_selected = (self.simulation_runs_selected + 1).min(last);
+        }
     }
 
     fn simulation_request(
@@ -1472,6 +1515,7 @@ fn handle_key(key: KeyEvent, app: &mut App, estimator: &mut SourceModelEstimator
         Mode::Location => handle_location_key(key, app, estimator),
         Mode::Arrays => handle_arrays_key(key, app, estimator),
         Mode::Shape => handle_shape_key(key, app),
+        Mode::SimulationRuns => handle_simulation_runs_key(key, app),
         Mode::SimulationRun => handle_simulation_run_key(key, app),
     }
 }
@@ -1540,6 +1584,12 @@ fn handle_normal_key(
                 && app.simulation_selected == SIMULATION_RUN_ROW_INDEX =>
         {
             app.start_simulation_run(estimator)
+        }
+        KeyCode::Enter
+            if app.focused_panel == Panel::Simulation
+                && app.simulation_selected == SIMULATION_RUNS_FIELD_INDEX =>
+        {
+            app.open_simulation_runs_picker()
         }
         KeyCode::Enter if app.focused_panel == Panel::Simulation => app.mode = Mode::Edit,
         KeyCode::Char('l') if app.focused_panel == Panel::System => app.open_location_search(),
@@ -1629,6 +1679,7 @@ fn handle_mouse(
     ) && app.mode != Mode::Location
         && app.mode != Mode::Arrays
         && app.mode != Mode::Shape
+        && app.mode != Mode::SimulationRuns
         && app.mode != Mode::SimulationRun
     {
         if let Some((Panel::Estimate, _)) = panel_at(vertical[0], app, mouse.column, mouse.row) {
@@ -1709,6 +1760,20 @@ fn handle_mouse(
         return Ok(());
     }
 
+    if app.mode == Mode::SimulationRuns {
+        if let Some(area) = simulation_panel_area(vertical[0], app) {
+            if let Some(index) = simulation_runs_option_at(area, mouse.column, mouse.row) {
+                app.simulation_runs_selected = index;
+                app.apply_simulation_runs_picker();
+            } else {
+                app.dismiss_simulation_runs_picker();
+            }
+        } else {
+            app.dismiss_simulation_runs_picker();
+        }
+        return Ok(());
+    }
+
     if app.mode == Mode::SimulationRun {
         app.cancel_or_close_simulation_run();
         return Ok(());
@@ -1761,6 +1826,8 @@ fn handle_mouse(
                 app.simulation_selected = row;
                 if row == SIMULATION_RUN_ROW_INDEX {
                     app.start_simulation_run(estimator);
+                } else if row == SIMULATION_RUNS_FIELD_INDEX {
+                    app.open_simulation_runs_picker();
                 } else {
                     app.mode = Mode::Edit;
                 }
@@ -1933,6 +2000,17 @@ fn handle_shape_key(key: KeyEvent, app: &mut App) -> Result<bool> {
         KeyCode::Right | KeyCode::Tab => app.move_shape_cell_forward(),
         KeyCode::Char('p') if key.modifiers.is_empty() => app.open_shape_preset_picker(),
         KeyCode::Char('c') if key.modifiers.is_empty() => app.set_shape_custom(),
+        _ => {}
+    }
+    Ok(false)
+}
+
+fn handle_simulation_runs_key(key: KeyEvent, app: &mut App) -> Result<bool> {
+    match key.code {
+        KeyCode::Esc => app.dismiss_simulation_runs_picker(),
+        KeyCode::Enter => app.apply_simulation_runs_picker(),
+        KeyCode::Up | KeyCode::BackTab => app.move_simulation_runs_selection(-1),
+        KeyCode::Down | KeyCode::Tab => app.move_simulation_runs_selection(1),
         _ => {}
     }
     Ok(false)
@@ -2812,6 +2890,10 @@ fn render_simulation(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App, focu
     );
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 
+    if focused && app.mode == Mode::SimulationRuns {
+        render_simulation_runs_picker(frame, area, app);
+    }
+
     if focused && app.mode == Mode::Edit && app.simulation_selected < app.simulation_fields.len() {
         let field = &app.simulation_fields[app.simulation_selected];
         let value_view = field_value_view(field, value_width, true);
@@ -2833,7 +2915,9 @@ fn simulation_field_line(
 ) -> Line<'static> {
     let selected = focused && app.simulation_selected == index;
     let style = match (selected, app.mode) {
-        (true, Mode::Edit) => Style::default().fg(Color::Black).bg(Color::Yellow),
+        (true, Mode::Edit | Mode::SimulationRuns) => {
+            Style::default().fg(Color::Black).bg(Color::Yellow)
+        }
         (true, Mode::Normal) => Style::default().fg(Color::Black).bg(Color::Cyan),
         _ => Style::default(),
     };
@@ -2842,11 +2926,7 @@ fn simulation_field_line(
     } else {
         Style::default().fg(Color::DarkGray)
     };
-    let value = if index == SIMULATION_SEED_FIELD_INDEX && field.value.trim().is_empty() {
-        "default".to_string()
-    } else {
-        field_value_view(field, value_width, selected).value
-    };
+    let value = field_value_view(field, value_width, selected).value;
     Line::from(vec![
         Span::styled(
             format!(
@@ -2879,6 +2959,80 @@ fn simulation_run_line(app: &App, focused: bool, value_width: usize) -> Line<'st
         ),
         Span::styled(format!("{:<width$}", "[Run]", width = value_width), style),
     ])
+}
+
+fn render_simulation_runs_picker(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let picker = simulation_runs_picker_area(area);
+    frame.render_widget(Clear, picker);
+    let block = Block::default().borders(Borders::ALL).title("Runs");
+    let inner = block.inner(picker);
+    frame.render_widget(block, picker);
+
+    let current = app.simulation_fields[SIMULATION_RUNS_FIELD_INDEX]
+        .value
+        .trim()
+        .parse::<usize>()
+        .ok();
+    let lines = SIMULATION_RUN_OPTIONS
+        .iter()
+        .enumerate()
+        .map(|(index, runs)| {
+            let selected = index == app.simulation_runs_selected;
+            let active = current == Some(*runs);
+            let style = if selected {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::default()
+            };
+            let marker = if active { "*" } else { " " };
+            Line::from(Span::styled(
+                format!("{marker} 10^{:<1} {:>13}", index + 3, format_runs(*runs)),
+                style,
+            ))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn simulation_runs_picker_area(area: Rect) -> Rect {
+    let inner = Block::default().borders(Borders::ALL).inner(area);
+    Rect::new(
+        inner.x.saturating_add(FIELD_LABEL_WIDTH),
+        inner.y,
+        SIMULATION_RUNS_PICKER_WIDTH.min(inner.width.saturating_sub(FIELD_LABEL_WIDTH).max(1)),
+        SIMULATION_RUNS_PICKER_HEIGHT.min(inner.height.max(1)),
+    )
+}
+
+fn simulation_panel_area(area: Rect, app: &App) -> Option<Rect> {
+    panel_layout(area, app)
+        .into_iter()
+        .find_map(|(panel, area)| (panel == Panel::Simulation).then_some(area))
+}
+
+fn simulation_runs_option_at(area: Rect, column: u16, row: u16) -> Option<usize> {
+    let picker = simulation_runs_picker_area(area);
+    let inner = Block::default().borders(Borders::ALL).inner(picker);
+    if column < inner.x || column >= inner.x.saturating_add(inner.width) {
+        return None;
+    }
+    if row < inner.y || row >= inner.y.saturating_add(inner.height) {
+        return None;
+    }
+    let index = row.saturating_sub(inner.y) as usize;
+    (index < SIMULATION_RUN_OPTIONS.len()).then_some(index)
+}
+
+fn format_runs(runs: usize) -> String {
+    let text = runs.to_string();
+    let mut output = String::new();
+    for (index, character) in text.chars().rev().enumerate() {
+        if index > 0 && index % 3 == 0 {
+            output.push('_');
+        }
+        output.push(character);
+    }
+    output.chars().rev().collect()
 }
 
 fn simulation_empty_lines() -> Vec<Line<'static>> {
@@ -3452,6 +3606,7 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             "SHAPE",
             "arrows select  enter edit  p presets  c custom  esc",
         ),
+        Mode::SimulationRuns => ("RUNS", "arrows select  enter apply  esc dismiss"),
         Mode::SimulationRun
             if app
                 .simulation_run
@@ -3951,27 +4106,22 @@ mod tests {
     fn parses_simulation_options_from_fields() {
         let mut app = App::new();
         app.simulation_fields[SIMULATION_RUNS_FIELD_INDEX].set_value("250");
-        app.simulation_fields[SIMULATION_SEED_FIELD_INDEX].set_value("42");
 
         let options = app.simulation_options().expect("valid simulation options");
 
         assert_eq!(options.runs, 250);
-        assert_eq!(options.seed, Some(42));
+        assert_eq!(options.seed, None);
     }
 
     #[test]
-    fn simulation_options_reject_invalid_runs_and_seed() {
+    fn simulation_options_reject_invalid_runs() {
         let mut app = App::new();
         app.simulation_fields[SIMULATION_RUNS_FIELD_INDEX].set_value("0");
         assert!(app.simulation_options().is_err());
-
-        app.simulation_fields[SIMULATION_RUNS_FIELD_INDEX].set_value("10");
-        app.simulation_fields[SIMULATION_SEED_FIELD_INDEX].set_value("abc");
-        assert!(app.simulation_options().is_err());
     }
 
     #[test]
-    fn simulation_panel_enter_edits_options_and_uses_run_row() {
+    fn simulation_panel_enter_opens_runs_picker_and_uses_run_row() {
         let mut app = App::new();
         app.panel_visibility.set_visible(Panel::Simulation, true);
         app.focused_panel = Panel::Simulation;
@@ -3986,7 +4136,8 @@ mod tests {
         .expect("key handled");
 
         assert!(!quit);
-        assert_eq!(app.mode, Mode::Edit);
+        assert_eq!(app.mode, Mode::SimulationRuns);
+        assert_eq!(app.simulation_runs_selected, 1);
 
         app.mode = Mode::Normal;
         app.simulation_selected = SIMULATION_RUN_ROW_INDEX;
@@ -4002,6 +4153,42 @@ mod tests {
         assert!(!quit);
         assert_eq!(app.mode, Mode::Normal);
         assert!(app.status.contains("Runs must be a positive integer"));
+    }
+
+    #[test]
+    fn simulation_runs_picker_applies_and_dismisses() {
+        let mut app = App::new();
+        app.open_simulation_runs_picker();
+        app.move_simulation_runs_selection(1);
+        app.move_simulation_runs_selection(1);
+        app.apply_simulation_runs_picker();
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(
+            app.simulation_fields[SIMULATION_RUNS_FIELD_INDEX].value,
+            "1000000"
+        );
+        assert_eq!(app.status, "Simulation runs set to 1_000_000");
+
+        app.open_simulation_runs_picker();
+        app.move_simulation_runs_selection(-1);
+        app.dismiss_simulation_runs_picker();
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(
+            app.simulation_fields[SIMULATION_RUNS_FIELD_INDEX].value,
+            "1000000"
+        );
+    }
+
+    #[test]
+    fn simulation_runs_picker_snapshot() {
+        let mut app = App::new();
+        app.toggle_panel(Panel::Simulation);
+        app.open_simulation_runs_picker();
+        app.simulation_runs_selected = 3;
+
+        assert_snapshot("simulation_runs_picker", &render_snapshot(&app));
     }
 
     #[test]
