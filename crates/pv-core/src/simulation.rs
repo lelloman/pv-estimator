@@ -1,12 +1,16 @@
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::thread;
 
 const HOURS_PER_YEAR: usize = 8760;
 const MONTH_DAYS: [usize; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 const DEFAULT_RUNS: usize = 10_000;
 const DEFAULT_SEED: u64 = 0x9e37_79b9_7f4a_7c15;
 const ROUND_TRIP_EFFICIENCY: f64 = 0.95;
+const SIMULATION_BATCH_RUNS: usize = 1000;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProductionProfile {
@@ -159,29 +163,139 @@ pub fn simulate_with_progress(
         .storage
         .map(|storage| storage.usable_capacity_kwh)
         .unwrap_or(0.0);
-    let mut rng = SmallRng::new(request.options.seed.unwrap_or(DEFAULT_SEED));
-    let mut runs = Vec::with_capacity(request.options.runs);
+    let requested_runs = request.options.runs;
+    let base_seed = request.options.seed.unwrap_or(DEFAULT_SEED);
+    let mut run_slots = vec![None; requested_runs];
+    let mut completed_runs = 0;
 
-    for run_index in 0..request.options.runs {
-        if run_index > 0 && cancelled() {
-            return Ok(SimulationResult {
-                requested_runs: request.options.runs,
-                completed_runs: runs.len(),
-                cancelled: true,
-                summaries: summarize_runs(&runs),
-            });
-        }
-        let production = stochastic_hourly_production(&request.production, &mut rng);
-        runs.push(dispatch_run(&production, &load, capacity));
-        progress(runs.len());
+    run_slots[0] = Some(simulate_run_index(
+        &request.production,
+        &load,
+        capacity,
+        base_seed,
+        0,
+    ));
+    completed_runs += 1;
+    progress(completed_runs);
+
+    if requested_runs == 1 {
+        return Ok(simulation_result(requested_runs, false, &run_slots));
+    }
+    if cancelled() {
+        return Ok(simulation_result(requested_runs, true, &run_slots));
     }
 
-    Ok(SimulationResult {
-        requested_runs: request.options.runs,
+    let cancel_flag = AtomicBool::new(false);
+    let next_run = AtomicUsize::new(1);
+    let worker_count = simulation_worker_count(requested_runs - 1);
+    let (sender, receiver) = mpsc::channel::<Vec<(usize, SimulationRunMetrics)>>();
+
+    thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let sender = sender.clone();
+            let production = &request.production;
+            let load = &load;
+            let cancel_flag = &cancel_flag;
+            let next_run = &next_run;
+            scope.spawn(move || {
+                loop {
+                    if cancel_flag.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let start = next_run.fetch_add(SIMULATION_BATCH_RUNS, Ordering::Relaxed);
+                    if start >= requested_runs {
+                        break;
+                    }
+                    let end = start
+                        .saturating_add(SIMULATION_BATCH_RUNS)
+                        .min(requested_runs);
+                    let batch = (start..end)
+                        .map(|run_index| {
+                            (
+                                run_index,
+                                simulate_run_index(
+                                    production, load, capacity, base_seed, run_index,
+                                ),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    if sender.send(batch).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(sender);
+
+        while completed_runs < requested_runs {
+            let Ok(batch) = receiver.recv() else {
+                break;
+            };
+            let mut batch_completed = 0;
+            for (run_index, metrics) in batch {
+                if run_slots[run_index].is_none() {
+                    run_slots[run_index] = Some(metrics);
+                    batch_completed += 1;
+                }
+            }
+            if batch_completed > 0 {
+                completed_runs += batch_completed;
+                progress(completed_runs);
+            }
+            if completed_runs < requested_runs && cancelled() {
+                cancel_flag.store(true, Ordering::Relaxed);
+                break;
+            }
+        }
+    });
+
+    Ok(simulation_result(
+        requested_runs,
+        completed_runs < requested_runs,
+        &run_slots,
+    ))
+}
+
+fn simulation_worker_count(remaining_runs: usize) -> usize {
+    thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(remaining_runs)
+        .max(1)
+}
+
+fn simulate_run_index(
+    profile: &ProductionProfile,
+    load: &[f64],
+    capacity_kwh: f64,
+    base_seed: u64,
+    run_index: usize,
+) -> SimulationRunMetrics {
+    let mut rng = SmallRng::new(run_seed(base_seed, run_index));
+    let production = stochastic_hourly_production(profile, &mut rng);
+    dispatch_run(&production, load, capacity_kwh)
+}
+
+fn run_seed(base_seed: u64, run_index: usize) -> u64 {
+    let mut value = base_seed ^ (run_index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+fn simulation_result(
+    requested_runs: usize,
+    cancelled: bool,
+    run_slots: &[Option<SimulationRunMetrics>],
+) -> SimulationResult {
+    let runs = run_slots.iter().flatten().copied().collect::<Vec<_>>();
+    SimulationResult {
+        requested_runs,
         completed_runs: runs.len(),
-        cancelled: false,
+        cancelled,
         summaries: summarize_runs(&runs),
-    })
+    }
 }
 
 fn validate_request(request: &SimulationRequest) -> Result<(), SimulationError> {
@@ -580,7 +694,27 @@ mod tests {
             .expect("simulation succeeds");
 
         assert_eq!(result.completed_runs, expected_runs);
-        assert_eq!(completed, (1..=expected_runs).collect::<Vec<_>>());
+        assert_eq!(completed.first(), Some(&1));
+        assert_eq!(completed.last(), Some(&expected_runs));
+        assert!(completed.windows(2).all(|window| window[0] < window[1]));
+    }
+
+    #[test]
+    fn progress_reports_batched_worker_completion() {
+        let mut request = request(flat_profile(100.0), None);
+        request.options.runs = SIMULATION_BATCH_RUNS + 2;
+        let mut completed = Vec::new();
+        let result = simulate_with_progress(&request, || false, |runs| completed.push(runs))
+            .expect("simulation succeeds");
+
+        assert_eq!(result.completed_runs, SIMULATION_BATCH_RUNS + 2);
+        assert_eq!(completed.first(), Some(&1));
+        assert_eq!(completed.last(), Some(&(SIMULATION_BATCH_RUNS + 2)));
+        assert!(
+            completed
+                .iter()
+                .any(|runs| *runs >= SIMULATION_BATCH_RUNS + 1)
+        );
     }
 
     #[test]
