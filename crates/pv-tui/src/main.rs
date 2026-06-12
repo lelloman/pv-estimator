@@ -117,6 +117,8 @@ struct TuiState {
     #[serde(default)]
     simulation_fields: Vec<TuiFieldState>,
     #[serde(default)]
+    simulation_result: Option<SimulationResult>,
+    #[serde(default)]
     panel_visibility: PanelVisibility,
     #[serde(default)]
     focused_panel: Panel,
@@ -368,7 +370,9 @@ fn run() -> Result<()> {
 
     let mut app = App::new();
     app.load_saved_state();
+    let saved_simulation_result = app.simulation_result.clone();
     app.recompute(&mut estimator);
+    app.simulation_result = saved_simulation_result;
     run_app(&mut terminal, &mut app, &mut estimator)?;
     app.save_state();
     terminal.show_cursor()?;
@@ -507,6 +511,7 @@ impl App {
                 field.set_value(&saved.value);
             }
         }
+        self.simulation_result = state.simulation_result;
         self.panel_visibility = state.panel_visibility;
         self.focused_panel = state.focused_panel;
         self.ensure_panel_focus();
@@ -552,6 +557,7 @@ impl App {
                     value: field.value.clone(),
                 })
                 .collect(),
+            simulation_result: self.simulation_result.clone(),
             panel_visibility: self.panel_visibility,
             focused_panel: self.focused_panel,
         };
@@ -978,6 +984,7 @@ impl App {
                     "Simulation completed".to_string()
                 };
                 self.simulation_result = Some(result);
+                self.save_state();
             }
             Err(error) => {
                 run.error = Some(error);
@@ -4479,6 +4486,42 @@ mod tests {
     }
 
     #[test]
+    fn tui_state_round_trips_simulation_result() {
+        let result = populated_simulation_result();
+        let state = TuiState {
+            schema_version: TUI_STATE_SCHEMA_VERSION,
+            selected_location_id: "custom".to_string(),
+            location_query: String::new(),
+            fields: Vec::new(),
+            consumer_fields: Vec::new(),
+            consumer_shape: ConsumerShapeState::default(),
+            simulation_fields: Vec::new(),
+            simulation_result: Some(result.clone()),
+            panel_visibility: PanelVisibility::default(),
+            focused_panel: Panel::Simulation,
+        };
+
+        let json = serde_json::to_string(&state).expect("serialize state");
+        let restored: TuiState = serde_json::from_str(&json).expect("deserialize state");
+
+        assert_eq!(restored.simulation_result, Some(result));
+    }
+
+    #[test]
+    fn startup_recompute_pattern_preserves_loaded_simulation_result() {
+        let mut app = App::new();
+        let result = populated_simulation_result();
+        app.simulation_result = Some(result.clone());
+        let mut estimator = SourceModelEstimator::load_embedded().expect("embedded estimator");
+
+        let saved_simulation_result = app.simulation_result.clone();
+        app.recompute(&mut estimator);
+        app.simulation_result = saved_simulation_result;
+
+        assert_eq!(app.simulation_result, Some(result));
+    }
+
+    #[test]
     fn simulation_result_snapshot() {
         let mut app = App::new();
         app.toggle_panel(Panel::Simulation);
@@ -4869,6 +4912,7 @@ mod tests {
             consumer_fields: Vec::new(),
             consumer_shape: ConsumerShapeState::default(),
             simulation_fields: Vec::new(),
+            simulation_result: None,
             panel_visibility: PanelVisibility::default(),
             focused_panel: Panel::System,
         };
