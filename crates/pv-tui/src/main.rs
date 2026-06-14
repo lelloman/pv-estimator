@@ -2211,12 +2211,12 @@ fn annual_energy_line(document: Option<&SourceEnsembleEstimateDocument>) -> Line
                 .annual_energy
                 .map(|band| {
                     format!(
-                        "{mean:.0} - {:.0}..{:.0}",
+                        "{mean:.0} low..high {:.0}..{:.0}",
                         band.low.as_kilowatt_hours().round(),
                         band.high.as_kilowatt_hours().round()
                     )
                 })
-                .unwrap_or_else(|| format!("{mean:.0} - -..-"))
+                .unwrap_or_else(|| format!("{mean:.0} low..high -..-"))
         })
         .unwrap_or_else(|| "-".to_string());
 
@@ -2237,13 +2237,13 @@ fn annual_revenue_line(document: &SourceEnsembleEstimateDocument, price: f64) ->
         .annual_energy
         .map(|band| {
             format!(
-                "{:.0} - {:.0}..{:.0}",
+                "{:.0} low..high {:.0}..{:.0}",
                 mean.round(),
                 (band.low.as_kilowatt_hours() * price).round(),
                 (band.high.as_kilowatt_hours() * price).round()
             )
         })
-        .unwrap_or_else(|| format!("{:.0} - -..-", mean.round()));
+        .unwrap_or_else(|| format!("{:.0} low..high -..-", mean.round()));
 
     estimate_metric_line(
         "Revenue €",
@@ -3139,14 +3139,14 @@ fn simulation_result_lines(result: &SimulationResult) -> Vec<Line<'static>> {
 
 fn format_kwh_summary(summary: MetricSummary) -> String {
     format!(
-        "{:.0} ({:.0}..{:.0}) kWh",
+        "{:.0} p10..p90 {:.0}..{:.0}",
         summary.mean, summary.p10, summary.p90
     )
 }
 
 fn format_ratio_summary(summary: MetricSummary) -> String {
     format!(
-        "{:.0}% ({:.0}..{:.0})",
+        "{:.0}% p10..p90 {:.0}..{:.0}%",
         summary.mean * 100.0,
         summary.p10 * 100.0,
         summary.p90 * 100.0
@@ -4799,8 +4799,8 @@ mod tests {
             p90: 0.29,
         };
 
-        assert_eq!(format_kwh_summary(kwh), "1234 (1000..1500) kWh");
-        assert_eq!(format_ratio_summary(ratio), "26% (24..29)");
+        assert_eq!(format_kwh_summary(kwh), "1234 p10..p90 1000..1500");
+        assert_eq!(format_ratio_summary(ratio), "26% p10..p90 24..29%");
     }
 
     #[test]
