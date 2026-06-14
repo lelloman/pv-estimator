@@ -3101,12 +3101,12 @@ fn simulation_result_lines(result: &SimulationResult) -> Vec<Line<'static>> {
     let summaries = &result.summaries;
     vec![
         estimate_metric_line(
-            "Production",
+            "Prod kWh",
             format_kwh_summary(summaries.production_kwh),
             Style::default(),
         ),
         estimate_metric_line(
-            "Import",
+            "Import kWh",
             format_kwh_summary(summaries.grid_import_kwh),
             Style::default().fg(Color::Green),
         ),
@@ -3131,12 +3131,12 @@ fn simulation_result_lines(result: &SimulationResult) -> Vec<Line<'static>> {
             Style::default(),
         ),
         estimate_metric_line(
-            "Export",
+            "Export kWh",
             format_kwh_summary(summaries.grid_export_kwh),
             Style::default(),
         ),
         estimate_metric_line(
-            "Self use",
+            "Self kWh",
             format_kwh_summary(summaries.self_consumed_kwh),
             Style::default(),
         ),
@@ -3146,7 +3146,7 @@ fn simulation_result_lines(result: &SimulationResult) -> Vec<Line<'static>> {
             Style::default(),
         ),
         estimate_metric_line(
-            "Losses",
+            "Loss kWh",
             format_kwh_summary(summaries.battery_losses_kwh),
             Style::default(),
         ),
@@ -3155,10 +3155,9 @@ fn simulation_result_lines(result: &SimulationResult) -> Vec<Line<'static>> {
 
 fn format_scenario_metrics(metrics: SimulationRunMetrics) -> String {
     format!(
-        "P {:.0} I {:.0} SS {:.0}%",
+        "Prod {:.0} Import {:.0} kWh",
         metrics.production_kwh,
-        metrics.grid_import_kwh,
-        metrics.self_sufficiency_ratio * 100.0
+        metrics.grid_import_kwh
     )
 }
 
@@ -4849,7 +4848,10 @@ mod tests {
 
         assert_eq!(format_kwh_summary(kwh), "1234 p10..p90 1000..1500");
         assert_eq!(format_ratio_summary(ratio), "26% p10..p90 24..29%");
-        assert_eq!(format_scenario_metrics(scenario), "P 1700 I 3100 SS 26%");
+        assert_eq!(
+            format_scenario_metrics(scenario),
+            "Prod 1700 Import 3100 kWh"
+        );
     }
 
     #[test]
