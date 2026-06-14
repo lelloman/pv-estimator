@@ -31,7 +31,7 @@ pub mod prelude {
     pub use crate::simulation::{
         BuiltInLoadShapeId, LoadProfile, LoadShape, MetricSummary, MonthlyProductionBand,
         ProductionProfile, SimulationMetricSummaries, SimulationOptions, SimulationRequest,
-        SimulationResult, SimulationRunMetrics, StorageConfig, simulate,
+        SimulationResult, SimulationRunMetrics, SimulationScenarios, StorageConfig, simulate,
         simulate_with_cancellation,
     };
     pub use crate::source_model::{

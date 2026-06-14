@@ -19,7 +19,8 @@ use crossterm::terminal::{
 use directories::ProjectDirs;
 use pv_core::simulation::{
     BuiltInLoadShapeId, LoadProfile, LoadShape, MetricSummary, SimulationOptions,
-    SimulationRequest, SimulationResult, StorageConfig, simulate_with_progress,
+    SimulationRequest, SimulationResult, SimulationRunMetrics, StorageConfig,
+    simulate_with_progress,
 };
 use pv_core::source_model::SourceEnsembleEstimateDocument;
 use pv_data::CitySearchResult;
@@ -3110,6 +3111,26 @@ fn simulation_result_lines(result: &SimulationResult) -> Vec<Line<'static>> {
             Style::default().fg(Color::Green),
         ),
         estimate_metric_line(
+            "Self suff",
+            format_ratio_summary(summaries.self_sufficiency_ratio),
+            Style::default().fg(Color::Green),
+        ),
+        estimate_metric_line(
+            "Low case",
+            format_scenario_metrics(result.scenarios.low),
+            Style::default(),
+        ),
+        estimate_metric_line(
+            "Mean case",
+            format_scenario_metrics(result.scenarios.mean),
+            Style::default(),
+        ),
+        estimate_metric_line(
+            "High case",
+            format_scenario_metrics(result.scenarios.high),
+            Style::default(),
+        ),
+        estimate_metric_line(
             "Export",
             format_kwh_summary(summaries.grid_export_kwh),
             Style::default(),
@@ -3118,11 +3139,6 @@ fn simulation_result_lines(result: &SimulationResult) -> Vec<Line<'static>> {
             "Self use",
             format_kwh_summary(summaries.self_consumed_kwh),
             Style::default(),
-        ),
-        estimate_metric_line(
-            "Self suff",
-            format_ratio_summary(summaries.self_sufficiency_ratio),
-            Style::default().fg(Color::Green),
         ),
         estimate_metric_line(
             "Self cons",
@@ -3135,6 +3151,15 @@ fn simulation_result_lines(result: &SimulationResult) -> Vec<Line<'static>> {
             Style::default(),
         ),
     ]
+}
+
+fn format_scenario_metrics(metrics: SimulationRunMetrics) -> String {
+    format!(
+        "P {:.0} I {:.0} SS {:.0}%",
+        metrics.production_kwh,
+        metrics.grid_import_kwh,
+        metrics.self_sufficiency_ratio * 100.0
+    )
 }
 
 fn format_kwh_summary(summary: MetricSummary) -> String {
@@ -3776,8 +3801,8 @@ mod tests {
 
     use pv_core::prelude::{
         AnnualPvEnsembleEstimate, Energy, EstimateCoverage, EstimateLocation, EstimateSystem,
-        Irradiation, MonthOfYear, SimulationMetricSummaries, SourceAnnualPvEstimate,
-        SourceMonthlyPvEstimate, WeatherSourceId,
+        Irradiation, MonthOfYear, SimulationMetricSummaries, SimulationScenarios,
+        SourceAnnualPvEstimate, SourceMonthlyPvEstimate, WeatherSourceId,
     };
     use ratatui::backend::TestBackend;
 
@@ -3837,6 +3862,17 @@ mod tests {
             p90,
             p50: mean,
         };
+        let metrics = |production, import, self_sufficiency| SimulationRunMetrics {
+            production_kwh: production,
+            load_kwh: 4200.0,
+            self_consumed_kwh: 4200.0 * self_sufficiency,
+            grid_import_kwh: import,
+            grid_export_kwh: 0.0,
+            battery_losses_kwh: 0.0,
+            ending_soc_kwh: 0.0,
+            self_consumption_ratio: 0.65,
+            self_sufficiency_ratio: self_sufficiency,
+        };
         SimulationResult {
             requested_runs: 10_000,
             completed_runs: 10_000,
@@ -3851,6 +3887,11 @@ mod tests {
                 ending_soc_kwh: summary(0.0, 0.0, 0.0),
                 self_consumption_ratio: summary(0.65, 0.60, 0.70),
                 self_sufficiency_ratio: summary(0.26, 0.24, 0.29),
+            },
+            scenarios: SimulationScenarios {
+                low: metrics(1500.0, 3300.0, 0.21),
+                mean: metrics(1700.0, 3100.0, 0.26),
+                high: metrics(1900.0, 2900.0, 0.31),
             },
         }
     }
@@ -4799,8 +4840,16 @@ mod tests {
             p90: 0.29,
         };
 
+        let scenario = SimulationRunMetrics {
+            production_kwh: 1700.0,
+            grid_import_kwh: 3100.0,
+            self_sufficiency_ratio: 0.26,
+            ..SimulationRunMetrics::default()
+        };
+
         assert_eq!(format_kwh_summary(kwh), "1234 p10..p90 1000..1500");
         assert_eq!(format_ratio_summary(ratio), "26% p10..p90 24..29%");
+        assert_eq!(format_scenario_metrics(scenario), "P 1700 I 3100 SS 26%");
     }
 
     #[test]
