@@ -90,9 +90,18 @@ pub struct SimulationResult {
     pub completed_runs: usize,
     pub cancelled: bool,
     pub summaries: SimulationMetricSummaries,
+    #[serde(default)]
+    pub scenarios: SimulationScenarios,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct SimulationScenarios {
+    pub low: SimulationRunMetrics,
+    pub mean: SimulationRunMetrics,
+    pub high: SimulationRunMetrics,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct SimulationRunMetrics {
     pub production_kwh: f64,
     pub load_kwh: f64,
@@ -185,10 +194,24 @@ pub fn simulate_with_progress(
     progress(completed_runs);
 
     if requested_runs == 1 {
-        return Ok(simulation_result(requested_runs, false, &run_slots));
+        return Ok(simulation_result(
+            requested_runs,
+            false,
+            &run_slots,
+            &request.production,
+            &load,
+            capacity,
+        ));
     }
     if cancelled() {
-        return Ok(simulation_result(requested_runs, true, &run_slots));
+        return Ok(simulation_result(
+            requested_runs,
+            true,
+            &run_slots,
+            &request.production,
+            &load,
+            capacity,
+        ));
     }
 
     let cancel_flag = AtomicBool::new(false);
@@ -259,6 +282,9 @@ pub fn simulate_with_progress(
         requested_runs,
         completed_runs < requested_runs,
         &run_slots,
+        &request.production,
+        &load,
+        capacity,
     ))
 }
 
@@ -283,6 +309,45 @@ fn simulate_run_index(
     dispatch_run(&production, &load, capacity_kwh)
 }
 
+fn deterministic_scenarios(
+    profile: &ProductionProfile,
+    load: &[f64],
+    capacity_kwh: f64,
+) -> SimulationScenarios {
+    SimulationScenarios {
+        low: deterministic_scenario(profile, load, capacity_kwh, production_low_weight(profile)),
+        mean: deterministic_scenario(profile, load, capacity_kwh, 1.0),
+        high: deterministic_scenario(profile, load, capacity_kwh, production_high_weight(profile)),
+    }
+}
+
+fn deterministic_scenario(
+    profile: &ProductionProfile,
+    load: &[f64],
+    capacity_kwh: f64,
+    production_weight: f64,
+) -> SimulationRunMetrics {
+    let mut production = profile.hourly_mean_kwh.clone();
+    scale_slice_by(&mut production, production_weight);
+    dispatch_run(&production, load, capacity_kwh)
+}
+
+fn production_low_weight(profile: &ProductionProfile) -> f64 {
+    production_weight_for(profile, profile.annual_low_kwh)
+}
+
+fn production_high_weight(profile: &ProductionProfile) -> f64 {
+    production_weight_for(profile, profile.annual_high_kwh)
+}
+
+fn production_weight_for(profile: &ProductionProfile, annual_kwh: f64) -> f64 {
+    if profile.annual_mean_kwh > 0.0 {
+        annual_kwh / profile.annual_mean_kwh
+    } else {
+        1.0
+    }
+}
+
 fn run_seed(base_seed: u64, run_index: usize) -> u64 {
     let mut value = base_seed ^ (run_index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
     value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
@@ -295,6 +360,9 @@ fn simulation_result(
     requested_runs: usize,
     cancelled: bool,
     run_slots: &[Option<SimulationRunMetrics>],
+    profile: &ProductionProfile,
+    load: &[f64],
+    capacity_kwh: f64,
 ) -> SimulationResult {
     let runs = run_slots.iter().flatten().copied().collect::<Vec<_>>();
     SimulationResult {
@@ -302,6 +370,7 @@ fn simulation_result(
         completed_runs: runs.len(),
         cancelled,
         summaries: summarize_runs(&runs),
+        scenarios: deterministic_scenarios(profile, load, capacity_kwh),
     }
 }
 
@@ -756,6 +825,26 @@ mod tests {
 
         assert!((0.8..=1.2).contains(&run_weight));
         assert!((run_weight - 1.0).abs() > 1.0e-9);
+    }
+
+    #[test]
+    fn deterministic_scenarios_use_annual_production_band() {
+        let mut profile = flat_profile(100.0);
+        profile.annual_low_kwh = profile.annual_mean_kwh * 0.8;
+        profile.annual_high_kwh = profile.annual_mean_kwh * 1.2;
+        let result = simulate(&request(profile, None)).expect("simulation succeeds");
+
+        assert!((result.scenarios.low.production_kwh - 960.0).abs() < 1.0e-9);
+        assert!((result.scenarios.mean.production_kwh - 1200.0).abs() < 1.0e-9);
+        assert!((result.scenarios.high.production_kwh - 1440.0).abs() < 1.0e-9);
+        assert_eq!(
+            result.scenarios.low.load_kwh,
+            result.scenarios.mean.load_kwh
+        );
+        assert_eq!(
+            result.scenarios.mean.load_kwh,
+            result.scenarios.high.load_kwh
+        );
     }
 
     #[test]
