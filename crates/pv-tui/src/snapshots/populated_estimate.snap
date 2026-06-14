@@ -1,6 +1,6 @@
 "┌[1] System────────────────────────────┐┌[4] Estimate──────────────────────────┐"
-"│Name         Custom location          ││Annual kWh 1692 - 1548..1836          │"
-"│Region                                ││Revenue €  372 - 341..404             │"
+"│Name         Custom location          ││Annual kWh 1692 low..high 1548..1836  │"
+"│Region                                ││Revenue €  372 low..high 341..404     │"
 "│Latitude     40.650                   ││POA        1776.00 kWh/m2             │"
 "│Longitude    15.643                   ││Sources    fixture-a, fixture-b       │"
 "│Loss %       14.0                     ││                                      │"
