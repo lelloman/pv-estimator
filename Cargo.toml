@@ -4,6 +4,7 @@ members = [
     "crates/pv-core",
     "crates/pv-data",
     "crates/pv-model",
+    "crates/pv-model-runtime",
     "crates/pv-service",
     "crates/pv-tui",
     "crates/pv-wasm",

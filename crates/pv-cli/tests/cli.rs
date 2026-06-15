@@ -28,6 +28,14 @@ fn assert_failure(output: Output) -> Output {
     output
 }
 
+fn assert_json_number_close(actual: &Value, expected: f64) {
+    let actual = actual.as_f64().expect("JSON number");
+    assert!(
+        (actual - expected).abs() < 1.0e-6,
+        "expected {expected}, got {actual}"
+    );
+}
+
 #[test]
 fn estimate_uses_embedded_defaults() {
     let output = assert_success(
@@ -51,6 +59,66 @@ fn estimate_uses_embedded_defaults() {
         document["ensemble_estimate"]["monthly_estimates"]
             .as_array()
             .is_some_and(|rows| rows.len() == 12)
+    );
+}
+
+#[test]
+fn estimate_madrid_json_matches_runtime_regression_fixture() {
+    let output = assert_success(
+        pv().args([
+            "estimate",
+            "--lat",
+            "40.4168",
+            "--lon=-3.7038",
+            "--name",
+            "Madrid",
+            "--region",
+            "ES",
+            "--kwp",
+            "4.5",
+            "--loss-pct",
+            "13",
+            "--tilt-deg",
+            "28",
+            "--azimuth-deg",
+            "5",
+            "--storage-kwh",
+            "5.5",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run Madrid regression estimate"),
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).expect("estimate JSON");
+
+    assert_eq!(document["schema_version"], 1);
+    assert_eq!(document["location"]["name"], "Madrid");
+    assert_eq!(document["location"]["region"], "ES");
+    assert_eq!(document["system"]["storage_usable_kwh"], 5.5);
+    assert_eq!(
+        document["coverage"]["applicable_sources"],
+        serde_json::json!(["nasa_power", "pvgis_era5", "pvgis_sarah3"])
+    );
+    assert_json_number_close(
+        &document["ensemble_estimate"]["annual_energy"]["mean"]["watt_hours"],
+        7_284_074.992219012,
+    );
+    assert_json_number_close(
+        &document["ensemble_estimate"]["annual_energy"]["low"]["watt_hours"],
+        6_971_517.213198024,
+    );
+    assert_json_number_close(
+        &document["ensemble_estimate"]["annual_energy"]["high"]["watt_hours"],
+        7_532_027.85505303,
+    );
+    assert_json_number_close(
+        &document["ensemble_estimate"]["monthly_estimates"][0]["energy"]["mean"]["watt_hours"],
+        425_479.9841724254,
+    );
+    assert_json_number_close(
+        &document["ensemble_estimate"]["monthly_estimates"][11]["energy"]["mean"]["watt_hours"],
+        387_656.9706862636,
     );
 }
 
@@ -176,6 +244,45 @@ fn estimate_accepts_multiple_arrays() {
     assert!(document["references"]["arrays"][0].get("name").is_none());
     assert_eq!(document["references"]["arrays"][1]["name"], "west roof");
     assert_eq!(document["references"]["arrays"][1]["azimuth_deg"], -90.0);
+}
+
+#[test]
+fn estimate_milan_multi_array_json_matches_runtime_regression_fixture() {
+    let output = assert_success(
+        pv().args([
+            "estimate",
+            "--lat",
+            "45.4642",
+            "--lon",
+            "9.1900",
+            "--array",
+            "1.5,30,0",
+            "--array",
+            "west roof,2.25,20,-90",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run Milan multi-array regression estimate"),
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).expect("estimate JSON");
+
+    assert_eq!(document["system"]["peak_power_kwp"], 3.75);
+    assert_eq!(document["system"]["tilt_deg"], 24.0);
+    assert_eq!(document["system"]["aspect_deg"], -54.0);
+    assert_eq!(document["references"]["arrays"][1]["name"], "west roof");
+    assert_json_number_close(
+        &document["ensemble_estimate"]["annual_energy"]["mean"]["watt_hours"],
+        4_500_427.349125953,
+    );
+    assert_json_number_close(
+        &document["ensemble_estimate"]["annual_energy"]["low"]["watt_hours"],
+        4_402_404.427571193,
+    );
+    assert_json_number_close(
+        &document["ensemble_estimate"]["annual_energy"]["high"]["watt_hours"],
+        4_584_262.65135788,
+    );
 }
 
 #[test]
