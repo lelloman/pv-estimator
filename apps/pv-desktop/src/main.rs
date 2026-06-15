@@ -86,7 +86,7 @@ fn main() {
         vec![plugin_tab(
             "system",
             "panel-left",
-            "System",
+            "",
             "com.lelloman.pv_estimator.system",
             "The PV system view could not be created.",
             false,

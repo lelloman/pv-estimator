@@ -7,19 +7,19 @@ use std::path::PathBuf;
 use gtk::glib::translate::IntoGlibPtr;
 use gtk::prelude::*;
 use gtk::{
-    Box as GtkBox, Button, DropDown, Entry, FileChooserAction, FileChooserNative, Grid, Label,
-    Orientation, PolicyType, ResponseType, ScrolledWindow, Separator, SpinButton,
+    Align, Box as GtkBox, Button, DropDown, Entry, FileChooserAction, FileChooserNative, Grid,
+    Label, ListBox, Orientation, PolicyType, ResponseType, ScrolledWindow, SelectionMode,
+    Separator, Window,
 };
 use maruzzella_sdk::{
-    CommandSpec, HostApi, MzStatusCode, MzViewPlacement, Plugin, PluginDependency,
-    PluginDescriptor, SurfaceContributionSpec, Version, ViewFactorySpec, export_plugin,
+    export_plugin, CommandSpec, HostApi, MzStatusCode, MzViewPlacement, Plugin, PluginDependency,
+    PluginDescriptor, SurfaceContributionSpec, Version, ViewFactorySpec,
 };
 use pv_core::simulation::{
-    BuiltInLoadShapeId, LoadProfile, LoadShape, SimulationRequest, StorageConfig, simulate,
+    simulate, BuiltInLoadShapeId, LoadProfile, LoadShape, SimulationRequest, StorageConfig,
 };
-use pv_desktop_core::{
-    PROJECT_EXTENSION, PvProjectDocument, load_project, project_file_display_name, save_project,
-};
+use pv_data::{search_cities, CitySearchResult};
+use pv_desktop_core::{load_project, save_project, PvProjectDocument, PROJECT_EXTENSION};
 use pv_model::{EstimateArray, EstimateRequest, SourceModelEstimator};
 
 pub struct PvDesktopPlugin;
@@ -495,11 +495,6 @@ fn render_system_into(root: &GtkBox) {
     content.set_margin_bottom(10);
     content.set_margin_start(10);
     content.set_margin_end(10);
-    content.append(&header_label("System"));
-    content.append(&meta_label(&document_label(&state)));
-    content.append(&section_separator());
-    append_project_fields(&content, &state.project);
-    content.append(&section_separator());
     append_location_fields(&content, &state.project.inputs.estimate_request);
     content.append(&section_separator());
     append_array_fields(&content, &state.project.inputs.arrays);
@@ -514,24 +509,12 @@ fn render_system_into(root: &GtkBox) {
     root.append(&scroller);
 }
 
-fn append_project_fields(content: &GtkBox, project: &PvProjectDocument) {
-    content.append(&section_label("Project"));
-    let title = text_entry(&project.metadata.title, |value| {
-        update_state(|state| state.project.metadata.title = value);
-    });
-    content.append(&field_row("Title", &title));
-}
-
 fn append_location_fields(content: &GtkBox, request: &EstimateRequest) {
     content.append(&section_label("Location"));
-    let name = text_entry(&request.name, |value| {
-        update_state(|state| state.project.inputs.estimate_request.name = value);
-    });
+    let name = Button::with_label(&request.name);
+    name.set_halign(Align::Fill);
+    name.connect_clicked(|_| show_location_search_dialog());
     content.append(&field_row("Name", &name));
-    let region = text_entry(&request.region, |value| {
-        update_state(|state| state.project.inputs.estimate_request.region = value);
-    });
-    content.append(&field_row("Region", &region));
     let lat = number_entry(request.latitude, 4, |value| {
         update_state(|state| state.project.inputs.estimate_request.latitude = value);
     });
@@ -540,6 +523,131 @@ fn append_location_fields(content: &GtkBox, request: &EstimateRequest) {
         update_state(|state| state.project.inputs.estimate_request.longitude = value);
     });
     content.append(&field_row("Longitude", &lon));
+}
+
+fn show_location_search_dialog() {
+    if !gtk::is_initialized_main_thread() && gtk::init().is_err() {
+        append_log("GTK is not initialized; cannot search locations".to_string());
+        return;
+    }
+
+    let current_query =
+        STATE.with(|state| state.borrow().project.inputs.estimate_request.name.clone());
+    let window = Window::builder()
+        .title("Search Location")
+        .modal(true)
+        .default_width(460)
+        .default_height(520)
+        .build();
+    window.add_css_class("app-dialog");
+
+    let content = GtkBox::new(Orientation::Vertical, 10);
+    content.set_margin_top(14);
+    content.set_margin_bottom(14);
+    content.set_margin_start(14);
+    content.set_margin_end(14);
+
+    let search = Entry::new();
+    search.set_placeholder_text(Some("Search city"));
+    search.set_text(&current_query);
+    content.append(&search);
+
+    let list = ListBox::new();
+    list.set_selection_mode(SelectionMode::None);
+    let scroller = ScrolledWindow::builder()
+        .hexpand(true)
+        .vexpand(true)
+        .hscrollbar_policy(PolicyType::Never)
+        .vscrollbar_policy(PolicyType::Automatic)
+        .child(&list)
+        .build();
+    content.append(&scroller);
+
+    let footer = GtkBox::new(Orientation::Horizontal, 6);
+    footer.set_halign(Align::End);
+    let cancel = Button::with_label("Cancel");
+    let window_for_cancel = window.clone();
+    cancel.connect_clicked(move |_| window_for_cancel.close());
+    footer.append(&cancel);
+    content.append(&footer);
+
+    window.set_child(Some(&content));
+    refresh_location_results(&list, &window, &current_query);
+
+    let list_for_search = list.clone();
+    let window_for_search = window.clone();
+    search.connect_changed(move |entry| {
+        refresh_location_results(&list_for_search, &window_for_search, entry.text().as_str());
+    });
+
+    window.present();
+    search.grab_focus();
+}
+
+fn refresh_location_results(list: &ListBox, window: &Window, query: &str) {
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+
+    let query = query.trim();
+    if query.len() < 2 {
+        list.append(&meta_label("Type at least 2 characters."));
+        return;
+    }
+
+    let results = search_cities(query, 12);
+    if results.is_empty() {
+        list.append(&meta_label("No matching locations."));
+        return;
+    }
+
+    for result in results {
+        list.append(&location_result_button(window, result));
+    }
+}
+
+fn location_result_button(window: &Window, result: CitySearchResult) -> Button {
+    let button = Button::new();
+    button.set_halign(Align::Fill);
+
+    let row = GtkBox::new(Orientation::Vertical, 2);
+    row.set_halign(Align::Fill);
+    row.set_hexpand(true);
+
+    let title = Label::new(Some(&format!(
+        "{}, {}",
+        result.display_name, result.country_code
+    )));
+    title.set_xalign(0.0);
+    title.set_hexpand(true);
+
+    let detail = Label::new(Some(&format!(
+        "{:.4}, {:.4} | population {}",
+        result.latitude_degrees, result.longitude_degrees, result.population
+    )));
+    detail.set_xalign(0.0);
+    detail.add_css_class("dim-label");
+
+    row.append(&title);
+    row.append(&detail);
+    button.set_child(Some(&row));
+
+    let window = window.clone();
+    button.connect_clicked(move |_| {
+        apply_location_result(&result);
+        window.close();
+    });
+    button
+}
+
+fn apply_location_result(result: &CitySearchResult) {
+    update_state(|state| {
+        let request = &mut state.project.inputs.estimate_request;
+        request.name = result.display_name.clone();
+        request.region = result.country_code.clone();
+        request.latitude = result.latitude_degrees;
+        request.longitude = result.longitude_degrees;
+    });
 }
 
 fn append_array_fields(content: &GtkBox, arrays: &[EstimateArray]) {
@@ -630,10 +738,10 @@ fn append_options_fields(content: &GtkBox, project: &PvProjectDocument) {
         },
     );
     content.append(&field_row("Storage kWh", &storage));
-    let runs = SpinButton::with_range(1.0, 1_000_000.0, 100.0);
-    runs.set_value(project.inputs.simulation_options.runs as f64);
-    runs.connect_value_changed(|spin| {
-        update_state(|state| state.project.inputs.simulation_options.runs = spin.value() as usize);
+    let runs = number_entry(project.inputs.simulation_options.runs as f64, 0, |value| {
+        update_state(|state| {
+            state.project.inputs.simulation_options.runs = value.round().max(1.0) as usize;
+        });
     });
     content.append(&field_row("Simulation runs", &runs));
 }
@@ -817,15 +925,6 @@ fn snapshot() -> DesktopState {
     STATE.with(|state| state.borrow().clone())
 }
 
-fn document_label(state: &DesktopState) -> String {
-    let name = project_file_display_name(state.path.as_deref(), &state.project);
-    if state.dirty {
-        format!("{name} *")
-    } else {
-        name
-    }
-}
-
 fn text_entry(value: &str, update: impl Fn(String) + 'static) -> Entry {
     let entry = Entry::new();
     entry.set_text(value);
@@ -833,19 +932,49 @@ fn text_entry(value: &str, update: impl Fn(String) + 'static) -> Entry {
     entry
 }
 
-fn number_entry(value: f64, digits: u32, update: impl Fn(f64) + 'static) -> SpinButton {
-    let spin = SpinButton::with_range(-180.0, 1_000_000.0, 0.1);
-    spin.set_digits(digits);
-    spin.set_value(value);
-    spin.connect_value_changed(move |spin| update(spin.value()));
-    spin
+fn number_entry(value: f64, digits: u32, update: impl Fn(f64) + 'static) -> Entry {
+    let entry = Entry::new();
+    entry.set_input_purpose(gtk::InputPurpose::Number);
+    entry.set_text(&format_number(value, digits));
+    entry.connect_changed(move |entry| {
+        if let Some(value) = parse_number(&entry.text()) {
+            update(value);
+        }
+    });
+    entry
+}
+
+fn format_number(value: f64, digits: u32) -> String {
+    if digits == 0 {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.digits$}", digits = digits as usize).replace('.', ",")
+    }
+}
+
+fn parse_number(value: &str) -> Option<f64> {
+    let normalized = value.trim().replace(',', ".");
+    if normalized.is_empty() {
+        return None;
+    }
+    normalized.parse::<f64>().ok()
 }
 
 fn field_row<W: IsA<gtk::Widget>>(label: &str, widget: &W) -> GtkBox {
-    let row = GtkBox::new(Orientation::Vertical, 4);
+    let row = GtkBox::new(Orientation::Horizontal, 12);
+    row.set_hexpand(true);
+
     let label = Label::new(Some(label));
     label.set_xalign(0.0);
+    label.set_valign(Align::Center);
+    label.set_width_chars(15);
+    label.set_max_width_chars(15);
+    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
     label.add_css_class("dim-label");
+
+    widget.set_hexpand(true);
+    widget.set_halign(Align::Fill);
+
     row.append(&label);
     row.append(widget);
     row
