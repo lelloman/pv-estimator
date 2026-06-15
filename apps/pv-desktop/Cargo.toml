@@ -1,0 +1,14 @@
+[package]
+name = "pv-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+gtk = { package = "gtk4", version = "0.9" }
+maruzzella = { path = "../../../maruzzella" }
+pv-desktop-plugin = { path = "../../crates/pv-desktop-plugin", default-features = false }
