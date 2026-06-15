@@ -21,8 +21,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Checkout Maruzzella
+        run: git clone --depth 1 https://github.com/lelloman/maruzzella.git ../maruzzella
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
