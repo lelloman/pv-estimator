@@ -497,7 +497,7 @@ fn render_system_into(root: &GtkBox) {
     content.set_margin_end(10);
     append_location_fields(&content, &state.project.inputs.estimate_request);
     content.append(&section_separator());
-    append_array_fields(&content, &state.project.inputs.arrays);
+    append_array_fields(&content, &state.project);
     content.append(&section_separator());
     append_consumption_fields(&content, &state.project.inputs.load_profile);
     content.append(&section_separator());
@@ -651,7 +651,8 @@ fn apply_location_result(result: &CitySearchResult) {
     });
 }
 
-fn append_array_fields(content: &GtkBox, arrays: &[EstimateArray]) {
+fn append_array_fields(content: &GtkBox, project: &PvProjectDocument) {
+    let arrays = &project.inputs.arrays;
     let header = GtkBox::new(Orientation::Horizontal, 8);
     header.set_hexpand(true);
     let title = section_label("Production");
@@ -663,22 +664,56 @@ fn append_array_fields(content: &GtkBox, arrays: &[EstimateArray]) {
     content.append(&header);
 
     let table = Grid::new();
-    table.set_column_spacing(10);
+    table.set_column_spacing(12);
     table.set_row_spacing(6);
     table.set_hexpand(true);
-    add_grid_header(&table, 0, "Array");
-    add_grid_header(&table, 1, "kWp");
-    add_grid_header(&table, 2, "Tilt");
-    add_grid_header(&table, 3, "Azimuth");
+    table.set_column_homogeneous(false);
+    add_table_header(&table, 1, "kWp", 1.0);
+    add_table_header(&table, 2, "Tilt", 1.0);
+    add_table_header(&table, 3, "Azimuth", 1.0);
 
     for (index, array) in arrays.iter().enumerate() {
         let row = (index + 1) as i32;
-        add_grid_text(&table, 0, row, array.name.as_deref().unwrap_or("Array"));
-        add_grid_text(&table, 1, row, &format!("{:.2}", array.peak_power_kwp));
-        add_grid_text(&table, 2, row, &format!("{:.1}", array.tilt_deg));
-        add_grid_text(&table, 3, row, &format!("{:.1}", array.azimuth_deg));
+        add_table_cell(
+            &table,
+            0,
+            row,
+            array.name.as_deref().unwrap_or("Array"),
+            0.0,
+            true,
+        );
+        add_table_cell(
+            &table,
+            1,
+            row,
+            &format!("{:.2}", array.peak_power_kwp),
+            1.0,
+            false,
+        );
+        add_table_cell(
+            &table,
+            2,
+            row,
+            &format!("{:.1}", array.tilt_deg),
+            1.0,
+            false,
+        );
+        add_table_cell(
+            &table,
+            3,
+            row,
+            &format!(
+                "{:.1} {}",
+                array.azimuth_deg,
+                azimuth_direction_label(array.azimuth_deg)
+            ),
+            1.0,
+            false,
+        );
 
         let actions = GtkBox::new(Orientation::Horizontal, 4);
+        actions.set_halign(Align::End);
+        actions.set_hexpand(true);
         let edit = icon_button("document-edit-symbolic", "Edit array");
         edit.connect_clicked(move |_| show_array_dialog(Some(index)));
         let delete = icon_button("edit-delete-symbolic", "Delete array");
@@ -692,6 +727,22 @@ fn append_array_fields(content: &GtkBox, arrays: &[EstimateArray]) {
     if arrays.is_empty() {
         content.append(&meta_label("No arrays configured."));
     }
+
+    let storage = number_entry(
+        project
+            .inputs
+            .estimate_request
+            .storage_usable_kwh
+            .unwrap_or(0.0),
+        2,
+        |value| {
+            update_state(|state| {
+                state.project.inputs.estimate_request.storage_usable_kwh =
+                    (value > 0.0).then_some(value);
+            });
+        },
+    );
+    content.append(&field_row("Storage kWh", &storage));
 
     let loss = STATE.with(|state| state.borrow().project.inputs.estimate_request.loss_pct);
     let loss = number_entry(loss, 1, |value| {
@@ -740,7 +791,7 @@ fn show_array_dialog(index: Option<usize>) {
     content.append(&field_row("Tilt", &tilt));
 
     let azimuth = dialog_number_entry(array.azimuth_deg, 1);
-    content.append(&field_row("Azimuth", &azimuth));
+    content.append(&azimuth_field_row(&azimuth));
 
     let footer = GtkBox::new(Orientation::Horizontal, 6);
     footer.set_halign(Align::End);
@@ -931,22 +982,7 @@ fn append_consumption_fields(content: &GtkBox, load_profile: &LoadProfile) {
 }
 
 fn append_options_fields(content: &GtkBox, project: &PvProjectDocument) {
-    content.append(&section_label("Storage / Run"));
-    let storage = number_entry(
-        project
-            .inputs
-            .estimate_request
-            .storage_usable_kwh
-            .unwrap_or(0.0),
-        2,
-        |value| {
-            update_state(|state| {
-                state.project.inputs.estimate_request.storage_usable_kwh =
-                    (value > 0.0).then_some(value);
-            });
-        },
-    );
-    content.append(&field_row("Storage kWh", &storage));
+    content.append(&section_label("Simulation"));
     let runs = number_entry(project.inputs.simulation_options.runs as f64, 0, |value| {
         update_state(|state| {
             state.project.inputs.simulation_options.runs = value.round().max(1.0) as usize;
@@ -1157,6 +1193,40 @@ fn parse_number(value: &str) -> Option<f64> {
     normalized.parse::<f64>().ok()
 }
 
+fn azimuth_field_row(azimuth: &Entry) -> GtkBox {
+    let value_row = GtkBox::new(Orientation::Horizontal, 8);
+    value_row.set_hexpand(true);
+    azimuth.set_hexpand(true);
+    azimuth.set_halign(Align::Fill);
+
+    let direction = Label::new(Some(&azimuth_direction_label(
+        parse_number(&azimuth.text()).unwrap_or(0.0),
+    )));
+    direction.set_width_chars(3);
+    direction.set_xalign(0.0);
+    direction.add_css_class("dim-label");
+
+    let direction_for_change = direction.clone();
+    azimuth.connect_changed(move |entry| {
+        if let Some(value) = parse_number(&entry.text()) {
+            direction_for_change.set_text(&azimuth_direction_label(value));
+        } else {
+            direction_for_change.set_text("");
+        }
+    });
+
+    value_row.append(azimuth);
+    value_row.append(&direction);
+    field_row("Azimuth", &value_row)
+}
+
+fn azimuth_direction_label(value: f64) -> String {
+    const DIRECTIONS: [&str; 8] = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
+    let normalized = value.rem_euclid(360.0);
+    let index = ((normalized + 22.5) / 45.0).floor() as usize % DIRECTIONS.len();
+    DIRECTIONS[index].to_string()
+}
+
 fn field_row<W: IsA<gtk::Widget>>(label: &str, widget: &W) -> GtkBox {
     let row = GtkBox::new(Orientation::Horizontal, 12);
     row.set_hexpand(true);
@@ -1245,6 +1315,24 @@ fn append_log_tail(content: &GtkBox, log: &[String]) {
     for entry in log.iter().rev().take(8) {
         content.append(&meta_label(entry));
     }
+}
+
+fn add_table_header(grid: &Grid, column: i32, text: &str, xalign: f32) {
+    let label = Label::new(Some(text));
+    label.set_xalign(xalign);
+    label.set_hexpand(column == 0);
+    label.add_css_class("heading");
+    grid.attach(&label, column, 0, 1, 1);
+}
+
+fn add_table_cell(grid: &Grid, column: i32, row: i32, text: &str, xalign: f32, expands: bool) {
+    let label = Label::new(Some(text));
+    label.set_xalign(xalign);
+    label.set_hexpand(expands);
+    if !expands {
+        label.add_css_class("monospace");
+    }
+    grid.attach(&label, column, row, 1, 1);
 }
 
 fn add_grid_header(grid: &Grid, column: i32, text: &str) {
