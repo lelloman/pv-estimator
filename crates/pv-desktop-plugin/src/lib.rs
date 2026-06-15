@@ -502,9 +502,6 @@ fn render_system_into(root: &GtkBox) {
     append_consumption_fields(&content, &state.project.inputs.load_profile);
     content.append(&section_separator());
     append_options_fields(&content, &state.project);
-    content.append(&section_separator());
-    append_action_buttons(&content);
-    content.append(&meta_label(&state.status));
     scroller.set_child(Some(&content));
     root.append(&scroller);
 }
@@ -991,28 +988,6 @@ fn append_options_fields(content: &GtkBox, project: &PvProjectDocument) {
     content.append(&field_row("Simulation runs", &runs));
 }
 
-fn append_action_buttons(content: &GtkBox) {
-    let row = GtkBox::new(Orientation::Horizontal, 6);
-    let estimate = Button::with_label("Run Estimate");
-    estimate.connect_clicked(|_| {
-        let _ = run_estimate();
-    });
-    let simulation = Button::with_label("Run Simulation");
-    simulation.connect_clicked(|_| {
-        let _ = run_simulation();
-    });
-    let save = Button::with_label("Save");
-    save.connect_clicked(|_| {
-        if matches!(save_current_project(), Ok(SaveDisposition::NeedsPath)) {
-            show_save_project_dialog();
-        }
-    });
-    row.append(&estimate);
-    row.append(&simulation);
-    row.append(&save);
-    content.append(&row);
-}
-
 fn render_estimate_into(root: &GtkBox) {
     clear_box(root);
     let state = snapshot();
@@ -1078,7 +1053,7 @@ fn render_estimate_into(root: &GtkBox) {
         content.append(&grid);
     } else {
         content.append(&body_label(
-            "No estimate yet. Run Estimate from the toolbar or System panel.",
+            "No estimate yet. Run Estimate from the toolbar.",
         ));
     }
     content.append(&section_separator());
