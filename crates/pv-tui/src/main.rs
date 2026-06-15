@@ -3156,8 +3156,7 @@ fn simulation_result_lines(result: &SimulationResult) -> Vec<Line<'static>> {
 fn format_scenario_metrics(metrics: SimulationRunMetrics) -> String {
     format!(
         "Prod {:.0} Import {:.0} kWh",
-        metrics.production_kwh,
-        metrics.grid_import_kwh
+        metrics.production_kwh, metrics.grid_import_kwh
     )
 }
 
