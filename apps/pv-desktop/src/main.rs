@@ -1,0 +1,179 @@
+use gtk::gio::prelude::ApplicationExtManual;
+use maruzzella::{
+    build_application, default_product_spec, load_static_plugin, plugin_tab, CommandSpec,
+    MaruzzellaConfig, MenuItemSpec, MenuRootSpec, PanelResizePolicy, TabGroupSpec,
+    ToolbarDisplayMode, ToolbarItemSpec, WorkbenchNodeSpec,
+};
+
+fn main() {
+    let mut product = default_product_spec();
+    product.branding.title = "PV Estimator".to_string();
+    product.branding.search_placeholder = "Search project commands".to_string();
+    product.branding.status_text = "PV engineering workbench".to_string();
+    product.include_base_toolbar_items = false;
+    product.include_base_menu_items = false;
+    product.include_base_startup_tabs = false;
+
+    product.menu_roots = vec![
+        MenuRootSpec {
+            id: "file".to_string(),
+            label: "File".to_string(),
+        },
+        MenuRootSpec {
+            id: "project".to_string(),
+            label: "Project".to_string(),
+        },
+        MenuRootSpec {
+            id: "help".to_string(),
+            label: "Help".to_string(),
+        },
+    ];
+    product.menu_items = vec![
+        menu_item("file-new", "file", "New Project", "pv.project.new"),
+        menu_item("file-open", "file", "Open Project", "pv.project.open"),
+        menu_item("file-save", "file", "Save Project", "pv.project.save"),
+        menu_item(
+            "file-save-as",
+            "file",
+            "Save Project As",
+            "pv.project.save_as",
+        ),
+        menu_item(
+            "project-estimate",
+            "project",
+            "Run Estimate",
+            "pv.project.run_estimate",
+        ),
+        menu_item(
+            "project-simulation",
+            "project",
+            "Run Simulation",
+            "pv.project.run_simulation",
+        ),
+        menu_item("help-about", "help", "About", "shell.about"),
+    ];
+    product.commands = vec![
+        command("pv.project.new", "New Project"),
+        command("pv.project.open", "Open Project"),
+        command("pv.project.save", "Save Project"),
+        command("pv.project.save_as", "Save Project As"),
+        command("pv.project.run_estimate", "Run Estimate"),
+        command("pv.project.run_simulation", "Run Simulation"),
+    ];
+    product.toolbar_items = vec![
+        toolbar_item(
+            "estimate",
+            Some("view-statistics-symbolic"),
+            "Estimate",
+            "pv.project.run_estimate",
+            true,
+        ),
+        toolbar_item(
+            "simulation",
+            Some("media-playback-start-symbolic"),
+            "Simulation",
+            "pv.project.run_simulation",
+            true,
+        ),
+    ];
+
+    product.layout.left_panel_resize = PanelResizePolicy::Fixed;
+    product.layout.right_panel_resize = PanelResizePolicy::Fixed;
+    product.layout.bottom_panel_resize = PanelResizePolicy::Fixed;
+    product.layout.left_panel = TabGroupSpec::new(
+        "panel-left",
+        Some("system"),
+        vec![plugin_tab(
+            "system",
+            "panel-left",
+            "System",
+            "com.lelloman.pv_estimator.system",
+            "The PV system view could not be created.",
+            false,
+        )],
+    )
+    .with_tab_strip_hidden()
+    .with_panel_appearance("primary")
+    .with_panel_header_appearance("secondary")
+    .with_tab_strip_appearance("utility");
+    product.layout.right_panel = TabGroupSpec::new("panel-right", None, Vec::new());
+    product.layout.bottom_panel = TabGroupSpec::new("panel-bottom", None, Vec::new());
+    product.layout.workbench = WorkbenchNodeSpec::Group(
+        TabGroupSpec::new(
+            "workbench-main",
+            Some("estimate"),
+            vec![
+                plugin_tab(
+                    "estimate",
+                    "workbench-main",
+                    "Estimate",
+                    "com.lelloman.pv_estimator.estimate",
+                    "The PV estimate view could not be created.",
+                    false,
+                ),
+                plugin_tab(
+                    "simulation",
+                    "workbench-main",
+                    "Simulation",
+                    "com.lelloman.pv_estimator.simulation",
+                    "The PV simulation view could not be created.",
+                    false,
+                ),
+            ],
+        )
+        .with_panel_appearance("workbench")
+        .with_panel_header_appearance("secondary")
+        .with_tab_strip_appearance("editor"),
+    );
+
+    let config = MaruzzellaConfig::new("com.lelloman.pv-estimator.desktop")
+        .with_persistence_id("pv-estimator-desktop")
+        .with_product(product)
+        .with_builtin_plugin(embedded_pv_plugin);
+
+    let application = build_application(config);
+    application.run();
+}
+
+fn menu_item(id: &str, root_id: &str, label: &str, command_id: &str) -> MenuItemSpec {
+    MenuItemSpec {
+        id: id.to_string(),
+        root_id: root_id.to_string(),
+        label: label.to_string(),
+        command_id: command_id.to_string(),
+        payload: Vec::new(),
+    }
+}
+
+fn command(id: &str, title: &str) -> CommandSpec {
+    CommandSpec {
+        id: id.to_string(),
+        title: title.to_string(),
+    }
+}
+
+fn toolbar_item(
+    id: &str,
+    icon_name: Option<&str>,
+    label: &str,
+    command_id: &str,
+    secondary: bool,
+) -> ToolbarItemSpec {
+    ToolbarItemSpec {
+        id: id.to_string(),
+        icon_name: icon_name.map(str::to_string),
+        label: Some(label.to_string()),
+        command_id: command_id.to_string(),
+        payload: Vec::new(),
+        secondary,
+        display_mode: ToolbarDisplayMode::IconOnly,
+        appearance_id: "toolbar".to_string(),
+    }
+}
+
+fn embedded_pv_plugin() -> Result<maruzzella::LoadedPlugin, maruzzella::PluginLoadError> {
+    load_static_plugin(
+        "builtin:pv-desktop-plugin",
+        pv_desktop_plugin::maruzzella_plugin_entry,
+    )
+}

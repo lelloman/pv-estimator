@@ -1,8 +1,11 @@
 [workspace]
 members = [
+    "apps/pv-desktop",
     "crates/pv-cli",
     "crates/pv-core",
     "crates/pv-data",
+    "crates/pv-desktop-core",
+    "crates/pv-desktop-plugin",
     "crates/pv-model",
     "crates/pv-model-runtime",
     "crates/pv-service",
