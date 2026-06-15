@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
 use ndarray::Array2;
@@ -137,7 +137,7 @@ impl SourceModelEstimator {
     }
 }
 
-fn embedded_onnx_bytes(path: &PathBuf) -> Result<&'static [u8]> {
+fn embedded_onnx_bytes(path: &Path) -> Result<&'static [u8]> {
     match path.to_str() {
         Some("nasa_power.onnx") => Ok(EMBEDDED_NASA_POWER_ONNX),
         Some("pvgis_era5.onnx") => Ok(EMBEDDED_PVGIS_ERA5_ONNX),

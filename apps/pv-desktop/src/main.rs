@@ -1,8 +1,8 @@
 use gtk::gio::prelude::ApplicationExtManual;
 use maruzzella::{
-    build_application, default_product_spec, load_static_plugin, plugin_tab, CommandSpec,
-    MaruzzellaConfig, MenuItemSpec, MenuRootSpec, PanelResizePolicy, TabGroupSpec,
-    ToolbarDisplayMode, ToolbarItemSpec, WorkbenchNodeSpec,
+    CommandSpec, MaruzzellaConfig, MenuItemSpec, MenuRootSpec, PanelResizePolicy, TabGroupSpec,
+    ToolbarDisplayMode, ToolbarItemSpec, WorkbenchNodeSpec, build_application,
+    default_product_spec, load_static_plugin, plugin_tab,
 };
 
 fn main() {

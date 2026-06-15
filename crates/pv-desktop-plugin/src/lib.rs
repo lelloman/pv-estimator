@@ -12,14 +12,14 @@ use gtk::{
     Separator, Window,
 };
 use maruzzella_sdk::{
-    export_plugin, CommandSpec, HostApi, MzStatusCode, MzViewPlacement, Plugin, PluginDependency,
-    PluginDescriptor, SurfaceContributionSpec, Version, ViewFactorySpec,
+    CommandSpec, HostApi, MzStatusCode, MzViewPlacement, Plugin, PluginDependency,
+    PluginDescriptor, SurfaceContributionSpec, Version, ViewFactorySpec, export_plugin,
 };
 use pv_core::simulation::{
-    simulate, BuiltInLoadShapeId, LoadProfile, LoadShape, SimulationRequest, StorageConfig,
+    BuiltInLoadShapeId, LoadProfile, LoadShape, SimulationRequest, StorageConfig, simulate,
 };
-use pv_data::{search_cities, CitySearchResult};
-use pv_desktop_core::{load_project, save_project, PvProjectDocument, PROJECT_EXTENSION};
+use pv_data::{CitySearchResult, search_cities};
+use pv_desktop_core::{PROJECT_EXTENSION, PvProjectDocument, load_project, save_project};
 use pv_model::{EstimateArray, EstimateRequest, SourceModelEstimator};
 
 pub struct PvDesktopPlugin;
@@ -360,12 +360,11 @@ fn show_open_project_dialog() {
         Some("Cancel"),
     );
     dialog.connect_response(|dialog, response| {
-        if response == ResponseType::Accept {
-            if let Some(file) = dialog.file() {
-                if let Some(path) = file.path() {
-                    open_project(path);
-                }
-            }
+        if response == ResponseType::Accept
+            && let Some(file) = dialog.file()
+            && let Some(path) = file.path()
+        {
+            open_project(path);
         }
         dialog.destroy();
     });
@@ -386,12 +385,11 @@ fn show_save_project_dialog() {
     );
     dialog.set_current_name("untitled.pvproj");
     dialog.connect_response(|dialog, response| {
-        if response == ResponseType::Accept {
-            if let Some(file) = dialog.file() {
-                if let Some(path) = file.path() {
-                    save_project_as(path);
-                }
-            }
+        if response == ResponseType::Accept
+            && let Some(file) = dialog.file()
+            && let Some(path) = file.path()
+        {
+            save_project_as(path);
         }
         dialog.destroy();
     });

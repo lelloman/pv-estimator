@@ -177,8 +177,10 @@ mod tests {
 
     #[test]
     fn rejects_wrong_kind() {
-        let mut project = PvProjectDocument::default();
-        project.kind = "wrong".to_string();
+        let project = PvProjectDocument {
+            kind: "wrong".to_string(),
+            ..PvProjectDocument::default()
+        };
         assert!(project.validate().is_err());
     }
 }
