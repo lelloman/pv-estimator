@@ -8,7 +8,7 @@ use gtk::glib::translate::IntoGlibPtr;
 use gtk::prelude::*;
 use gtk::{
     Align, Box as GtkBox, Button, DropDown, Entry, FileChooserAction, FileChooserNative, Grid,
-    Label, ListBox, Orientation, PolicyType, ResponseType, ScrolledWindow, SelectionMode,
+    Image, Label, ListBox, Orientation, PolicyType, ResponseType, ScrolledWindow, SelectionMode,
     Separator, Window,
 };
 use maruzzella_sdk::{
@@ -543,7 +543,7 @@ fn show_location_search_dialog() {
 
     let content = GtkBox::new(Orientation::Vertical, 10);
     content.set_margin_top(14);
-    content.set_margin_bottom(14);
+    content.set_margin_bottom(8);
     content.set_margin_start(14);
     content.set_margin_end(14);
 
@@ -565,6 +565,7 @@ fn show_location_search_dialog() {
 
     let footer = GtkBox::new(Orientation::Horizontal, 6);
     footer.set_halign(Align::End);
+    footer.set_margin_bottom(0);
     let cancel = Button::with_label("Cancel");
     let window_for_cancel = window.clone();
     cancel.connect_clicked(move |_| window_for_cancel.close());
@@ -651,37 +652,245 @@ fn apply_location_result(result: &CitySearchResult) {
 }
 
 fn append_array_fields(content: &GtkBox, arrays: &[EstimateArray]) {
-    content.append(&section_label("Production"));
-    let first = arrays.first().cloned().unwrap_or(EstimateArray {
-        name: Some("Main array".to_string()),
-        peak_power_kwp: 1.0,
-        tilt_deg: 30.0,
-        azimuth_deg: 0.0,
-    });
-    let name = text_entry(first.name.as_deref().unwrap_or("Main array"), |value| {
-        update_first_array(|array| array.name = Some(value));
-    });
-    content.append(&field_row("Array name", &name));
-    let kwp = number_entry(first.peak_power_kwp, 2, |value| {
-        update_first_array(|array| array.peak_power_kwp = value);
-        update_state(|state| state.project.inputs.estimate_request.peak_power_kwp = value);
-    });
-    content.append(&field_row("kWp", &kwp));
-    let tilt = number_entry(first.tilt_deg, 1, |value| {
-        update_first_array(|array| array.tilt_deg = value);
-        update_state(|state| state.project.inputs.estimate_request.tilt_deg = value);
-    });
-    content.append(&field_row("Tilt", &tilt));
-    let azimuth = number_entry(first.azimuth_deg, 1, |value| {
-        update_first_array(|array| array.azimuth_deg = value);
-        update_state(|state| state.project.inputs.estimate_request.azimuth_deg = value);
-    });
-    content.append(&field_row("Azimuth", &azimuth));
+    let header = GtkBox::new(Orientation::Horizontal, 8);
+    header.set_hexpand(true);
+    let title = section_label("Production");
+    title.set_hexpand(true);
+    let add = icon_button("list-add-symbolic", "Add array");
+    add.connect_clicked(|_| show_array_dialog(None));
+    header.append(&title);
+    header.append(&add);
+    content.append(&header);
+
+    let table = Grid::new();
+    table.set_column_spacing(10);
+    table.set_row_spacing(6);
+    table.set_hexpand(true);
+    add_grid_header(&table, 0, "Array");
+    add_grid_header(&table, 1, "kWp");
+    add_grid_header(&table, 2, "Tilt");
+    add_grid_header(&table, 3, "Azimuth");
+
+    for (index, array) in arrays.iter().enumerate() {
+        let row = (index + 1) as i32;
+        add_grid_text(&table, 0, row, array.name.as_deref().unwrap_or("Array"));
+        add_grid_text(&table, 1, row, &format!("{:.2}", array.peak_power_kwp));
+        add_grid_text(&table, 2, row, &format!("{:.1}", array.tilt_deg));
+        add_grid_text(&table, 3, row, &format!("{:.1}", array.azimuth_deg));
+
+        let actions = GtkBox::new(Orientation::Horizontal, 4);
+        let edit = icon_button("document-edit-symbolic", "Edit array");
+        edit.connect_clicked(move |_| show_array_dialog(Some(index)));
+        let delete = icon_button("edit-delete-symbolic", "Delete array");
+        delete.connect_clicked(move |_| confirm_delete_array(index));
+        actions.append(&edit);
+        actions.append(&delete);
+        table.attach(&actions, 4, row, 1, 1);
+    }
+
+    content.append(&table);
+    if arrays.is_empty() {
+        content.append(&meta_label("No arrays configured."));
+    }
+
     let loss = STATE.with(|state| state.borrow().project.inputs.estimate_request.loss_pct);
     let loss = number_entry(loss, 1, |value| {
         update_state(|state| state.project.inputs.estimate_request.loss_pct = value);
     });
     content.append(&field_row("Loss %", &loss));
+}
+
+fn show_array_dialog(index: Option<usize>) {
+    if !gtk::is_initialized_main_thread() && gtk::init().is_err() {
+        append_log("GTK is not initialized; cannot edit production arrays".to_string());
+        return;
+    }
+
+    let array = index
+        .and_then(|index| {
+            STATE.with(|state| state.borrow().project.inputs.arrays.get(index).cloned())
+        })
+        .unwrap_or_else(default_array);
+
+    let window = Window::builder()
+        .title(if index.is_some() {
+            "Edit Array"
+        } else {
+            "Add Array"
+        })
+        .modal(true)
+        .default_width(420)
+        .build();
+    window.add_css_class("app-dialog");
+
+    let content = GtkBox::new(Orientation::Vertical, 12);
+    content.set_margin_top(14);
+    content.set_margin_bottom(8);
+    content.set_margin_start(14);
+    content.set_margin_end(14);
+
+    let name = Entry::new();
+    name.set_text(array.name.as_deref().unwrap_or(""));
+    content.append(&field_row("Name", &name));
+
+    let kwp = dialog_number_entry(array.peak_power_kwp, 2);
+    content.append(&field_row("kWp", &kwp));
+
+    let tilt = dialog_number_entry(array.tilt_deg, 1);
+    content.append(&field_row("Tilt", &tilt));
+
+    let azimuth = dialog_number_entry(array.azimuth_deg, 1);
+    content.append(&field_row("Azimuth", &azimuth));
+
+    let footer = GtkBox::new(Orientation::Horizontal, 6);
+    footer.set_halign(Align::End);
+    footer.set_margin_bottom(0);
+    let cancel = Button::with_label("Cancel");
+    let window_for_cancel = window.clone();
+    cancel.connect_clicked(move |_| window_for_cancel.close());
+    let save = Button::with_label("Save");
+    let window_for_save = window.clone();
+    let name_for_save = name.clone();
+    let kwp_for_save = kwp.clone();
+    let tilt_for_save = tilt.clone();
+    let azimuth_for_save = azimuth.clone();
+    save.connect_clicked(move |_| {
+        if let Some(array) = read_array_dialog_values(
+            &name_for_save,
+            &kwp_for_save,
+            &tilt_for_save,
+            &azimuth_for_save,
+        ) {
+            save_array(index, array);
+            window_for_save.close();
+        }
+    });
+    footer.append(&cancel);
+    footer.append(&save);
+    content.append(&footer);
+
+    window.set_child(Some(&content));
+    window.present();
+    name.grab_focus();
+}
+
+fn default_array() -> EstimateArray {
+    EstimateArray {
+        name: Some("New array".to_string()),
+        peak_power_kwp: 1.0,
+        tilt_deg: 30.0,
+        azimuth_deg: 0.0,
+    }
+}
+
+fn dialog_number_entry(value: f64, digits: u32) -> Entry {
+    let entry = Entry::new();
+    entry.set_input_purpose(gtk::InputPurpose::Number);
+    entry.set_text(&format_number(value, digits));
+    entry
+}
+
+fn read_array_dialog_values(
+    name: &Entry,
+    kwp: &Entry,
+    tilt: &Entry,
+    azimuth: &Entry,
+) -> Option<EstimateArray> {
+    Some(EstimateArray {
+        name: non_empty_text(&name.text()),
+        peak_power_kwp: parse_number(&kwp.text())?.max(0.0),
+        tilt_deg: parse_number(&tilt.text())?,
+        azimuth_deg: parse_number(&azimuth.text())?,
+    })
+}
+
+fn non_empty_text(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn save_array(index: Option<usize>, array: EstimateArray) {
+    update_state(|state| {
+        match index {
+            Some(index) if index < state.project.inputs.arrays.len() => {
+                state.project.inputs.arrays[index] = array;
+            }
+            _ => state.project.inputs.arrays.push(array),
+        }
+        sync_request_from_arrays(state);
+    });
+}
+
+fn confirm_delete_array(index: usize) {
+    if !gtk::is_initialized_main_thread() && gtk::init().is_err() {
+        append_log("GTK is not initialized; cannot confirm array deletion".to_string());
+        return;
+    }
+
+    let array_name = STATE.with(|state| {
+        state
+            .borrow()
+            .project
+            .inputs
+            .arrays
+            .get(index)
+            .and_then(|array| array.name.clone())
+            .unwrap_or_else(|| "this array".to_string())
+    });
+
+    let window = Window::builder()
+        .title("Delete Array")
+        .modal(true)
+        .default_width(360)
+        .build();
+    window.add_css_class("app-dialog");
+
+    let content = GtkBox::new(Orientation::Vertical, 12);
+    content.set_margin_top(14);
+    content.set_margin_bottom(8);
+    content.set_margin_start(14);
+    content.set_margin_end(14);
+
+    content.append(&body_label(&format!(
+        "Delete {array_name}? This cannot be undone."
+    )));
+
+    let footer = GtkBox::new(Orientation::Horizontal, 6);
+    footer.set_halign(Align::End);
+    footer.set_margin_bottom(0);
+    let cancel = Button::with_label("Cancel");
+    let window_for_cancel = window.clone();
+    cancel.connect_clicked(move |_| window_for_cancel.close());
+    let delete = Button::with_label("Delete");
+    let window_for_delete = window.clone();
+    delete.connect_clicked(move |_| {
+        delete_array(index);
+        window_for_delete.close();
+    });
+    footer.append(&cancel);
+    footer.append(&delete);
+    content.append(&footer);
+
+    window.set_child(Some(&content));
+    window.present();
+}
+
+fn delete_array(index: usize) {
+    update_state(|state| {
+        if index >= state.project.inputs.arrays.len() {
+            return;
+        }
+        state.project.inputs.arrays.remove(index);
+        sync_request_from_arrays(state);
+    });
+}
+
+fn sync_request_from_arrays(state: &mut DesktopState) {
+    if let Some(first) = state.project.inputs.arrays.first() {
+        state.project.inputs.estimate_request.peak_power_kwp = first.peak_power_kwp;
+        state.project.inputs.estimate_request.tilt_deg = first.tilt_deg;
+        state.project.inputs.estimate_request.azimuth_deg = first.azimuth_deg;
+    }
 }
 
 fn append_consumption_fields(content: &GtkBox, load_profile: &LoadProfile) {
@@ -882,20 +1091,6 @@ fn render_simulation_into(root: &GtkBox) {
     root.append(&scroller);
 }
 
-fn update_first_array(update: impl FnOnce(&mut EstimateArray)) {
-    update_state(|state| {
-        if state.project.inputs.arrays.is_empty() {
-            state.project.inputs.arrays.push(EstimateArray {
-                name: Some("Main array".to_string()),
-                peak_power_kwp: 1.0,
-                tilt_deg: 30.0,
-                azimuth_deg: 0.0,
-            });
-        }
-        update(&mut state.project.inputs.arrays[0]);
-    });
-}
-
 fn update_state(update: impl FnOnce(&mut DesktopState)) {
     STATE.with(|state| {
         let mut state = state.borrow_mut();
@@ -925,11 +1120,13 @@ fn snapshot() -> DesktopState {
     STATE.with(|state| state.borrow().clone())
 }
 
-fn text_entry(value: &str, update: impl Fn(String) + 'static) -> Entry {
-    let entry = Entry::new();
-    entry.set_text(value);
-    entry.connect_changed(move |entry| update(entry.text().to_string()));
-    entry
+fn icon_button(icon_name: &str, tooltip: &str) -> Button {
+    let button = Button::new();
+    button.set_tooltip_text(Some(tooltip));
+    let icon = Image::from_icon_name(icon_name);
+    icon.set_icon_size(gtk::IconSize::Normal);
+    button.set_child(Some(&icon));
+    button
 }
 
 fn number_entry(value: f64, digits: u32, update: impl Fn(f64) + 'static) -> Entry {
