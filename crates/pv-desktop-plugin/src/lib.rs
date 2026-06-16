@@ -35,6 +35,7 @@ const CMD_SAVE: &str = "pv.project.save";
 const CMD_SAVE_AS: &str = "pv.project.save_as";
 const CMD_RUN_ESTIMATE: &str = "pv.project.run_estimate";
 const CMD_RUN_SIMULATION: &str = "pv.project.run_simulation";
+const CMD_SET_SIMULATION_RUNS: &str = "pv.project.set_simulation_runs";
 
 #[derive(Clone, Debug)]
 struct DesktopState {
@@ -100,6 +101,10 @@ impl Plugin for PvDesktopPlugin {
         host.register_command(
             CommandSpec::new(PLUGIN_ID, CMD_RUN_SIMULATION, "Run Simulation")
                 .with_handler(command_run_simulation),
+        )?;
+        host.register_command(
+            CommandSpec::new(PLUGIN_ID, CMD_SET_SIMULATION_RUNS, "Set Simulation Runs")
+                .with_handler(command_set_simulation_runs),
         )?;
 
         host.register_surface_contribution(SurfaceContributionSpec::about_section(
@@ -201,6 +206,39 @@ extern "C" fn command_run_simulation(
             maruzzella_sdk::ffi::MzStatus::new(MzStatusCode::InternalError)
         }
     }
+}
+
+extern "C" fn command_set_simulation_runs(
+    payload: maruzzella_sdk::ffi::MzBytes,
+) -> maruzzella_sdk::ffi::MzStatus {
+    let Some(runs) = simulation_runs_from_payload(payload) else {
+        append_log("Invalid simulation run count".to_string());
+        refresh_views();
+        return maruzzella_sdk::ffi::MzStatus::new(MzStatusCode::InvalidArgument);
+    };
+
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        state.project.inputs.simulation_options.runs = runs;
+        state.project.results.simulation = None;
+        state.dirty = true;
+        let message = format!("Simulation runs set to {runs}");
+        state.status = message.clone();
+        state.log.push(message);
+    });
+    refresh_views();
+    maruzzella_sdk::ffi::MzStatus::OK
+}
+
+fn simulation_runs_from_payload(payload: maruzzella_sdk::ffi::MzBytes) -> Option<usize> {
+    if payload.ptr.is_null() {
+        return None;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(payload.ptr, payload.len) };
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|runs| *runs > 0)
 }
 
 fn run_estimate() -> Result<(), String> {
@@ -498,8 +536,6 @@ fn render_system_into(root: &GtkBox) {
     append_array_fields(&content, &state.project);
     content.append(&section_separator());
     append_consumption_fields(&content, &state.project.inputs.load_profile);
-    content.append(&section_separator());
-    append_options_fields(&content, &state.project);
     scroller.set_child(Some(&content));
     root.append(&scroller);
 }
@@ -974,16 +1010,6 @@ fn append_consumption_fields(content: &GtkBox, load_profile: &LoadProfile) {
         });
     });
     content.append(&field_row("Shape", &dropdown));
-}
-
-fn append_options_fields(content: &GtkBox, project: &PvProjectDocument) {
-    content.append(&section_label("Simulation"));
-    let runs = number_entry(project.inputs.simulation_options.runs as f64, 0, |value| {
-        update_state(|state| {
-            state.project.inputs.simulation_options.runs = value.round().max(1.0) as usize;
-        });
-    });
-    content.append(&field_row("Simulation runs", &runs));
 }
 
 fn render_estimate_into(root: &GtkBox) {
