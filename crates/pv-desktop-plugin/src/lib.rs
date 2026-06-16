@@ -1032,9 +1032,6 @@ fn render_estimate_into(root: &GtkBox) {
     let state = snapshot();
     let scroller = workbench_scroller();
     let content = workbench_content();
-    content.append(&header_label("Estimate"));
-    content.append(&meta_label(&state.status));
-    content.append(&section_separator());
     if let Some(estimate) = &state.project.results.estimate {
         let annual = estimate
             .ensemble_estimate
@@ -1091,9 +1088,10 @@ fn render_estimate_into(root: &GtkBox) {
         }
         content.append(&grid);
     } else {
-        content.append(&body_label(
-            "No estimate yet. Run Estimate from the toolbar.",
-        ));
+        content.set_valign(Align::Center);
+        let empty = meta_label("Run Estimate to calculate monthly production.");
+        empty.set_halign(Align::Center);
+        content.append(&empty);
     }
     scroller.set_child(Some(&content));
     root.append(&scroller);
