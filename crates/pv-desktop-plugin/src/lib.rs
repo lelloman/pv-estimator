@@ -1095,8 +1095,6 @@ fn render_estimate_into(root: &GtkBox) {
             "No estimate yet. Run Estimate from the toolbar.",
         ));
     }
-    content.append(&section_separator());
-    append_log_tail(&content, &state.log);
     scroller.set_child(Some(&content));
     root.append(&scroller);
 }
@@ -1135,8 +1133,6 @@ fn render_simulation_into(root: &GtkBox) {
             "No simulation yet. Run an estimate first, then Run Simulation.",
         ));
     }
-    content.append(&section_separator());
-    append_log_tail(&content, &state.log);
     scroller.set_child(Some(&content));
     root.append(&scroller);
 }
@@ -1334,13 +1330,6 @@ fn workbench_content() -> GtkBox {
     content.set_margin_start(22);
     content.set_margin_end(22);
     content
-}
-
-fn append_log_tail(content: &GtkBox, log: &[String]) {
-    content.append(&section_label("Log"));
-    for entry in log.iter().rev().take(8) {
-        content.append(&meta_label(entry));
-    }
 }
 
 fn add_table_header(grid: &Grid, column: i32, text: &str, xalign: f32) {
