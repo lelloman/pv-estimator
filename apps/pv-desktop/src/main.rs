@@ -1,14 +1,13 @@
 use gtk::gio::prelude::ApplicationExtManual;
 use maruzzella::{
-    CommandSpec, MaruzzellaConfig, MenuItemSpec, MenuRootSpec, PanelResizePolicy, TabGroupSpec,
-    ToolbarDisplayMode, ToolbarItemSpec, WorkbenchNodeSpec, build_application,
-    default_product_spec, load_static_plugin, plugin_tab,
+    CommandSpec, MaruzzellaConfig, MenuItemSpec, MenuRootSpec, PanelResizePolicy, ShellChrome,
+    TabGroupSpec, ToolbarDisplayMode, ToolbarItemSpec, ToolbarOptionSpec, WorkbenchNodeSpec,
+    build_application, default_product_spec, load_static_plugin, plugin_tab,
 };
 
 fn main() {
     let mut product = default_product_spec();
     product.branding.title = "PV Estimator".to_string();
-    product.branding.search_placeholder = "Search project commands".to_string();
     product.branding.status_text = "PV engineering workbench".to_string();
     product.include_base_toolbar_items = false;
     product.include_base_menu_items = false;
@@ -59,11 +58,12 @@ fn main() {
         command("pv.project.save_as", "Save Project As"),
         command("pv.project.run_estimate", "Run Estimate"),
         command("pv.project.run_simulation", "Run Simulation"),
+        command("pv.project.set_simulation_runs", "Set Simulation Runs"),
     ];
     product.toolbar_items = vec![
         toolbar_item(
             "estimate",
-            Some("view-statistics-symbolic"),
+            Some("x-office-spreadsheet-symbolic"),
             "Estimate",
             "pv.project.run_estimate",
             true,
@@ -73,6 +73,22 @@ fn main() {
             Some("media-playback-start-symbolic"),
             "Simulation",
             "pv.project.run_simulation",
+            true,
+        ),
+        toolbar_dropdown_item(
+            "simulation-runs",
+            "Simulation runs",
+            "pv.project.set_simulation_runs",
+            &[
+                ("1_000 runs", "1000"),
+                ("10_000 runs", "10000"),
+                ("100_000 runs", "100000"),
+                ("1_000_000 runs", "1000000"),
+                ("10_000_000 runs", "10000000"),
+                ("100_000_000 runs", "100000000"),
+                ("1_000_000_000 runs", "1000000000"),
+            ],
+            1,
             true,
         ),
     ];
@@ -129,6 +145,11 @@ fn main() {
     let config = MaruzzellaConfig::new("com.lelloman.pv-estimator.desktop")
         .with_persistence_id("pv-estimator-desktop")
         .with_product(product)
+        .with_workspace_chrome(ShellChrome {
+            show_menu_bar: true,
+            show_toolbar: true,
+            show_search: false,
+        })
         .with_builtin_plugin(embedded_pv_plugin);
 
     let application = build_application(config);
@@ -168,6 +189,36 @@ fn toolbar_item(
         secondary,
         display_mode: ToolbarDisplayMode::IconOnly,
         appearance_id: "toolbar".to_string(),
+        options: Vec::new(),
+        selected_index: 0,
+    }
+}
+
+fn toolbar_dropdown_item(
+    id: &str,
+    label: &str,
+    command_id: &str,
+    options: &[(&str, &str)],
+    selected_index: u32,
+    secondary: bool,
+) -> ToolbarItemSpec {
+    ToolbarItemSpec {
+        id: id.to_string(),
+        icon_name: None,
+        label: Some(label.to_string()),
+        command_id: command_id.to_string(),
+        payload: Vec::new(),
+        secondary,
+        display_mode: ToolbarDisplayMode::Dropdown,
+        appearance_id: "toolbar".to_string(),
+        options: options
+            .iter()
+            .map(|(label, payload)| ToolbarOptionSpec {
+                label: (*label).to_string(),
+                payload: payload.as_bytes().to_vec(),
+            })
+            .collect(),
+        selected_index,
     }
 }
 
