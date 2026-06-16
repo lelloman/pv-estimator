@@ -38,6 +38,8 @@ pub struct ProjectInputs {
     pub estimate_request: EstimateRequest,
     pub arrays: Vec<EstimateArray>,
     pub load_profile: LoadProfile,
+    #[serde(default)]
+    pub energy_price_eur_per_kwh: Option<f64>,
     pub simulation_options: SimulationOptions,
 }
 
@@ -85,6 +87,7 @@ impl Default for PvProjectDocument {
                         shape_id: BuiltInLoadShapeId::ResidentialDefault,
                     },
                 },
+                energy_price_eur_per_kwh: None,
                 simulation_options: SimulationOptions {
                     runs: 10_000,
                     seed: None,
@@ -172,6 +175,20 @@ mod tests {
         let json = serde_json::to_string_pretty(&project).expect("serialize project");
         let restored: PvProjectDocument = serde_json::from_str(&json).expect("deserialize project");
         assert_eq!(restored, project);
+        restored.validate().expect("restored project is valid");
+    }
+
+    #[test]
+    fn project_inputs_default_missing_energy_price() {
+        let project = PvProjectDocument::default();
+        let mut json = serde_json::to_value(&project).expect("serialize project");
+        json["inputs"]
+            .as_object_mut()
+            .expect("inputs is an object")
+            .remove("energy_price_eur_per_kwh");
+        let restored: PvProjectDocument =
+            serde_json::from_value(json).expect("deserialize legacy project");
+        assert_eq!(restored.inputs.energy_price_eur_per_kwh, None);
         restored.validate().expect("restored project is valid");
     }
 

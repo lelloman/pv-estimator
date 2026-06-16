@@ -16,11 +16,15 @@ use maruzzella_sdk::{
     PluginDescriptor, SurfaceContributionSpec, Version, ViewFactorySpec, export_plugin,
 };
 use pv_core::simulation::{
-    BuiltInLoadShapeId, LoadProfile, LoadShape, SimulationRequest, StorageConfig, simulate,
+    BuiltInLoadShapeId, LoadProfile, LoadShape, ProductionProfile, SimulationRequest,
+    StorageConfig, simulate,
 };
+use pv_core::source_model::SourceEnsembleEstimateDocument;
 use pv_data::{CitySearchResult, search_cities};
 use pv_desktop_core::{PROJECT_EXTENSION, PvProjectDocument, load_project, save_project};
-use pv_model::{EstimateArray, EstimateRequest, SourceModelEstimator};
+use pv_model::{
+    EstimateArray, EstimateRequest, SourceModelEstimator, days_in_month, short_month_name,
+};
 
 pub struct PvDesktopPlugin;
 
@@ -60,6 +64,7 @@ impl Default for DesktopState {
 
 thread_local! {
     static STATE: RefCell<DesktopState> = RefCell::new(DesktopState::default());
+    static ESTIMATOR: RefCell<Option<SourceModelEstimator>> = const { RefCell::new(None) };
     static SYSTEM_VIEWS: RefCell<Vec<gtk::glib::WeakRef<GtkBox>>> = const { RefCell::new(Vec::new()) };
     static ESTIMATE_VIEWS: RefCell<Vec<gtk::glib::WeakRef<GtkBox>>> = const { RefCell::new(Vec::new()) };
     static SIMULATION_VIEWS: RefCell<Vec<gtk::glib::WeakRef<GtkBox>>> = const { RefCell::new(Vec::new()) };
@@ -147,6 +152,7 @@ extern "C" fn command_new_project(
         *state.borrow_mut() = DesktopState::default();
     });
     append_log("New project created".to_string());
+    ensure_estimate_loaded();
     refresh_views();
     maruzzella_sdk::ffi::MzStatus::OK
 }
@@ -248,38 +254,100 @@ fn simulation_runs_from_payload(payload: maruzzella_sdk::ffi::MzBytes) -> Option
 
 fn run_estimate() -> Result<(), String> {
     append_log("Running source-model estimate".to_string());
-    let (request, arrays) = STATE.with(|state| {
-        let state = state.borrow();
-        (
-            state.project.inputs.estimate_request.clone(),
-            state.project.inputs.arrays.clone(),
-        )
-    });
-    let mut estimator = SourceModelEstimator::load_embedded()
-        .map_err(|error| format!("Failed to load embedded model artifacts: {error:#}"))?;
-    let estimate = estimator
-        .estimate_arrays(&request, &arrays)
-        .map_err(|error| format!("Estimate failed: {error:#}"))?;
-    let production_profile = estimator
-        .production_profile_arrays(&request, &arrays)
-        .map_err(|error| format!("Production profile failed: {error:#}"))?;
-    let annual_kwh = estimate
-        .ensemble_estimate
-        .annual_energy
-        .mean
-        .as_kilowatt_hours();
+    let project = STATE.with(|state| state.borrow().project.clone());
+    let (estimate, production_profile, annual_kwh) = compute_estimate_for_project(&project)?;
+    store_estimate_result(
+        estimate,
+        production_profile,
+        format!("Estimate complete: {annual_kwh:.0} kWh/year"),
+        true,
+        true,
+    );
+    refresh_views();
+    Ok(())
+}
+
+fn compute_estimate_for_project(
+    project: &PvProjectDocument,
+) -> Result<(SourceEnsembleEstimateDocument, ProductionProfile, f64), String> {
+    let request = project.inputs.estimate_request.clone();
+    let arrays = project.inputs.arrays.clone();
+    ESTIMATOR.with(|estimator| {
+        let mut estimator = estimator.borrow_mut();
+        if estimator.is_none() {
+            *estimator =
+                Some(SourceModelEstimator::load_embedded().map_err(|error| {
+                    format!("Failed to load embedded model artifacts: {error:#}")
+                })?);
+        }
+        let estimator = estimator
+            .as_mut()
+            .expect("embedded estimator is initialized above");
+        let estimate = estimator
+            .estimate_arrays(&request, &arrays)
+            .map_err(|error| format!("Estimate failed: {error:#}"))?;
+        let production_profile = estimator
+            .production_profile_arrays(&request, &arrays)
+            .map_err(|error| format!("Production profile failed: {error:#}"))?;
+        let annual_kwh = estimate
+            .ensemble_estimate
+            .annual_energy
+            .mean
+            .as_kilowatt_hours();
+        Ok((estimate, production_profile, annual_kwh))
+    })
+}
+
+fn store_estimate_result(
+    estimate: SourceEnsembleEstimateDocument,
+    production_profile: ProductionProfile,
+    status: String,
+    push_log: bool,
+    mark_dirty: bool,
+) {
     STATE.with(|state| {
         let mut state = state.borrow_mut();
         state.project.results.estimate = Some(estimate);
         state.project.results.production_profile = Some(production_profile);
         state.project.results.simulation = None;
-        state.dirty = true;
-        let status = format!("Estimate complete: {annual_kwh:.0} kWh/year");
+        if mark_dirty {
+            state.dirty = true;
+        }
         state.status = status.clone();
-        state.log.push(status);
+        if push_log {
+            state.log.push(status);
+        }
     });
-    refresh_views();
+}
+
+fn recompute_current_estimate(
+    status_prefix: &str,
+    push_log: bool,
+    mark_dirty: bool,
+) -> Result<(), String> {
+    let project = STATE.with(|state| state.borrow().project.clone());
+    let (estimate, production_profile, annual_kwh) = compute_estimate_for_project(&project)?;
+    store_estimate_result(
+        estimate,
+        production_profile,
+        format!("{status_prefix}: {annual_kwh:.0} kWh/year"),
+        push_log,
+        mark_dirty,
+    );
     Ok(())
+}
+
+fn ensure_estimate_loaded() {
+    let needs_estimate = STATE.with(|state| {
+        let state = state.borrow();
+        state.project.results.estimate.is_none()
+            || state.project.results.production_profile.is_none()
+    });
+    if needs_estimate
+        && let Err(message) = recompute_current_estimate("Estimate ready", false, false)
+    {
+        append_log(message);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -369,6 +437,7 @@ fn open_project(path: PathBuf) {
                 state.status = status.clone();
                 state.log.push(status);
             });
+            ensure_estimate_loaded();
         }
         Err(error) => append_log(format!("Open failed: {error:#}")),
     }
@@ -456,6 +525,7 @@ extern "C" fn create_system_view(
     if !gtk::is_initialized_main_thread() && gtk::init().is_err() {
         return std::ptr::null_mut();
     }
+    ensure_estimate_loaded();
     let root = GtkBox::new(Orientation::Vertical, 0);
     root.set_hexpand(true);
     root.set_vexpand(true);
@@ -471,6 +541,7 @@ extern "C" fn create_estimate_view(
     if !gtk::is_initialized_main_thread() && gtk::init().is_err() {
         return std::ptr::null_mut();
     }
+    ensure_estimate_loaded();
     let root = GtkBox::new(Orientation::Vertical, 0);
     root.set_hexpand(true);
     root.set_vexpand(true);
@@ -486,6 +557,7 @@ extern "C" fn create_simulation_view(
     if !gtk::is_initialized_main_thread() && gtk::init().is_err() {
         return std::ptr::null_mut();
     }
+    ensure_estimate_loaded();
     let root = GtkBox::new(Orientation::Vertical, 0);
     root.set_hexpand(true);
     root.set_vexpand(true);
@@ -512,6 +584,10 @@ fn remember_view(
 
 fn refresh_views() {
     refresh_view_group(&SYSTEM_VIEWS, render_system_into);
+    refresh_workbench_views();
+}
+
+fn refresh_workbench_views() {
     refresh_view_group(&ESTIMATE_VIEWS, render_estimate_into);
     refresh_view_group(&SIMULATION_VIEWS, render_simulation_into);
 }
@@ -538,7 +614,7 @@ fn render_system_into(root: &GtkBox) {
     let scroller = ScrolledWindow::builder()
         .hexpand(true)
         .vexpand(true)
-        .hscrollbar_policy(PolicyType::Never)
+        .hscrollbar_policy(PolicyType::Automatic)
         .vscrollbar_policy(PolicyType::Automatic)
         .build();
     let content = GtkBox::new(Orientation::Vertical, 14);
@@ -550,7 +626,7 @@ fn render_system_into(root: &GtkBox) {
     content.append(&section_separator());
     append_array_fields(&content, &state.project);
     content.append(&section_separator());
-    append_consumption_fields(&content, &state.project.inputs.load_profile);
+    append_consumption_fields(&content, &state.project.inputs);
     scroller.set_child(Some(&content));
     root.append(&scroller);
 }
@@ -562,11 +638,11 @@ fn append_location_fields(content: &GtkBox, request: &EstimateRequest) {
     name.connect_clicked(|_| show_location_search_dialog());
     content.append(&field_row("Name", &name));
     let lat = number_entry(request.latitude, 4, |value| {
-        update_state(|state| state.project.inputs.estimate_request.latitude = value);
+        update_input_state(|state| state.project.inputs.estimate_request.latitude = value);
     });
     content.append(&field_row("Latitude", &lat));
     let lon = number_entry(request.longitude, 4, |value| {
-        update_state(|state| state.project.inputs.estimate_request.longitude = value);
+        update_input_state(|state| state.project.inputs.estimate_request.longitude = value);
     });
     content.append(&field_row("Longitude", &lon));
 }
@@ -603,7 +679,7 @@ fn show_location_search_dialog() {
     let scroller = ScrolledWindow::builder()
         .hexpand(true)
         .vexpand(true)
-        .hscrollbar_policy(PolicyType::Never)
+        .hscrollbar_policy(PolicyType::Automatic)
         .vscrollbar_policy(PolicyType::Automatic)
         .child(&list)
         .build();
@@ -782,7 +858,7 @@ fn append_array_fields(content: &GtkBox, project: &PvProjectDocument) {
             .unwrap_or(0.0),
         2,
         |value| {
-            update_state(|state| {
+            update_input_state(|state| {
                 state.project.inputs.estimate_request.storage_usable_kwh =
                     (value > 0.0).then_some(value);
             });
@@ -792,7 +868,7 @@ fn append_array_fields(content: &GtkBox, project: &PvProjectDocument) {
 
     let loss = STATE.with(|state| state.borrow().project.inputs.estimate_request.loss_pct);
     let loss = number_entry(loss, 1, |value| {
-        update_state(|state| state.project.inputs.estimate_request.loss_pct = value);
+        update_input_state(|state| state.project.inputs.estimate_request.loss_pct = value);
     });
     content.append(&field_row("Loss %", &loss));
 }
@@ -990,14 +1066,15 @@ fn sync_request_from_arrays(state: &mut DesktopState) {
     }
 }
 
-fn append_consumption_fields(content: &GtkBox, load_profile: &LoadProfile) {
+fn append_consumption_fields(content: &GtkBox, inputs: &pv_desktop_core::ProjectInputs) {
     content.append(&section_label("Consumption"));
+    let load_profile = &inputs.load_profile;
     let annual = match load_profile {
         LoadProfile::AnnualKwh { annual_kwh, .. } => *annual_kwh,
         LoadProfile::DailyKwh { daily_kwh, .. } => *daily_kwh * 365.0,
     };
     let annual_entry = number_entry(annual, 0, |value| {
-        update_state(|state| {
+        update_input_state(|state| {
             let shape = load_shape(&state.project.inputs.load_profile);
             state.project.inputs.load_profile = LoadProfile::AnnualKwh {
                 annual_kwh: value,
@@ -1006,6 +1083,8 @@ fn append_consumption_fields(content: &GtkBox, load_profile: &LoadProfile) {
         });
     });
     content.append(&field_row("Annual kWh", &annual_entry));
+    let price = optional_number_entry(inputs.energy_price_eur_per_kwh, 3, set_energy_price);
+    content.append(&field_row("EUR/kWh", &price));
     let shape = load_shape(load_profile);
     let dropdown = DropDown::from_strings(&["Residential", "Flat", "Daytime", "Evening"]);
     dropdown.set_selected(shape_index(&shape));
@@ -1013,7 +1092,7 @@ fn append_consumption_fields(content: &GtkBox, load_profile: &LoadProfile) {
         let next_shape = LoadShape::BuiltIn {
             shape_id: shape_from_index(dropdown.selected()),
         };
-        update_state(|state| {
+        update_input_state(|state| {
             let annual_kwh = match state.project.inputs.load_profile {
                 LoadProfile::AnnualKwh { annual_kwh, .. } => annual_kwh,
                 LoadProfile::DailyKwh { daily_kwh, .. } => daily_kwh * 365.0,
@@ -1032,69 +1111,79 @@ fn render_estimate_into(root: &GtkBox) {
     let state = snapshot();
     let scroller = workbench_scroller();
     let content = workbench_content();
-    if let Some(estimate) = &state.project.results.estimate {
-        let annual = estimate
-            .ensemble_estimate
-            .annual_energy
-            .mean
-            .as_kilowatt_hours();
-        content.append(&metric_label(
-            "Annual production",
-            &format!("{annual:.0} kWh"),
-        ));
-        content.append(&metric_label(
-            "Sources",
-            &estimate
-                .coverage
-                .applicable_sources
-                .iter()
-                .map(|source| source.as_str())
-                .collect::<Vec<_>>()
-                .join(", "),
-        ));
-        let grid = Grid::new();
-        grid.set_column_spacing(12);
-        grid.set_row_spacing(4);
-        add_grid_header(&grid, 0, "Month");
-        add_grid_header(&grid, 1, "Mean kWh");
-        add_grid_header(&grid, 2, "Low kWh");
-        add_grid_header(&grid, 3, "High kWh");
-        for (row, monthly) in estimate
-            .ensemble_estimate
-            .monthly_estimates
-            .iter()
-            .enumerate()
-        {
-            let row = (row + 1) as i32;
-            add_grid_text(&grid, 0, row, &monthly.month.value().to_string());
-            add_grid_text(
-                &grid,
-                1,
-                row,
-                &format!("{:.0}", monthly.energy.mean.as_kilowatt_hours()),
-            );
-            add_grid_text(
-                &grid,
-                2,
-                row,
-                &format!("{:.0}", monthly.energy.low.as_kilowatt_hours()),
-            );
-            add_grid_text(
-                &grid,
-                3,
-                row,
-                &format!("{:.0}", monthly.energy.high.as_kilowatt_hours()),
-            );
-        }
-        content.append(&grid);
+    if state.project.results.estimate.is_some() {
+        append_estimate_result(&content, &state.project);
     } else {
-        content.set_valign(Align::Center);
-        let empty = meta_label("Run Estimate to calculate monthly production.");
-        empty.set_halign(Align::Center);
-        content.append(&empty);
+        append_estimate_empty_state(&content);
     }
     scroller.set_child(Some(&content));
     root.append(&scroller);
+}
+
+fn append_estimate_empty_state(content: &GtkBox) {
+    let summary = Grid::new();
+    summary.set_column_spacing(18);
+    summary.set_row_spacing(8);
+    summary.set_hexpand(true);
+    add_estimate_metric_row(&summary, 0, "Annual kWh", "-", EstimateTone::Strong);
+    content.append(&summary);
+    content.append(&body_label("No estimate"));
+}
+
+fn append_estimate_result(content: &GtkBox, project: &PvProjectDocument) {
+    let Some(document) = &project.results.estimate else {
+        return;
+    };
+    let estimate = &document.ensemble_estimate;
+    let sources = document
+        .coverage
+        .applicable_sources
+        .iter()
+        .map(|source| source.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let summary = Grid::new();
+    summary.set_column_spacing(18);
+    summary.set_row_spacing(8);
+    summary.set_hexpand(true);
+    add_estimate_metric_row(
+        &summary,
+        0,
+        "Annual kWh",
+        &annual_energy_value(document),
+        EstimateTone::Strong,
+    );
+    let mut row = 1;
+    if let Some(price) = project.inputs.energy_price_eur_per_kwh {
+        add_estimate_metric_row(
+            &summary,
+            row,
+            "Revenue €",
+            &annual_revenue_value(document, price),
+            EstimateTone::Strong,
+        );
+        row += 1;
+    }
+    add_estimate_metric_row(
+        &summary,
+        row,
+        "POA",
+        &format!(
+            "{:.2} kWh/m2",
+            estimate
+                .annual_in_plane_irradiation
+                .mean
+                .as_kilowatt_hours_per_square_meter()
+        ),
+        EstimateTone::Normal,
+    );
+    row += 1;
+    add_estimate_metric_row(&summary, row, "Sources", &sources, EstimateTone::Normal);
+    content.append(&summary);
+
+    let rows = monthly_estimate_rows(estimate);
+    content.append(&estimate_monthly_table(&rows));
 }
 
 fn render_simulation_into(root: &GtkBox) {
@@ -1135,17 +1224,61 @@ fn render_simulation_into(root: &GtkBox) {
     root.append(&scroller);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshScope {
+    All,
+    Workbench,
+}
+
 fn update_state(update: impl FnOnce(&mut DesktopState)) {
-    STATE.with(|state| {
+    update_project_inputs(update, RefreshScope::All);
+}
+
+fn update_input_state(update: impl FnOnce(&mut DesktopState)) {
+    update_project_inputs(update, RefreshScope::Workbench);
+}
+
+fn update_project_inputs(update: impl FnOnce(&mut DesktopState), refresh_scope: RefreshScope) {
+    let project = STATE.with(|state| {
         let mut state = state.borrow_mut();
         update(&mut state);
         state.dirty = true;
-        state.project.results.estimate = None;
-        state.project.results.production_profile = None;
         state.project.results.simulation = None;
-        state.status = "Project inputs changed".to_string();
+        state.project.clone()
     });
-    refresh_views();
+
+    match compute_estimate_for_project(&project) {
+        Ok((estimate, production_profile, annual_kwh)) => store_estimate_result(
+            estimate,
+            production_profile,
+            format!("Estimate updated: {annual_kwh:.0} kWh/year"),
+            false,
+            true,
+        ),
+        Err(message) => STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.project.results.estimate = None;
+            state.project.results.production_profile = None;
+            state.project.results.simulation = None;
+            state.status = message;
+        }),
+    }
+
+    match refresh_scope {
+        RefreshScope::All => refresh_views(),
+        RefreshScope::Workbench => refresh_workbench_views(),
+    }
+}
+
+fn set_energy_price(value: Option<f64>) {
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        state.project.inputs.energy_price_eur_per_kwh = value;
+        state.project.results.simulation = None;
+        state.dirty = true;
+        state.status = "Energy price updated".to_string();
+    });
+    refresh_workbench_views();
 }
 
 fn append_log(message: String) {
@@ -1180,6 +1313,27 @@ fn number_entry(value: f64, digits: u32, update: impl Fn(f64) + 'static) -> Entr
     entry.connect_changed(move |entry| {
         if let Some(value) = parse_number(&entry.text()) {
             update(value);
+        }
+    });
+    entry
+}
+
+fn optional_number_entry(
+    value: Option<f64>,
+    digits: u32,
+    update: impl Fn(Option<f64>) + 'static,
+) -> Entry {
+    let entry = Entry::new();
+    entry.set_input_purpose(gtk::InputPurpose::Number);
+    if let Some(value) = value {
+        entry.set_text(&format_number(value, digits));
+    }
+    entry.connect_changed(move |entry| {
+        let text = entry.text();
+        if text.trim().is_empty() {
+            update(None);
+        } else if let Some(value) = parse_number(&text) {
+            update(Some(value));
         }
     });
     entry
@@ -1245,6 +1399,250 @@ fn azimuth_direction_label(value: f64) -> String {
     let normalized = value.rem_euclid(360.0);
     let index = ((normalized + 22.5) / 45.0).floor() as usize % DIRECTIONS.len();
     DIRECTIONS[index].to_string()
+}
+
+fn annual_energy_value(document: &pv_core::source_model::SourceEnsembleEstimateDocument) -> String {
+    let estimate = &document.ensemble_estimate;
+    let mean = estimate.annual_energy.mean.as_kilowatt_hours().round();
+    estimate
+        .uncertainty
+        .annual_energy
+        .map(|band| {
+            format!(
+                "{mean:.0} low..high {:.0}..{:.0}",
+                band.low.as_kilowatt_hours().round(),
+                band.high.as_kilowatt_hours().round()
+            )
+        })
+        .unwrap_or_else(|| format!("{mean:.0} low..high -..-"))
+}
+
+fn annual_revenue_value(
+    document: &pv_core::source_model::SourceEnsembleEstimateDocument,
+    price: f64,
+) -> String {
+    let estimate = &document.ensemble_estimate;
+    let mean = (estimate.annual_energy.mean.as_kilowatt_hours() * price).round();
+    estimate
+        .uncertainty
+        .annual_energy
+        .map(|band| {
+            format!(
+                "{mean:.0} low..high {:.0}..{:.0}",
+                (band.low.as_kilowatt_hours() * price).round(),
+                (band.high.as_kilowatt_hours() * price).round()
+            )
+        })
+        .unwrap_or_else(|| format!("{mean:.0} low..high -..-"))
+}
+
+fn monthly_estimate_rows(
+    estimate: &pv_core::source_model::AnnualPvEnsembleEstimate,
+) -> Vec<[String; 7]> {
+    estimate
+        .monthly_estimates
+        .iter()
+        .map(|monthly| {
+            let month = monthly.month.value();
+            let days = days_in_month(month).expect("valid month has a day count");
+            let month_name = short_month_name(month).expect("valid month has a short name");
+            let total_kwh = monthly.energy.mean.as_kilowatt_hours();
+            let (total_min, total_max, daily_min, daily_max) = monthly
+                .uncertainty
+                .annual_energy
+                .map(|band| {
+                    let low = band.low.as_kilowatt_hours();
+                    let high = band.high.as_kilowatt_hours();
+                    (
+                        format!("{low:.0}"),
+                        format!("{high:.0}"),
+                        format!("{:.1}", low / days),
+                        format!("{:.1}", high / days),
+                    )
+                })
+                .unwrap_or_else(|| {
+                    (
+                        "-".to_string(),
+                        "-".to_string(),
+                        "-".to_string(),
+                        "-".to_string(),
+                    )
+                });
+            [
+                month_name.to_string(),
+                format!("{total_kwh:.1}"),
+                total_min,
+                total_max,
+                format!("{:.1}", total_kwh / days),
+                daily_min,
+                daily_max,
+            ]
+        })
+        .collect()
+}
+
+fn estimate_monthly_table(rows: &[[String; 7]]) -> Grid {
+    let grid = Grid::new();
+    grid.set_column_spacing(14);
+    grid.set_row_spacing(5);
+    grid.set_hexpand(true);
+    grid.set_column_homogeneous(true);
+    add_estimate_table_group_header(&grid, 1, 3, "Monthly kWh");
+    add_estimate_table_group_header(&grid, 4, 3, "Daily kWh");
+    add_estimate_table_header(&grid, 0, 1, "Month", 0.0);
+    add_estimate_table_header(&grid, 1, 1, "mean", 1.0);
+    add_estimate_table_header(&grid, 2, 1, "min", 1.0);
+    add_estimate_table_header(&grid, 3, 1, "max", 1.0);
+    add_estimate_table_header(&grid, 4, 1, "mean", 1.0);
+    add_estimate_table_header(&grid, 5, 1, "min", 1.0);
+    add_estimate_table_header(&grid, 6, 1, "max", 1.0);
+
+    let minimums = monthly_table_minimums(rows);
+    for (index, row_data) in rows.iter().enumerate() {
+        let row = index as i32 + 2;
+        add_estimate_table_cell(&grid, 0, row, &row_data[0], 0.0, EstimateTone::Muted);
+        add_estimate_table_cell(&grid, 1, row, &row_data[1], 1.0, EstimateTone::Mean);
+        add_estimate_table_cell(
+            &grid,
+            2,
+            row,
+            &row_data[2],
+            1.0,
+            minimums
+                .filter(|(monthly_min, _)| is_table_minimum(&row_data[2], *monthly_min))
+                .map(|_| EstimateTone::Minimum)
+                .unwrap_or(EstimateTone::Normal),
+        );
+        add_estimate_table_cell(&grid, 3, row, &row_data[3], 1.0, EstimateTone::Normal);
+        add_estimate_table_cell(&grid, 4, row, &row_data[4], 1.0, EstimateTone::Mean);
+        add_estimate_table_cell(
+            &grid,
+            5,
+            row,
+            &row_data[5],
+            1.0,
+            minimums
+                .filter(|(_, daily_min)| is_table_minimum(&row_data[5], *daily_min))
+                .map(|_| EstimateTone::Minimum)
+                .unwrap_or(EstimateTone::Normal),
+        );
+        add_estimate_table_cell(&grid, 6, row, &row_data[6], 1.0, EstimateTone::Normal);
+    }
+    grid
+}
+
+fn monthly_table_minimums(rows: &[[String; 7]]) -> Option<(f64, f64)> {
+    if rows.is_empty() {
+        return None;
+    }
+    Some((min_table_column(rows, 2)?, min_table_column(rows, 5)?))
+}
+
+fn min_table_column(rows: &[[String; 7]], index: usize) -> Option<f64> {
+    rows.iter()
+        .filter_map(|row| row[index].parse::<f64>().ok())
+        .min_by(f64::total_cmp)
+}
+
+fn is_table_minimum(value: &str, minimum: f64) -> bool {
+    value
+        .parse::<f64>()
+        .map(|parsed| parsed.total_cmp(&minimum).is_eq())
+        .unwrap_or(false)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EstimateTone {
+    Normal,
+    Muted,
+    Strong,
+    Mean,
+    Minimum,
+}
+
+fn add_estimate_metric_row(grid: &Grid, row: i32, label: &str, value: &str, tone: EstimateTone) {
+    grid.attach(
+        &estimate_text_label(label, 0.0, EstimateTone::Muted, false),
+        0,
+        row,
+        1,
+        1,
+    );
+    let value = estimate_text_label(value, 0.0, tone, true);
+    value.set_hexpand(true);
+    value.set_wrap(true);
+    grid.attach(&value, 1, row, 1, 1);
+}
+
+fn add_estimate_table_group_header(grid: &Grid, column: i32, width: i32, text: &str) {
+    grid.attach(
+        &estimate_text_label(text, 0.5, EstimateTone::Muted, true),
+        column,
+        0,
+        width,
+        1,
+    );
+}
+
+fn add_estimate_table_header(grid: &Grid, column: i32, row: i32, text: &str, xalign: f32) {
+    grid.attach(
+        &estimate_text_label(text, xalign, EstimateTone::Muted, true),
+        column,
+        row,
+        1,
+        1,
+    );
+}
+
+fn add_estimate_table_cell(
+    grid: &Grid,
+    column: i32,
+    row: i32,
+    text: &str,
+    xalign: f32,
+    tone: EstimateTone,
+) {
+    grid.attach(
+        &estimate_text_label(text, xalign, tone, true),
+        column,
+        row,
+        1,
+        1,
+    );
+}
+
+fn estimate_text_label(text: &str, xalign: f32, tone: EstimateTone, monospace: bool) -> Label {
+    let label = Label::new(None);
+    label.set_xalign(xalign);
+    label.set_hexpand(true);
+    label.set_halign(Align::Fill);
+    if monospace {
+        label.add_css_class("monospace");
+    }
+    label.set_markup(&estimate_markup(text, tone));
+    label
+}
+
+fn estimate_markup(text: &str, tone: EstimateTone) -> String {
+    let text = escape_markup(text);
+    match tone {
+        EstimateTone::Normal => format!(r##"<span size="large">{text}</span>"##),
+        EstimateTone::Muted => {
+            format!(r##"<span size="large" foreground="#77767b">{text}</span>"##)
+        }
+        EstimateTone::Strong | EstimateTone::Mean => {
+            format!(r##"<span size="large" foreground="#2ec27e" weight="bold">{text}</span>"##)
+        }
+        EstimateTone::Minimum => {
+            format!(r##"<span size="large" foreground="#e01b24" weight="bold">{text}</span>"##)
+        }
+    }
+}
+fn escape_markup(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 fn field_row<W: IsA<gtk::Widget>>(label: &str, widget: &W) -> GtkBox {
@@ -1316,7 +1714,7 @@ fn workbench_scroller() -> ScrolledWindow {
     ScrolledWindow::builder()
         .hexpand(true)
         .vexpand(true)
-        .hscrollbar_policy(PolicyType::Never)
+        .hscrollbar_policy(PolicyType::Automatic)
         .vscrollbar_policy(PolicyType::Automatic)
         .build()
 }
@@ -1343,22 +1741,6 @@ fn add_table_cell(grid: &Grid, column: i32, row: i32, text: &str, xalign: f32, e
     label.set_xalign(xalign);
     label.set_hexpand(expands);
     if !expands {
-        label.add_css_class("monospace");
-    }
-    grid.attach(&label, column, row, 1, 1);
-}
-
-fn add_grid_header(grid: &Grid, column: i32, text: &str) {
-    let label = Label::new(Some(text));
-    label.set_xalign(0.0);
-    label.add_css_class("heading");
-    grid.attach(&label, column, 0, 1, 1);
-}
-
-fn add_grid_text(grid: &Grid, column: i32, row: i32, text: &str) {
-    let label = Label::new(Some(text));
-    label.set_xalign(if column == 0 { 0.0 } else { 1.0 });
-    if column != 0 {
         label.add_css_class("monospace");
     }
     grid.attach(&label, column, row, 1, 1);
