@@ -200,7 +200,12 @@ extern "C" fn command_run_simulation(
 ) -> maruzzella_sdk::ffi::MzStatus {
     match run_simulation() {
         Ok(()) => maruzzella_sdk::ffi::MzStatus::OK,
-        Err(message) => {
+        Err(RunSimulationError::NeedsEstimate) => {
+            append_log("Run an estimate before simulation".to_string());
+            refresh_views();
+            maruzzella_sdk::ffi::MzStatus::OK
+        }
+        Err(RunSimulationError::Failed(message)) => {
             append_log(message);
             refresh_views();
             maruzzella_sdk::ffi::MzStatus::new(MzStatusCode::InternalError)
@@ -222,7 +227,7 @@ extern "C" fn command_set_simulation_runs(
         state.project.inputs.simulation_options.runs = runs;
         state.project.results.simulation = None;
         state.dirty = true;
-        let message = format!("Simulation runs set to {runs}");
+        let message = format!("Simulation runs set to {}", format_runs(runs));
         state.status = message.clone();
         state.log.push(message);
     });
@@ -277,7 +282,13 @@ fn run_estimate() -> Result<(), String> {
     Ok(())
 }
 
-fn run_simulation() -> Result<(), String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RunSimulationError {
+    NeedsEstimate,
+    Failed(String),
+}
+
+fn run_simulation() -> Result<(), RunSimulationError> {
     let (production, load, storage, options) = STATE.with(|state| {
         let state = state.borrow();
         (
@@ -288,9 +299,12 @@ fn run_simulation() -> Result<(), String> {
         )
     });
     let Some(production) = production else {
-        return Err("Run an estimate before simulation".to_string());
+        return Err(RunSimulationError::NeedsEstimate);
     };
-    append_log(format!("Running simulation with {} runs", options.runs));
+    append_log(format!(
+        "Running simulation with {} runs",
+        format_runs(options.runs)
+    ));
     let request = SimulationRequest {
         production,
         load,
@@ -299,7 +313,8 @@ fn run_simulation() -> Result<(), String> {
         }),
         options,
     };
-    let result = simulate(&request).map_err(|error| format!("Simulation failed: {error}"))?;
+    let result = simulate(&request)
+        .map_err(|error| RunSimulationError::Failed(format!("Simulation failed: {error}")))?;
     let self_sufficiency = result.summaries.self_sufficiency_ratio.p50;
     STATE.with(|state| {
         let mut state = state.borrow_mut();
@@ -1190,6 +1205,18 @@ fn parse_number(value: &str) -> Option<f64> {
         return None;
     }
     normalized.parse::<f64>().ok()
+}
+
+fn format_runs(runs: usize) -> String {
+    let text = runs.to_string();
+    let mut output = String::new();
+    for (index, character) in text.chars().rev().enumerate() {
+        if index > 0 && index % 3 == 0 {
+            output.push('_');
+        }
+        output.push(character);
+    }
+    output.chars().rev().collect()
 }
 
 fn azimuth_field_row(azimuth: &Entry) -> GtkBox {
