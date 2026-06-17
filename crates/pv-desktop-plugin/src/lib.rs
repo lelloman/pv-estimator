@@ -2,14 +2,16 @@
 
 use std::cell::RefCell;
 use std::ffi::c_void;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 
+use directories::ProjectDirs;
 use gtk::glib::translate::IntoGlibPtr;
 use gtk::prelude::*;
 use gtk::{
     Align, Box as GtkBox, Button, DropDown, Entry, FileChooserAction, FileChooserNative, Grid,
-    Image, Label, ListBox, Orientation, PolicyType, ResponseType, ScrolledWindow, SelectionMode,
-    Separator, Window,
+    Image, Label, ListBox, Orientation, PolicyType, Popover, ResponseType, ScrolledWindow,
+    SelectionMode, Separator, Window,
 };
 use maruzzella_sdk::{
     CommandSpec, HostApi, MzStatusCode, MzViewPlacement, Plugin, PluginDependency,
@@ -25,6 +27,7 @@ use pv_desktop_core::{PROJECT_EXTENSION, PvProjectDocument, load_project, save_p
 use pv_model::{
     EstimateArray, EstimateRequest, SourceModelEstimator, days_in_month, short_month_name,
 };
+use serde::{Deserialize, Serialize};
 
 pub struct PvDesktopPlugin;
 
@@ -32,6 +35,7 @@ const PLUGIN_ID: &str = "com.lelloman.pv_estimator.desktop";
 const VIEW_SYSTEM: &str = "com.lelloman.pv_estimator.system";
 const VIEW_ESTIMATE: &str = "com.lelloman.pv_estimator.estimate";
 const VIEW_SIMULATION: &str = "com.lelloman.pv_estimator.simulation";
+const DESKTOP_SESSION_SCHEMA_VERSION: u32 = 1;
 
 const CMD_NEW: &str = "pv.project.new";
 const CMD_OPEN: &str = "pv.project.open";
@@ -48,6 +52,13 @@ struct DesktopState {
     dirty: bool,
     status: String,
     log: Vec<String>,
+    session_loaded: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DesktopSession {
+    schema_version: u32,
+    last_project_path: Option<PathBuf>,
 }
 
 impl Default for DesktopState {
@@ -58,6 +69,7 @@ impl Default for DesktopState {
             dirty: false,
             status: "New PV project".to_string(),
             log: vec!["New PV project".to_string()],
+            session_loaded: false,
         }
     }
 }
@@ -149,8 +161,11 @@ extern "C" fn command_new_project(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
     STATE.with(|state| {
-        *state.borrow_mut() = DesktopState::default();
+        let mut next = DesktopState::default();
+        next.session_loaded = true;
+        *state.borrow_mut() = next;
     });
+    save_desktop_session(None);
     append_log("New project created".to_string());
     ensure_estimate_loaded();
     refresh_views();
@@ -414,6 +429,7 @@ fn save_current_project() -> Result<SaveDisposition, String> {
         return Ok(SaveDisposition::NeedsPath);
     };
     save_project(&path, &project).map_err(|error| format!("Save failed: {error:#}"))?;
+    save_desktop_session(Some(&path));
     STATE.with(|state| {
         let mut state = state.borrow_mut();
         state.dirty = false;
@@ -426,39 +442,114 @@ fn save_current_project() -> Result<SaveDisposition, String> {
 }
 
 fn open_project(path: PathBuf) {
-    match load_project(&path) {
+    if load_project_into_state(&path, true) {
+        ensure_estimate_loaded();
+    }
+    refresh_views();
+}
+
+fn load_project_into_state(path: &Path, remember: bool) -> bool {
+    match load_project(path) {
         Ok(project) => {
             STATE.with(|state| {
                 let mut state = state.borrow_mut();
                 state.project = project;
-                state.path = Some(path.clone());
+                state.path = Some(path.to_path_buf());
                 state.dirty = false;
+                state.session_loaded = true;
                 let status = format!("Opened {}", path.display());
                 state.status = status.clone();
                 state.log.push(status);
             });
-            ensure_estimate_loaded();
+            if remember {
+                save_desktop_session(Some(path));
+            }
+            true
         }
-        Err(error) => append_log(format!("Open failed: {error:#}")),
+        Err(error) => {
+            append_log(format!("Open failed: {error:#}"));
+            false
+        }
     }
-    refresh_views();
 }
 
 fn save_project_as(path: PathBuf) {
     let path = ensure_project_extension(path);
     let project = STATE.with(|state| state.borrow().project.clone());
     match save_project(&path, &project) {
-        Ok(()) => STATE.with(|state| {
-            let mut state = state.borrow_mut();
-            state.path = Some(path.clone());
-            state.dirty = false;
-            let status = format!("Saved {}", path.display());
-            state.status = status.clone();
-            state.log.push(status);
-        }),
+        Ok(()) => {
+            save_desktop_session(Some(&path));
+            STATE.with(|state| {
+                let mut state = state.borrow_mut();
+                state.path = Some(path.clone());
+                state.dirty = false;
+                let status = format!("Saved {}", path.display());
+                state.status = status.clone();
+                state.log.push(status);
+            });
+        }
         Err(error) => append_log(format!("Save failed: {error:#}")),
     }
     refresh_views();
+}
+
+fn ensure_session_loaded() {
+    let already_loaded = STATE.with(|state| state.borrow().session_loaded);
+    if already_loaded {
+        return;
+    }
+
+    let last_project_path = load_desktop_session().and_then(|session| session.last_project_path);
+    match last_project_path {
+        Some(path) if path.exists() => {
+            if !load_project_into_state(&path, false) {
+                STATE.with(|state| state.borrow_mut().session_loaded = true);
+                save_desktop_session(None);
+            }
+        }
+        Some(path) => {
+            STATE.with(|state| {
+                let mut state = state.borrow_mut();
+                state.session_loaded = true;
+                let status = format!("Last project not found: {}", path.display());
+                state.status = status.clone();
+                state.log.push(status);
+            });
+            save_desktop_session(None);
+        }
+        None => STATE.with(|state| state.borrow_mut().session_loaded = true),
+    }
+}
+
+fn desktop_session_path() -> Option<PathBuf> {
+    ProjectDirs::from("dev", "lelloman", "pv-estimator")
+        .map(|dirs| dirs.config_dir().join("pv-desktop-session.json"))
+}
+
+fn load_desktop_session() -> Option<DesktopSession> {
+    let path = desktop_session_path()?;
+    let bytes = fs::read(path).ok()?;
+    let session: DesktopSession = serde_json::from_slice(&bytes).ok()?;
+    (session.schema_version == DESKTOP_SESSION_SCHEMA_VERSION).then_some(session)
+}
+
+fn save_desktop_session(last_project_path: Option<&Path>) {
+    let Some(path) = desktop_session_path() else {
+        return;
+    };
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let session = DesktopSession {
+        schema_version: DESKTOP_SESSION_SCHEMA_VERSION,
+        last_project_path: last_project_path.map(Path::to_path_buf),
+    };
+    if let Ok(bytes) = serde_json::to_vec_pretty(&session) {
+        let _ = fs::write(path, bytes);
+    }
 }
 
 fn ensure_project_extension(path: PathBuf) -> PathBuf {
@@ -525,6 +616,7 @@ extern "C" fn create_system_view(
     if !gtk::is_initialized_main_thread() && gtk::init().is_err() {
         return std::ptr::null_mut();
     }
+    ensure_session_loaded();
     ensure_estimate_loaded();
     let root = GtkBox::new(Orientation::Vertical, 0);
     root.set_hexpand(true);
@@ -541,6 +633,7 @@ extern "C" fn create_estimate_view(
     if !gtk::is_initialized_main_thread() && gtk::init().is_err() {
         return std::ptr::null_mut();
     }
+    ensure_session_loaded();
     ensure_estimate_loaded();
     let root = GtkBox::new(Orientation::Vertical, 0);
     root.set_hexpand(true);
@@ -557,6 +650,7 @@ extern "C" fn create_simulation_view(
     if !gtk::is_initialized_main_thread() && gtk::init().is_err() {
         return std::ptr::null_mut();
     }
+    ensure_session_loaded();
     ensure_estimate_loaded();
     let root = GtkBox::new(Orientation::Vertical, 0);
     root.set_hexpand(true);
@@ -622,6 +716,8 @@ fn render_system_into(root: &GtkBox) {
     content.set_margin_bottom(10);
     content.set_margin_start(10);
     content.set_margin_end(10);
+    append_scenario_switcher(&content, &state.project);
+    content.append(&section_separator());
     append_location_fields(&content, &state.project.inputs.estimate_request);
     content.append(&section_separator());
     append_array_fields(&content, &state.project);
@@ -629,6 +725,98 @@ fn render_system_into(root: &GtkBox) {
     append_consumption_fields(&content, &state.project.inputs);
     scroller.set_child(Some(&content));
     root.append(&scroller);
+}
+
+fn append_scenario_switcher(content: &GtkBox, project: &PvProjectDocument) {
+    let row = GtkBox::new(Orientation::Horizontal, 6);
+    row.set_hexpand(true);
+
+    let setup_name = project.title_for_window();
+    let dropdown = DropDown::from_strings(&[setup_name.as_str()]);
+    dropdown.set_hexpand(true);
+    dropdown.set_halign(Align::Fill);
+    dropdown.set_selected(0);
+    dropdown.set_tooltip_text(Some("Active setup"));
+    row.append(&dropdown);
+
+    let add = icon_button("list-add-symbolic", "Add setup");
+    add.connect_clicked(|_| {
+        append_log("Setup creation is not wired yet".to_string());
+        refresh_views();
+    });
+    row.append(&add);
+
+    let more = icon_button("open-menu-symbolic", "Setup actions");
+    let menu = Popover::new();
+    menu.set_has_arrow(false);
+    menu.set_parent(&more);
+    let menu_content = GtkBox::new(Orientation::Vertical, 0);
+    menu_content.set_margin_top(6);
+    menu_content.set_margin_bottom(6);
+    menu_content.set_margin_start(6);
+    menu_content.set_margin_end(6);
+    let rename = Button::with_label("Rename setup");
+    rename.set_halign(Align::Fill);
+    let menu_for_rename = menu.clone();
+    rename.connect_clicked(move |_| {
+        menu_for_rename.popdown();
+        show_rename_setup_dialog();
+    });
+    menu_content.append(&rename);
+    menu.set_child(Some(&menu_content));
+    let menu_for_more = menu.clone();
+    more.connect_clicked(move |_| menu_for_more.popup());
+    row.append(&more);
+
+    content.append(&row);
+}
+
+fn show_rename_setup_dialog() {
+    if !gtk::is_initialized_main_thread() && gtk::init().is_err() {
+        append_log("GTK is not initialized; cannot rename setup".to_string());
+        return;
+    }
+
+    let current_name = STATE.with(|state| state.borrow().project.title_for_window());
+    let window = Window::builder()
+        .title("Rename Setup")
+        .modal(true)
+        .default_width(360)
+        .build();
+    window.add_css_class("app-dialog");
+
+    let content = GtkBox::new(Orientation::Vertical, 12);
+    content.set_margin_top(14);
+    content.set_margin_bottom(8);
+    content.set_margin_start(14);
+    content.set_margin_end(14);
+
+    let name = Entry::new();
+    name.set_text(&current_name);
+    name.set_placeholder_text(Some("Setup name"));
+    content.append(&field_row("Name", &name));
+
+    let footer = GtkBox::new(Orientation::Horizontal, 6);
+    footer.set_halign(Align::End);
+    footer.set_margin_bottom(0);
+    let cancel = Button::with_label("Cancel");
+    let window_for_cancel = window.clone();
+    cancel.connect_clicked(move |_| window_for_cancel.close());
+    let save = Button::with_label("Save");
+    let window_for_save = window.clone();
+    let name_for_save = name.clone();
+    save.connect_clicked(move |_| {
+        if rename_setup_from_entry(&name_for_save) {
+            window_for_save.close();
+        }
+    });
+    footer.append(&cancel);
+    footer.append(&save);
+    content.append(&footer);
+
+    window.set_child(Some(&content));
+    window.present();
+    name.grab_focus();
 }
 
 fn append_location_fields(content: &GtkBox, request: &EstimateRequest) {
@@ -1238,6 +1426,28 @@ fn update_input_state(update: impl FnOnce(&mut DesktopState)) {
     update_project_inputs(update, RefreshScope::Workbench);
 }
 
+fn rename_setup_from_entry(name: &Entry) -> bool {
+    let name = name.text().trim().to_string();
+    if name.is_empty() {
+        append_log("Setup name cannot be empty".to_string());
+        refresh_workbench_views();
+        return false;
+    }
+
+    rename_setup(name);
+    true
+}
+
+fn rename_setup(name: String) {
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        state.project.metadata.title = name.clone();
+        state.dirty = true;
+        state.status = format!("Renamed setup to {name}");
+    });
+    refresh_views();
+}
+
 fn update_project_inputs(update: impl FnOnce(&mut DesktopState), refresh_scope: RefreshScope) {
     let project = STATE.with(|state| {
         let mut state = state.borrow_mut();
@@ -1396,8 +1606,8 @@ fn azimuth_field_row(azimuth: &Entry) -> GtkBox {
 
 fn azimuth_direction_label(value: f64) -> String {
     const DIRECTIONS: [&str; 8] = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
-    let normalized = value.rem_euclid(360.0);
-    let index = ((normalized + 22.5) / 45.0).floor() as usize % DIRECTIONS.len();
+    let compass_degrees = (180.0 + value).rem_euclid(360.0);
+    let index = ((compass_degrees + 22.5) / 45.0).floor() as usize % DIRECTIONS.len();
     DIRECTIONS[index].to_string()
 }
 
@@ -1784,3 +1994,19 @@ fn clear_box(root: &GtkBox) {
 }
 
 export_plugin!(PvDesktopPlugin);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn desktop_azimuth_label_matches_pvgis_convention() {
+        assert_eq!(azimuth_direction_label(0.0), "S");
+        assert_eq!(azimuth_direction_label(-90.0), "E");
+        assert_eq!(azimuth_direction_label(90.0), "W");
+        assert_eq!(azimuth_direction_label(180.0), "N");
+        assert_eq!(azimuth_direction_label(-180.0), "N");
+        assert_eq!(azimuth_direction_label(45.0), "SW");
+        assert_eq!(azimuth_direction_label(-45.0), "SE");
+    }
+}
