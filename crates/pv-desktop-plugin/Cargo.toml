@@ -17,6 +17,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 anyhow = "1.0"
+directories = "6.0"
 gtk = { package = "gtk4", version = "0.9" }
 maruzzella_sdk = { path = "../../../maruzzella/maruzzella_sdk" }
 pv-core = { path = "../pv-core" }
