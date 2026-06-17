@@ -9,9 +9,9 @@ use directories::ProjectDirs;
 use gtk::glib::translate::IntoGlibPtr;
 use gtk::prelude::*;
 use gtk::{
-    Align, Box as GtkBox, Button, DropDown, Entry, FileChooserAction, FileChooserNative, Grid,
-    Image, Label, ListBox, Orientation, PolicyType, Popover, ResponseType, ScrolledWindow,
-    SelectionMode, Separator, Window,
+    Align, Box as GtkBox, Button, DropDown, Entry, FileChooserAction, FileChooserNative,
+    FileFilter, Grid, Image, Label, ListBox, Orientation, PolicyType, Popover, ResponseType,
+    ScrolledWindow, SelectionMode, Separator, Window,
 };
 use maruzzella_sdk::{
     CommandSpec, HostApi, MzStatusCode, MzViewPlacement, Plugin, PluginDependency,
@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 pub struct PvDesktopPlugin;
 
 const PLUGIN_ID: &str = "com.lelloman.pv_estimator.desktop";
+const VIEW_LAUNCHER: &str = "com.lelloman.pv_estimator.launcher";
 const VIEW_SYSTEM: &str = "com.lelloman.pv_estimator.system";
 const VIEW_ESTIMATE: &str = "com.lelloman.pv_estimator.estimate";
 const VIEW_SIMULATION: &str = "com.lelloman.pv_estimator.simulation";
@@ -39,15 +40,17 @@ const DESKTOP_SESSION_SCHEMA_VERSION: u32 = 1;
 
 const CMD_NEW: &str = "pv.project.new";
 const CMD_OPEN: &str = "pv.project.open";
+const CMD_CLOSE: &str = "pv.project.close";
 const CMD_SAVE: &str = "pv.project.save";
 const CMD_SAVE_AS: &str = "pv.project.save_as";
 const CMD_RUN_ESTIMATE: &str = "pv.project.run_estimate";
 const CMD_RUN_SIMULATION: &str = "pv.project.run_simulation";
 const CMD_SET_SIMULATION_RUNS: &str = "pv.project.set_simulation_runs";
+const CMD_EXIT: &str = "pv.app.exit";
 
 #[derive(Clone, Debug)]
 struct DesktopState {
-    project: PvProjectDocument,
+    project: Option<PvProjectDocument>,
     path: Option<PathBuf>,
     dirty: bool,
     status: String,
@@ -64,22 +67,46 @@ struct DesktopSession {
 impl Default for DesktopState {
     fn default() -> Self {
         Self {
-            project: PvProjectDocument::default(),
+            project: None,
             path: None,
             dirty: false,
-            status: "New PV project".to_string(),
-            log: vec!["New PV project".to_string()],
+            status: "No project open".to_string(),
+            log: vec!["No project open".to_string()],
             session_loaded: false,
         }
     }
 }
 
+struct ShellModeHandlers {
+    show_workspace: Box<dyn Fn()>,
+    show_launcher: Box<dyn Fn()>,
+}
+
 thread_local! {
     static STATE: RefCell<DesktopState> = RefCell::new(DesktopState::default());
     static ESTIMATOR: RefCell<Option<SourceModelEstimator>> = const { RefCell::new(None) };
+    static SHELL_MODE_HANDLERS: RefCell<Option<ShellModeHandlers>> = const { RefCell::new(None) };
     static SYSTEM_VIEWS: RefCell<Vec<gtk::glib::WeakRef<GtkBox>>> = const { RefCell::new(Vec::new()) };
     static ESTIMATE_VIEWS: RefCell<Vec<gtk::glib::WeakRef<GtkBox>>> = const { RefCell::new(Vec::new()) };
     static SIMULATION_VIEWS: RefCell<Vec<gtk::glib::WeakRef<GtkBox>>> = const { RefCell::new(Vec::new()) };
+}
+
+pub fn install_shell_mode_handlers(
+    show_workspace: impl Fn() + 'static,
+    show_launcher: impl Fn() + 'static,
+) {
+    SHELL_MODE_HANDLERS.with(|handlers| {
+        *handlers.borrow_mut() = Some(ShellModeHandlers {
+            show_workspace: Box::new(show_workspace),
+            show_launcher: Box::new(show_launcher),
+        });
+    });
+}
+
+pub fn has_restorable_desktop_session() -> bool {
+    load_desktop_session()
+        .and_then(|session| session.last_project_path)
+        .is_some_and(|path| path.exists())
 }
 
 impl Plugin for PvDesktopPlugin {
@@ -104,24 +131,37 @@ impl Plugin for PvDesktopPlugin {
                 .with_handler(command_open_project),
         )?;
         host.register_command(
+            CommandSpec::new(PLUGIN_ID, CMD_CLOSE, "Close Project")
+                .with_handler(command_close_project)
+                .with_enabled(has_open_project_for_command),
+        )?;
+        host.register_command(
             CommandSpec::new(PLUGIN_ID, CMD_SAVE, "Save Project")
-                .with_handler(command_save_project),
+                .with_handler(command_save_project)
+                .with_enabled(has_open_project_for_command),
         )?;
         host.register_command(
             CommandSpec::new(PLUGIN_ID, CMD_SAVE_AS, "Save Project As")
-                .with_handler(command_save_project_as),
+                .with_handler(command_save_project_as)
+                .with_enabled(has_open_project_for_command),
         )?;
         host.register_command(
             CommandSpec::new(PLUGIN_ID, CMD_RUN_ESTIMATE, "Run Estimate")
-                .with_handler(command_run_estimate),
+                .with_handler(command_run_estimate)
+                .with_enabled(has_open_project_for_command),
         )?;
         host.register_command(
             CommandSpec::new(PLUGIN_ID, CMD_RUN_SIMULATION, "Run Simulation")
-                .with_handler(command_run_simulation),
+                .with_handler(command_run_simulation)
+                .with_enabled(has_open_project_for_command),
         )?;
         host.register_command(
             CommandSpec::new(PLUGIN_ID, CMD_SET_SIMULATION_RUNS, "Set Simulation Runs")
-                .with_handler(command_set_simulation_runs),
+                .with_handler(command_set_simulation_runs)
+                .with_enabled(has_open_project_for_command),
+        )?;
+        host.register_command(
+            CommandSpec::new(PLUGIN_ID, CMD_EXIT, "Exit").with_handler(command_exit_app),
         )?;
 
         host.register_surface_contribution(SurfaceContributionSpec::about_section(
@@ -131,6 +171,13 @@ impl Plugin for PvDesktopPlugin {
             "Engineering workbench for photovoltaic production and consumption simulations.",
         ))?;
 
+        host.register_view_factory(ViewFactorySpec::new(
+            PLUGIN_ID,
+            VIEW_LAUNCHER,
+            "PV Estimator",
+            MzViewPlacement::Workbench,
+            create_launcher_view,
+        ))?;
         host.register_view_factory(ViewFactorySpec::new(
             PLUGIN_ID,
             VIEW_SYSTEM,
@@ -160,16 +207,25 @@ impl Plugin for PvDesktopPlugin {
 extern "C" fn command_new_project(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
+    create_new_project();
+    maruzzella_sdk::ffi::MzStatus::OK
+}
+
+fn create_new_project() {
     STATE.with(|state| {
-        let mut next = DesktopState::default();
-        next.session_loaded = true;
-        *state.borrow_mut() = next;
+        let mut state = state.borrow_mut();
+        state.project = Some(PvProjectDocument::default());
+        state.path = None;
+        state.dirty = true;
+        state.session_loaded = true;
+        let status = "New project created".to_string();
+        state.status = status.clone();
+        state.log.push(status);
     });
     save_desktop_session(None);
-    append_log("New project created".to_string());
     ensure_estimate_loaded();
+    show_project_workspace();
     refresh_views();
-    maruzzella_sdk::ffi::MzStatus::OK
 }
 
 extern "C" fn command_open_project(
@@ -179,9 +235,22 @@ extern "C" fn command_open_project(
     maruzzella_sdk::ffi::MzStatus::OK
 }
 
+extern "C" fn command_close_project(
+    _payload: maruzzella_sdk::ffi::MzBytes,
+) -> maruzzella_sdk::ffi::MzStatus {
+    close_project();
+    maruzzella_sdk::ffi::MzStatus::OK
+}
+
 extern "C" fn command_save_project(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
+    if !has_open_project() {
+        append_log("Open or create a project first".to_string());
+        refresh_views();
+        return maruzzella_sdk::ffi::MzStatus::OK;
+    }
+
     match save_current_project() {
         Ok(SaveDisposition::Saved) => maruzzella_sdk::ffi::MzStatus::OK,
         Ok(SaveDisposition::NeedsPath) => {
@@ -199,13 +268,24 @@ extern "C" fn command_save_project(
 extern "C" fn command_save_project_as(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
-    show_save_project_dialog();
+    if has_open_project() {
+        show_save_project_dialog();
+    } else {
+        append_log("Open or create a project first".to_string());
+        refresh_views();
+    }
     maruzzella_sdk::ffi::MzStatus::OK
 }
 
 extern "C" fn command_run_estimate(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
+    if !has_open_project() {
+        append_log("Open or create a project first".to_string());
+        refresh_views();
+        return maruzzella_sdk::ffi::MzStatus::OK;
+    }
+
     match run_estimate() {
         Ok(()) => maruzzella_sdk::ffi::MzStatus::OK,
         Err(message) => {
@@ -221,6 +301,11 @@ extern "C" fn command_run_simulation(
 ) -> maruzzella_sdk::ffi::MzStatus {
     match run_simulation() {
         Ok(()) => maruzzella_sdk::ffi::MzStatus::OK,
+        Err(RunSimulationError::NeedsProject) => {
+            append_log("Open or create a project first".to_string());
+            refresh_views();
+            maruzzella_sdk::ffi::MzStatus::OK
+        }
         Err(RunSimulationError::NeedsEstimate) => {
             append_log("Run an estimate before simulation".to_string());
             refresh_views();
@@ -234,6 +319,15 @@ extern "C" fn command_run_simulation(
     }
 }
 
+extern "C" fn command_exit_app(
+    _payload: maruzzella_sdk::ffi::MzBytes,
+) -> maruzzella_sdk::ffi::MzStatus {
+    if let Some(application) = gtk::gio::Application::default() {
+        application.quit();
+    }
+    maruzzella_sdk::ffi::MzStatus::OK
+}
+
 extern "C" fn command_set_simulation_runs(
     payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
@@ -243,16 +337,24 @@ extern "C" fn command_set_simulation_runs(
         return maruzzella_sdk::ffi::MzStatus::new(MzStatusCode::InvalidArgument);
     };
 
-    STATE.with(|state| {
+    let updated = STATE.with(|state| {
         let mut state = state.borrow_mut();
-        state.project.inputs.simulation_options.runs = runs;
-        state.project.results.simulation = None;
+        let Some(project) = state.project.as_mut() else {
+            let message = "Open or create a project first".to_string();
+            state.status = message.clone();
+            state.log.push(message);
+            return false;
+        };
+        project.inputs.simulation_options.runs = runs;
+        project.results.simulation = None;
         state.dirty = true;
         let message = format!("Simulation runs set to {}", format_runs(runs));
         state.status = message.clone();
         state.log.push(message);
+        true
     });
     refresh_views();
+    let _ = updated;
     maruzzella_sdk::ffi::MzStatus::OK
 }
 
@@ -268,8 +370,10 @@ fn simulation_runs_from_payload(payload: maruzzella_sdk::ffi::MzBytes) -> Option
 }
 
 fn run_estimate() -> Result<(), String> {
+    let Some(project) = STATE.with(|state| state.borrow().project.clone()) else {
+        return Err("Open or create a project first".to_string());
+    };
     append_log("Running source-model estimate".to_string());
-    let project = STATE.with(|state| state.borrow().project.clone());
     let (estimate, production_profile, annual_kwh) = compute_estimate_for_project(&project)?;
     store_estimate_result(
         estimate,
@@ -322,9 +426,12 @@ fn store_estimate_result(
 ) {
     STATE.with(|state| {
         let mut state = state.borrow_mut();
-        state.project.results.estimate = Some(estimate);
-        state.project.results.production_profile = Some(production_profile);
-        state.project.results.simulation = None;
+        let Some(project) = state.project.as_mut() else {
+            return;
+        };
+        project.results.estimate = Some(estimate);
+        project.results.production_profile = Some(production_profile);
+        project.results.simulation = None;
         if mark_dirty {
             state.dirty = true;
         }
@@ -340,7 +447,9 @@ fn recompute_current_estimate(
     push_log: bool,
     mark_dirty: bool,
 ) -> Result<(), String> {
-    let project = STATE.with(|state| state.borrow().project.clone());
+    let Some(project) = STATE.with(|state| state.borrow().project.clone()) else {
+        return Ok(());
+    };
     let (estimate, production_profile, annual_kwh) = compute_estimate_for_project(&project)?;
     store_estimate_result(
         estimate,
@@ -355,8 +464,9 @@ fn recompute_current_estimate(
 fn ensure_estimate_loaded() {
     let needs_estimate = STATE.with(|state| {
         let state = state.borrow();
-        state.project.results.estimate.is_none()
-            || state.project.results.production_profile.is_none()
+        state.project.as_ref().is_some_and(|project| {
+            project.results.estimate.is_none() || project.results.production_profile.is_none()
+        })
     });
     if needs_estimate
         && let Err(message) = recompute_current_estimate("Estimate ready", false, false)
@@ -367,20 +477,25 @@ fn ensure_estimate_loaded() {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RunSimulationError {
+    NeedsProject,
     NeedsEstimate,
     Failed(String),
 }
 
 fn run_simulation() -> Result<(), RunSimulationError> {
-    let (production, load, storage, options) = STATE.with(|state| {
+    let Some((production, load, storage, options)) = STATE.with(|state| {
         let state = state.borrow();
-        (
-            state.project.results.production_profile.clone(),
-            state.project.inputs.load_profile.clone(),
-            state.project.inputs.estimate_request.storage_usable_kwh,
-            state.project.inputs.simulation_options,
-        )
-    });
+        state.project.as_ref().map(|project| {
+            (
+                project.results.production_profile.clone(),
+                project.inputs.load_profile.clone(),
+                project.inputs.estimate_request.storage_usable_kwh,
+                project.inputs.simulation_options,
+            )
+        })
+    }) else {
+        return Err(RunSimulationError::NeedsProject);
+    };
     let Some(production) = production else {
         return Err(RunSimulationError::NeedsEstimate);
     };
@@ -401,7 +516,10 @@ fn run_simulation() -> Result<(), RunSimulationError> {
     let self_sufficiency = result.summaries.self_sufficiency_ratio.p50;
     STATE.with(|state| {
         let mut state = state.borrow_mut();
-        state.project.results.simulation = Some(result);
+        let Some(project) = state.project.as_mut() else {
+            return;
+        };
+        project.results.simulation = Some(result);
         state.dirty = true;
         let status = format!(
             "Simulation complete: {:.0}% self sufficiency",
@@ -420,11 +538,23 @@ enum SaveDisposition {
     NeedsPath,
 }
 
+extern "C" fn has_open_project_for_command() -> bool {
+    has_open_project()
+}
+
+fn has_open_project() -> bool {
+    ensure_session_loaded();
+    STATE.with(|state| state.borrow().project.is_some())
+}
+
 fn save_current_project() -> Result<SaveDisposition, String> {
     let (path, project) = STATE.with(|state| {
         let state = state.borrow();
         (state.path.clone(), state.project.clone())
     });
+    let Some(project) = project else {
+        return Err("Open or create a project first".to_string());
+    };
     let Some(path) = path else {
         return Ok(SaveDisposition::NeedsPath);
     };
@@ -444,8 +574,41 @@ fn save_current_project() -> Result<SaveDisposition, String> {
 fn open_project(path: PathBuf) {
     if load_project_into_state(&path, true) {
         ensure_estimate_loaded();
+        show_project_workspace();
     }
     refresh_views();
+}
+
+fn close_project() {
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        state.project = None;
+        state.path = None;
+        state.dirty = false;
+        state.session_loaded = true;
+        let status = "No project open".to_string();
+        state.status = status.clone();
+        state.log.push(status);
+    });
+    save_desktop_session(None);
+    show_no_project_launcher();
+    refresh_views();
+}
+
+fn show_project_workspace() {
+    SHELL_MODE_HANDLERS.with(|handlers| {
+        if let Some(handlers) = handlers.borrow().as_ref() {
+            (handlers.show_workspace)();
+        }
+    });
+}
+
+fn show_no_project_launcher() {
+    SHELL_MODE_HANDLERS.with(|handlers| {
+        if let Some(handlers) = handlers.borrow().as_ref() {
+            (handlers.show_launcher)();
+        }
+    });
 }
 
 fn load_project_into_state(path: &Path, remember: bool) -> bool {
@@ -453,7 +616,7 @@ fn load_project_into_state(path: &Path, remember: bool) -> bool {
         Ok(project) => {
             STATE.with(|state| {
                 let mut state = state.borrow_mut();
-                state.project = project;
+                state.project = Some(project);
                 state.path = Some(path.to_path_buf());
                 state.dirty = false;
                 state.session_loaded = true;
@@ -475,7 +638,11 @@ fn load_project_into_state(path: &Path, remember: bool) -> bool {
 
 fn save_project_as(path: PathBuf) {
     let path = ensure_project_extension(path);
-    let project = STATE.with(|state| state.borrow().project.clone());
+    let Some(project) = STATE.with(|state| state.borrow().project.clone()) else {
+        append_log("Open or create a project first".to_string());
+        refresh_views();
+        return;
+    };
     match save_project(&path, &project) {
         Ok(()) => {
             save_desktop_session(Some(&path));
@@ -517,7 +684,14 @@ fn ensure_session_loaded() {
             });
             save_desktop_session(None);
         }
-        None => STATE.with(|state| state.borrow_mut().session_loaded = true),
+        None => STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.session_loaded = true;
+            state.project = None;
+            state.path = None;
+            state.dirty = false;
+            state.status = "No project open".to_string();
+        }),
     }
 }
 
@@ -560,6 +734,13 @@ fn ensure_project_extension(path: PathBuf) -> PathBuf {
     }
 }
 
+fn pv_project_file_filter() -> FileFilter {
+    let filter = FileFilter::new();
+    filter.set_name(Some("PV projects (*.pvproj)"));
+    filter.add_pattern("*.pvproj");
+    filter
+}
+
 fn show_open_project_dialog() {
     if !gtk::is_initialized_main_thread() && gtk::init().is_err() {
         append_log("GTK is not initialized; cannot open file dialog".to_string());
@@ -572,6 +753,7 @@ fn show_open_project_dialog() {
         Some("Open"),
         Some("Cancel"),
     );
+    dialog.add_filter(&pv_project_file_filter());
     dialog.connect_response(|dialog, response| {
         if response == ResponseType::Accept
             && let Some(file) = dialog.file()
@@ -596,6 +778,7 @@ fn show_save_project_dialog() {
         Some("Save"),
         Some("Cancel"),
     );
+    dialog.add_filter(&pv_project_file_filter());
     dialog.set_current_name("untitled.pvproj");
     dialog.connect_response(|dialog, response| {
         if response == ResponseType::Accept
@@ -607,6 +790,20 @@ fn show_save_project_dialog() {
         dialog.destroy();
     });
     dialog.show();
+}
+
+extern "C" fn create_launcher_view(
+    _host: *const maruzzella_sdk::ffi::MzHostApi,
+    _request: *const maruzzella_sdk::ffi::MzViewRequest,
+) -> *mut c_void {
+    if !gtk::is_initialized_main_thread() && gtk::init().is_err() {
+        return std::ptr::null_mut();
+    }
+    let root = GtkBox::new(Orientation::Vertical, 0);
+    root.set_hexpand(true);
+    root.set_vexpand(true);
+    render_launcher_into(&root);
+    widget_ptr(root)
 }
 
 extern "C" fn create_system_view(
@@ -702,6 +899,21 @@ fn refresh_view_group(
     });
 }
 
+fn render_launcher_into(root: &GtkBox) {
+    clear_box(root);
+    let content = GtkBox::new(Orientation::Vertical, 14);
+    content.set_margin_top(32);
+    content.set_margin_bottom(32);
+    content.set_margin_start(32);
+    content.set_margin_end(32);
+    append_no_project_state(
+        &content,
+        "No project open",
+        "Create a new project or open an existing .pvproj file.",
+    );
+    root.append(&content);
+}
+
 fn render_system_into(root: &GtkBox) {
     clear_box(root);
     let state = snapshot();
@@ -716,15 +928,39 @@ fn render_system_into(root: &GtkBox) {
     content.set_margin_bottom(10);
     content.set_margin_start(10);
     content.set_margin_end(10);
-    append_scenario_switcher(&content, &state.project);
-    content.append(&section_separator());
-    append_location_fields(&content, &state.project.inputs.estimate_request);
-    content.append(&section_separator());
-    append_array_fields(&content, &state.project);
-    content.append(&section_separator());
-    append_consumption_fields(&content, &state.project.inputs);
+    if let Some(project) = &state.project {
+        append_scenario_switcher(&content, project);
+        content.append(&section_separator());
+        append_location_fields(&content, &project.inputs.estimate_request);
+        content.append(&section_separator());
+        append_array_fields(&content, project);
+        content.append(&section_separator());
+        append_consumption_fields(&content, &project.inputs);
+    } else {
+        append_no_project_state(
+            &content,
+            "No project open",
+            "Create a new project or open an existing .pvproj file.",
+        );
+    }
     scroller.set_child(Some(&content));
     root.append(&scroller);
+}
+
+fn append_no_project_state(content: &GtkBox, title: &str, message: &str) {
+    content.set_valign(Align::Center);
+    content.append(&header_label(title));
+    content.append(&body_label(message));
+
+    let actions = GtkBox::new(Orientation::Horizontal, 6);
+    actions.set_halign(Align::Start);
+    let new_project = Button::with_label("New Project");
+    new_project.connect_clicked(|_| create_new_project());
+    actions.append(&new_project);
+    let open_project = Button::with_label("Open Project");
+    open_project.connect_clicked(|_| show_open_project_dialog());
+    actions.append(&open_project);
+    content.append(&actions);
 }
 
 fn append_scenario_switcher(content: &GtkBox, project: &PvProjectDocument) {
@@ -777,7 +1013,17 @@ fn show_rename_setup_dialog() {
         return;
     }
 
-    let current_name = STATE.with(|state| state.borrow().project.title_for_window());
+    let Some(current_name) = STATE.with(|state| {
+        state
+            .borrow()
+            .project
+            .as_ref()
+            .map(PvProjectDocument::title_for_window)
+    }) else {
+        append_log("Open or create a project first".to_string());
+        refresh_views();
+        return;
+    };
     let window = Window::builder()
         .title("Rename Setup")
         .modal(true)
@@ -826,11 +1072,19 @@ fn append_location_fields(content: &GtkBox, request: &EstimateRequest) {
     name.connect_clicked(|_| show_location_search_dialog());
     content.append(&field_row("Name", &name));
     let lat = number_entry(request.latitude, 4, |value| {
-        update_input_state(|state| state.project.inputs.estimate_request.latitude = value);
+        update_input_state(|state| {
+            if let Some(project) = state.project.as_mut() {
+                project.inputs.estimate_request.latitude = value;
+            }
+        });
     });
     content.append(&field_row("Latitude", &lat));
     let lon = number_entry(request.longitude, 4, |value| {
-        update_input_state(|state| state.project.inputs.estimate_request.longitude = value);
+        update_input_state(|state| {
+            if let Some(project) = state.project.as_mut() {
+                project.inputs.estimate_request.longitude = value;
+            }
+        });
     });
     content.append(&field_row("Longitude", &lon));
 }
@@ -841,8 +1095,17 @@ fn show_location_search_dialog() {
         return;
     }
 
-    let current_query =
-        STATE.with(|state| state.borrow().project.inputs.estimate_request.name.clone());
+    let Some(current_query) = STATE.with(|state| {
+        state
+            .borrow()
+            .project
+            .as_ref()
+            .map(|project| project.inputs.estimate_request.name.clone())
+    }) else {
+        append_log("Open or create a project first".to_string());
+        refresh_views();
+        return;
+    };
     let window = Window::builder()
         .title("Search Location")
         .modal(true)
@@ -953,7 +1216,10 @@ fn location_result_button(window: &Window, result: CitySearchResult) -> Button {
 
 fn apply_location_result(result: &CitySearchResult) {
     update_state(|state| {
-        let request = &mut state.project.inputs.estimate_request;
+        let Some(project) = state.project.as_mut() else {
+            return;
+        };
+        let request = &mut project.inputs.estimate_request;
         request.name = result.display_name.clone();
         request.region = result.country_code.clone();
         request.latitude = result.latitude_degrees;
@@ -1047,16 +1313,32 @@ fn append_array_fields(content: &GtkBox, project: &PvProjectDocument) {
         2,
         |value| {
             update_input_state(|state| {
-                state.project.inputs.estimate_request.storage_usable_kwh =
-                    (value > 0.0).then_some(value);
+                if let Some(project) = state.project.as_mut() {
+                    project.inputs.estimate_request.storage_usable_kwh =
+                        (value > 0.0).then_some(value);
+                }
             });
         },
     );
     content.append(&field_row("Storage kWh", &storage));
 
-    let loss = STATE.with(|state| state.borrow().project.inputs.estimate_request.loss_pct);
+    let Some(loss) = STATE.with(|state| {
+        state
+            .borrow()
+            .project
+            .as_ref()
+            .map(|project| project.inputs.estimate_request.loss_pct)
+    }) else {
+        append_log("Open or create a project first".to_string());
+        refresh_views();
+        return;
+    };
     let loss = number_entry(loss, 1, |value| {
-        update_input_state(|state| state.project.inputs.estimate_request.loss_pct = value);
+        update_input_state(|state| {
+            if let Some(project) = state.project.as_mut() {
+                project.inputs.estimate_request.loss_pct = value;
+            }
+        });
     });
     content.append(&field_row("Loss %", &loss));
 }
@@ -1069,7 +1351,13 @@ fn show_array_dialog(index: Option<usize>) {
 
     let array = index
         .and_then(|index| {
-            STATE.with(|state| state.borrow().project.inputs.arrays.get(index).cloned())
+            STATE.with(|state| {
+                state
+                    .borrow()
+                    .project
+                    .as_ref()
+                    .and_then(|project| project.inputs.arrays.get(index).cloned())
+            })
         })
         .unwrap_or_else(default_array);
 
@@ -1172,11 +1460,14 @@ fn non_empty_text(value: &str) -> Option<String> {
 
 fn save_array(index: Option<usize>, array: EstimateArray) {
     update_state(|state| {
+        let Some(project) = state.project.as_mut() else {
+            return;
+        };
         match index {
-            Some(index) if index < state.project.inputs.arrays.len() => {
-                state.project.inputs.arrays[index] = array;
+            Some(index) if index < project.inputs.arrays.len() => {
+                project.inputs.arrays[index] = array;
             }
-            _ => state.project.inputs.arrays.push(array),
+            _ => project.inputs.arrays.push(array),
         }
         sync_request_from_arrays(state);
     });
@@ -1192,9 +1483,8 @@ fn confirm_delete_array(index: usize) {
         state
             .borrow()
             .project
-            .inputs
-            .arrays
-            .get(index)
+            .as_ref()
+            .and_then(|project| project.inputs.arrays.get(index))
             .and_then(|array| array.name.clone())
             .unwrap_or_else(|| "this array".to_string())
     });
@@ -1238,19 +1528,25 @@ fn confirm_delete_array(index: usize) {
 
 fn delete_array(index: usize) {
     update_state(|state| {
-        if index >= state.project.inputs.arrays.len() {
+        let Some(project) = state.project.as_mut() else {
+            return;
+        };
+        if index >= project.inputs.arrays.len() {
             return;
         }
-        state.project.inputs.arrays.remove(index);
+        project.inputs.arrays.remove(index);
         sync_request_from_arrays(state);
     });
 }
 
 fn sync_request_from_arrays(state: &mut DesktopState) {
-    if let Some(first) = state.project.inputs.arrays.first() {
-        state.project.inputs.estimate_request.peak_power_kwp = first.peak_power_kwp;
-        state.project.inputs.estimate_request.tilt_deg = first.tilt_deg;
-        state.project.inputs.estimate_request.azimuth_deg = first.azimuth_deg;
+    let Some(project) = state.project.as_mut() else {
+        return;
+    };
+    if let Some(first) = project.inputs.arrays.first() {
+        project.inputs.estimate_request.peak_power_kwp = first.peak_power_kwp;
+        project.inputs.estimate_request.tilt_deg = first.tilt_deg;
+        project.inputs.estimate_request.azimuth_deg = first.azimuth_deg;
     }
 }
 
@@ -1263,11 +1559,13 @@ fn append_consumption_fields(content: &GtkBox, inputs: &pv_desktop_core::Project
     };
     let annual_entry = number_entry(annual, 0, |value| {
         update_input_state(|state| {
-            let shape = load_shape(&state.project.inputs.load_profile);
-            state.project.inputs.load_profile = LoadProfile::AnnualKwh {
-                annual_kwh: value,
-                shape,
-            };
+            if let Some(project) = state.project.as_mut() {
+                let shape = load_shape(&project.inputs.load_profile);
+                project.inputs.load_profile = LoadProfile::AnnualKwh {
+                    annual_kwh: value,
+                    shape,
+                };
+            }
         });
     });
     content.append(&field_row("Annual kWh", &annual_entry));
@@ -1281,14 +1579,16 @@ fn append_consumption_fields(content: &GtkBox, inputs: &pv_desktop_core::Project
             shape_id: shape_from_index(dropdown.selected()),
         };
         update_input_state(|state| {
-            let annual_kwh = match state.project.inputs.load_profile {
-                LoadProfile::AnnualKwh { annual_kwh, .. } => annual_kwh,
-                LoadProfile::DailyKwh { daily_kwh, .. } => daily_kwh * 365.0,
-            };
-            state.project.inputs.load_profile = LoadProfile::AnnualKwh {
-                annual_kwh,
-                shape: next_shape,
-            };
+            if let Some(project) = state.project.as_mut() {
+                let annual_kwh = match project.inputs.load_profile {
+                    LoadProfile::AnnualKwh { annual_kwh, .. } => annual_kwh,
+                    LoadProfile::DailyKwh { daily_kwh, .. } => daily_kwh * 365.0,
+                };
+                project.inputs.load_profile = LoadProfile::AnnualKwh {
+                    annual_kwh,
+                    shape: next_shape,
+                };
+            }
         });
     });
     content.append(&field_row("Shape", &dropdown));
@@ -1299,10 +1599,18 @@ fn render_estimate_into(root: &GtkBox) {
     let state = snapshot();
     let scroller = workbench_scroller();
     let content = workbench_content();
-    if state.project.results.estimate.is_some() {
-        append_estimate_result(&content, &state.project);
+    if let Some(project) = &state.project {
+        if project.results.estimate.is_some() {
+            append_estimate_result(&content, project);
+        } else {
+            append_estimate_empty_state(&content);
+        }
     } else {
-        append_estimate_empty_state(&content);
+        append_no_project_state(
+            &content,
+            "No project open",
+            "Open a project to view production estimates.",
+        );
     }
     scroller.set_child(Some(&content));
     root.append(&scroller);
@@ -1379,10 +1687,20 @@ fn render_simulation_into(root: &GtkBox) {
     let state = snapshot();
     let scroller = workbench_scroller();
     let content = workbench_content();
+    let Some(project) = &state.project else {
+        append_no_project_state(
+            &content,
+            "No project open",
+            "Open a project to run consumption simulations.",
+        );
+        scroller.set_child(Some(&content));
+        root.append(&scroller);
+        return;
+    };
     content.append(&header_label("Simulation"));
     content.append(&meta_label(&state.status));
     content.append(&section_separator());
-    if let Some(result) = &state.project.results.simulation {
+    if let Some(result) = &project.results.simulation {
         content.append(&metric_label(
             "Completed runs",
             &format!("{} / {}", result.completed_runs, result.requested_runs),
@@ -1441,7 +1759,10 @@ fn rename_setup_from_entry(name: &Entry) -> bool {
 fn rename_setup(name: String) {
     STATE.with(|state| {
         let mut state = state.borrow_mut();
-        state.project.metadata.title = name.clone();
+        let Some(project) = state.project.as_mut() else {
+            return;
+        };
+        project.metadata.title = name.clone();
         state.dirty = true;
         state.status = format!("Renamed setup to {name}");
     });
@@ -1451,11 +1772,26 @@ fn rename_setup(name: String) {
 fn update_project_inputs(update: impl FnOnce(&mut DesktopState), refresh_scope: RefreshScope) {
     let project = STATE.with(|state| {
         let mut state = state.borrow_mut();
+        if state.project.is_none() {
+            let message = "Open or create a project first".to_string();
+            state.status = message.clone();
+            state.log.push(message);
+            return None;
+        }
         update(&mut state);
         state.dirty = true;
-        state.project.results.simulation = None;
-        state.project.clone()
+        if let Some(project) = state.project.as_mut() {
+            project.results.simulation = None;
+            Some(project.clone())
+        } else {
+            None
+        }
     });
+
+    let Some(project) = project else {
+        refresh_views();
+        return;
+    };
 
     match compute_estimate_for_project(&project) {
         Ok((estimate, production_profile, annual_kwh)) => store_estimate_result(
@@ -1467,9 +1803,11 @@ fn update_project_inputs(update: impl FnOnce(&mut DesktopState), refresh_scope: 
         ),
         Err(message) => STATE.with(|state| {
             let mut state = state.borrow_mut();
-            state.project.results.estimate = None;
-            state.project.results.production_profile = None;
-            state.project.results.simulation = None;
+            if let Some(project) = state.project.as_mut() {
+                project.results.estimate = None;
+                project.results.production_profile = None;
+                project.results.simulation = None;
+            }
             state.status = message;
         }),
     }
@@ -1483,8 +1821,11 @@ fn update_project_inputs(update: impl FnOnce(&mut DesktopState), refresh_scope: 
 fn set_energy_price(value: Option<f64>) {
     STATE.with(|state| {
         let mut state = state.borrow_mut();
-        state.project.inputs.energy_price_eur_per_kwh = value;
-        state.project.results.simulation = None;
+        let Some(project) = state.project.as_mut() else {
+            return;
+        };
+        project.inputs.energy_price_eur_per_kwh = value;
+        project.results.simulation = None;
         state.dirty = true;
         state.status = "Energy price updated".to_string();
     });

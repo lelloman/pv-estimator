@@ -1,8 +1,9 @@
 use gtk::gio::prelude::ApplicationExtManual;
 use maruzzella::{
-    CommandSpec, MaruzzellaConfig, MenuItemSpec, MenuRootSpec, PanelResizePolicy, ShellChrome,
-    TabGroupSpec, ToolbarDisplayMode, ToolbarItemSpec, ToolbarOptionSpec, WorkbenchNodeSpec,
-    build_application, default_product_spec, load_static_plugin, plugin_tab,
+    CommandSpec, LauncherSpec, MaruzzellaConfig, MenuItemSpec, MenuRootSpec, PanelResizePolicy,
+    ShellChrome, ShellMode, TabGroupSpec, ToolbarDisplayMode, ToolbarItemSpec, ToolbarOptionSpec,
+    WorkbenchNodeSpec, WorkspaceSession, build_application_with_handle, default_product_spec,
+    load_static_plugin, plugin_tab,
 };
 
 fn main() {
@@ -30,6 +31,7 @@ fn main() {
     product.menu_items = vec![
         menu_item("file-new", "file", "New Project", "pv.project.new"),
         menu_item("file-open", "file", "Open Project", "pv.project.open"),
+        menu_item("file-close", "file", "Close Project", "pv.project.close"),
         menu_item("file-save", "file", "Save Project", "pv.project.save"),
         menu_item(
             "file-save-as",
@@ -37,6 +39,7 @@ fn main() {
             "Save Project As",
             "pv.project.save_as",
         ),
+        menu_item("file-exit", "file", "Exit", "pv.app.exit"),
         menu_item(
             "project-estimate",
             "project",
@@ -54,11 +57,13 @@ fn main() {
     product.commands = vec![
         command("pv.project.new", "New Project"),
         command("pv.project.open", "Open Project"),
+        command("pv.project.close", "Close Project"),
         command("pv.project.save", "Save Project"),
         command("pv.project.save_as", "Save Project As"),
         command("pv.project.run_estimate", "Run Estimate"),
         command("pv.project.run_simulation", "Run Simulation"),
         command("pv.project.set_simulation_runs", "Set Simulation Runs"),
+        command("pv.app.exit", "Exit"),
     ];
     product.toolbar_items = vec![
         toolbar_item(
@@ -142,18 +147,72 @@ fn main() {
         .with_tab_strip_appearance("editor"),
     );
 
+    let project_shell = product.shell_spec();
+    let launcher = no_project_launcher(&product);
+    let startup_mode = if pv_desktop_plugin::has_restorable_desktop_session() {
+        ShellMode::Workspace
+    } else {
+        ShellMode::Launcher
+    };
+
     let config = MaruzzellaConfig::new("com.lelloman.pv-estimator.desktop")
         .with_persistence_id("pv-estimator-desktop")
         .with_product(product)
-        .with_workspace_chrome(ShellChrome {
-            show_menu_bar: true,
-            show_toolbar: true,
-            show_search: false,
-        })
+        .with_startup_mode(startup_mode)
+        .with_launcher(launcher)
+        .with_workspace_chrome(workspace_chrome())
         .with_builtin_plugin(embedded_pv_plugin);
 
-    let application = build_application(config);
+    let (application, handle) = build_application_with_handle(config);
+    let workspace_handle = handle.clone();
+    let launcher_handle = handle.clone();
+    pv_desktop_plugin::install_shell_mode_handlers(
+        move || {
+            let _ =
+                workspace_handle.switch_to_workspace(WorkspaceSession::new(project_shell.clone()));
+        },
+        move || {
+            let _ = launcher_handle.switch_to_launcher();
+        },
+    );
     application.run();
+}
+
+fn workspace_chrome() -> ShellChrome {
+    ShellChrome {
+        show_menu_bar: true,
+        show_toolbar: true,
+        show_search: false,
+    }
+}
+
+fn no_project_launcher(product: &maruzzella::ProductSpec) -> LauncherSpec {
+    let mut launcher = LauncherSpec::new(
+        "PV Estimator",
+        TabGroupSpec::new(
+            "launcher-main",
+            Some("no-project"),
+            vec![plugin_tab(
+                "no-project",
+                "launcher-main",
+                "PV Estimator",
+                "com.lelloman.pv_estimator.launcher",
+                "The PV start view could not be created.",
+                false,
+            )],
+        )
+        .with_tab_strip_hidden()
+        .with_panel_appearance("workbench")
+        .with_panel_header_appearance("secondary")
+        .with_tab_strip_appearance("editor"),
+    );
+    launcher.menu_roots = product.menu_roots.clone();
+    launcher.menu_items = product.menu_items.clone();
+    launcher.commands = product.commands.clone();
+    launcher.toolbar_items = product.toolbar_items.clone();
+    launcher.include_base_toolbar_items = product.include_base_toolbar_items;
+    launcher.chrome = workspace_chrome();
+    launcher
 }
 
 fn menu_item(id: &str, root_id: &str, label: &str, command_id: &str) -> MenuItemSpec {
