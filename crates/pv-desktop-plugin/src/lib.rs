@@ -9,7 +9,7 @@ use directories::ProjectDirs;
 use gtk::glib::translate::IntoGlibPtr;
 use gtk::prelude::*;
 use gtk::{
-    Align, Box as GtkBox, Button, DropDown, Entry, FileChooserAction, FileChooserNative,
+    Align, Box as GtkBox, Button, DropDown, Entry, FileChooserAction, FileChooserDialog,
     FileFilter, Grid, Image, Label, ListBox, Orientation, PolicyType, Popover, ResponseType,
     ScrolledWindow, SelectionMode, Separator, Window,
 };
@@ -86,6 +86,7 @@ thread_local! {
     static STATE: RefCell<DesktopState> = RefCell::new(DesktopState::default());
     static ESTIMATOR: RefCell<Option<SourceModelEstimator>> = const { RefCell::new(None) };
     static SHELL_MODE_HANDLERS: RefCell<Option<ShellModeHandlers>> = const { RefCell::new(None) };
+    static ACTIVE_FILE_CHOOSER: RefCell<Option<FileChooserDialog>> = const { RefCell::new(None) };
     static SYSTEM_VIEWS: RefCell<Vec<gtk::glib::WeakRef<GtkBox>>> = const { RefCell::new(Vec::new()) };
     static ESTIMATE_VIEWS: RefCell<Vec<gtk::glib::WeakRef<GtkBox>>> = const { RefCell::new(Vec::new()) };
     static SIMULATION_VIEWS: RefCell<Vec<gtk::glib::WeakRef<GtkBox>>> = const { RefCell::new(Vec::new()) };
@@ -741,19 +742,57 @@ fn pv_project_file_filter() -> FileFilter {
     filter
 }
 
+fn active_window() -> Option<Window> {
+    gtk::gio::Application::default()
+        .and_then(|application| application.downcast::<gtk::Application>().ok())
+        .and_then(|application| application.active_window())
+        .map(|window| window.upcast())
+}
+
+fn prefer_dark_gtk_theme() {
+    if let Some(settings) = gtk::Settings::default() {
+        settings.set_gtk_application_prefer_dark_theme(true);
+    }
+}
+
+fn keep_file_chooser_alive(dialog: &FileChooserDialog) {
+    ACTIVE_FILE_CHOOSER.with(|active_dialog| {
+        *active_dialog.borrow_mut() = Some(dialog.clone());
+    });
+}
+
+fn release_file_chooser(dialog: &FileChooserDialog) {
+    ACTIVE_FILE_CHOOSER.with(|active_dialog| {
+        let mut active_dialog = active_dialog.borrow_mut();
+        if active_dialog
+            .as_ref()
+            .is_some_and(|active_dialog| active_dialog.as_ptr() == dialog.as_ptr())
+        {
+            active_dialog.take();
+        }
+    });
+}
+
 fn show_open_project_dialog() {
     if !gtk::is_initialized_main_thread() && gtk::init().is_err() {
         append_log("GTK is not initialized; cannot open file dialog".to_string());
         return;
     }
-    let dialog = FileChooserNative::new(
+    prefer_dark_gtk_theme();
+    let parent = active_window();
+    let dialog = FileChooserDialog::new(
         Some("Open PV Project"),
-        None::<&gtk::Window>,
+        parent.as_ref(),
         FileChooserAction::Open,
-        Some("Open"),
-        Some("Cancel"),
+        &[
+            ("Cancel", ResponseType::Cancel),
+            ("Open", ResponseType::Accept),
+        ],
     );
     dialog.add_filter(&pv_project_file_filter());
+    dialog.add_css_class("app-dialog");
+    dialog.set_modal(true);
+    keep_file_chooser_alive(&dialog);
     dialog.connect_response(|dialog, response| {
         if response == ResponseType::Accept
             && let Some(file) = dialog.file()
@@ -762,8 +801,9 @@ fn show_open_project_dialog() {
             open_project(path);
         }
         dialog.destroy();
+        release_file_chooser(dialog);
     });
-    dialog.show();
+    dialog.present();
 }
 
 fn show_save_project_dialog() {
@@ -771,15 +811,22 @@ fn show_save_project_dialog() {
         append_log("GTK is not initialized; cannot open file dialog".to_string());
         return;
     }
-    let dialog = FileChooserNative::new(
+    prefer_dark_gtk_theme();
+    let parent = active_window();
+    let dialog = FileChooserDialog::new(
         Some("Save PV Project"),
-        None::<&gtk::Window>,
+        parent.as_ref(),
         FileChooserAction::Save,
-        Some("Save"),
-        Some("Cancel"),
+        &[
+            ("Cancel", ResponseType::Cancel),
+            ("Save", ResponseType::Accept),
+        ],
     );
     dialog.add_filter(&pv_project_file_filter());
+    dialog.add_css_class("app-dialog");
     dialog.set_current_name("untitled.pvproj");
+    dialog.set_modal(true);
+    keep_file_chooser_alive(&dialog);
     dialog.connect_response(|dialog, response| {
         if response == ResponseType::Accept
             && let Some(file) = dialog.file()
@@ -788,8 +835,9 @@ fn show_save_project_dialog() {
             save_project_as(path);
         }
         dialog.destroy();
+        release_file_chooser(dialog);
     });
-    dialog.show();
+    dialog.present();
 }
 
 extern "C" fn create_launcher_view(
