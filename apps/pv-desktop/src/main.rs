@@ -1,10 +1,18 @@
 use gtk::gio::prelude::ApplicationExtManual;
 use maruzzella::{
     CommandSpec, LauncherSpec, MaruzzellaConfig, MenuItemSpec, MenuRootSpec, PanelResizePolicy,
-    ShellChrome, ShellMode, TabGroupSpec, ToolbarDisplayMode, ToolbarItemSpec, ToolbarOptionSpec,
-    WorkbenchNodeSpec, WorkspaceSession, build_application_with_handle, default_product_spec,
-    load_static_plugin, plugin_tab,
+    ShellChrome, ShellMode, ShellSpec, TabGroupSpec, TabSpec, ToolbarDisplayMode, ToolbarItemSpec,
+    ToolbarOptionSpec, WorkbenchNodeSpec, WorkspaceSession, build_application_with_handle,
+    default_product_spec, layout, load_static_plugin, plugin_tab,
 };
+
+const PERSISTENCE_ID: &str = "pv-estimator-desktop";
+const WORKSPACE_SLOT: &str = "workspace";
+const WORKBENCH_GROUP_ID: &str = "workbench-main";
+const ESTIMATE_TAB_ID: &str = "estimate";
+const ESTIMATE_VIEW_ID: &str = "com.lelloman.pv_estimator.estimate";
+const SIMULATION_TAB_ID: &str = "simulation";
+const SIMULATION_VIEW_ID: &str = "com.lelloman.pv_estimator.simulation";
 
 fn main() {
     let mut product = default_product_spec();
@@ -120,43 +128,26 @@ fn main() {
     product.layout.right_panel = TabGroupSpec::new("panel-right", None, Vec::new());
     product.layout.bottom_panel = TabGroupSpec::new("panel-bottom", None, Vec::new());
     product.layout.workbench = WorkbenchNodeSpec::Group(
-        TabGroupSpec::new(
-            "workbench-main",
-            Some("estimate"),
-            vec![
-                plugin_tab(
-                    "estimate",
-                    "workbench-main",
-                    "Estimate",
-                    "com.lelloman.pv_estimator.estimate",
-                    "The PV estimate view could not be created.",
-                    false,
-                ),
-                plugin_tab(
-                    "simulation",
-                    "workbench-main",
-                    "Simulation",
-                    "com.lelloman.pv_estimator.simulation",
-                    "The PV simulation view could not be created.",
-                    false,
-                ),
-            ],
-        )
-        .with_panel_appearance("workbench")
-        .with_panel_header_appearance("secondary")
-        .with_tab_strip_appearance("editor"),
+        TabGroupSpec::new("workbench-main", Some("estimate"), project_workbench_tabs())
+            .with_panel_appearance("workbench")
+            .with_panel_header_appearance("secondary")
+            .with_tab_strip_appearance("editor"),
     );
 
     let project_shell = product.shell_spec();
     let launcher = no_project_launcher(&product);
-    let startup_mode = if pv_desktop_plugin::has_restorable_desktop_session() {
+    let has_restorable_session = pv_desktop_plugin::has_restorable_desktop_session();
+    if has_restorable_session {
+        repair_empty_workspace_workbench(&project_shell);
+    }
+    let startup_mode = if has_restorable_session {
         ShellMode::Workspace
     } else {
         ShellMode::Launcher
     };
 
     let config = MaruzzellaConfig::new("com.lelloman.pv-estimator.desktop")
-        .with_persistence_id("pv-estimator-desktop")
+        .with_persistence_id(PERSISTENCE_ID)
         .with_product(product)
         .with_startup_mode(startup_mode)
         .with_launcher(launcher)
@@ -166,13 +157,27 @@ fn main() {
     let (application, handle) = build_application_with_handle(config);
     let workspace_handle = handle.clone();
     let launcher_handle = handle.clone();
+    let estimate_handle = handle.clone();
+    let simulation_handle = handle.clone();
+    let workspace_shell = project_shell.clone();
+    let estimate_shell = project_shell.clone();
+    let simulation_shell = project_shell.clone();
     pv_desktop_plugin::install_shell_mode_handlers(
         move || {
-            let _ =
-                workspace_handle.switch_to_workspace(WorkspaceSession::new(project_shell.clone()));
+            switch_to_project_workspace(&workspace_handle, &workspace_shell);
         },
         move || {
             let _ = launcher_handle.switch_to_launcher();
+        },
+        move || {
+            ensure_workbench_tab(&estimate_handle, &estimate_shell, estimate_workbench_tab());
+        },
+        move || {
+            ensure_workbench_tab(
+                &simulation_handle,
+                &simulation_shell,
+                simulation_workbench_tab(),
+            );
         },
     );
     application.run();
@@ -184,6 +189,177 @@ fn workspace_chrome() -> ShellChrome {
         show_toolbar: true,
         show_search: false,
     }
+}
+
+fn project_workbench_tabs() -> Vec<TabSpec> {
+    vec![estimate_workbench_tab(), simulation_workbench_tab()]
+}
+
+fn estimate_workbench_tab() -> TabSpec {
+    plugin_tab(
+        ESTIMATE_TAB_ID,
+        WORKBENCH_GROUP_ID,
+        "Estimate",
+        ESTIMATE_VIEW_ID,
+        "The PV estimate view could not be created.",
+        true,
+    )
+}
+
+fn simulation_workbench_tab() -> TabSpec {
+    plugin_tab(
+        SIMULATION_TAB_ID,
+        WORKBENCH_GROUP_ID,
+        "Simulation",
+        SIMULATION_VIEW_ID,
+        "The PV simulation view could not be created.",
+        true,
+    )
+}
+
+fn switch_to_project_workspace(handle: &maruzzella::MaruzzellaHandle, default_shell: &ShellSpec) {
+    let spec = repaired_workspace_spec(default_shell);
+    let _ = handle.switch_to_workspace(WorkspaceSession::new(spec));
+}
+
+fn repair_empty_workspace_workbench(default_shell: &ShellSpec) {
+    let _ = repaired_workspace_spec(default_shell);
+}
+
+fn repaired_workspace_spec(default_shell: &ShellSpec) -> ShellSpec {
+    let workspace_persistence_id = layout::scoped_persistence_id(PERSISTENCE_ID, WORKSPACE_SLOT);
+    let mut shell = layout::load_for_slot(PERSISTENCE_ID, WORKSPACE_SLOT, default_shell);
+    let mut changed = normalize_empty_workbench_groups(&mut shell.spec.workbench);
+    if ensure_workbench_has_any_tab(&mut shell.spec.workbench) {
+        changed = true;
+    }
+    if changed {
+        layout::save(&workspace_persistence_id, &shell);
+    }
+    shell.spec
+}
+
+fn ensure_workbench_has_any_tab(node: &mut WorkbenchNodeSpec) -> bool {
+    if workbench_has_tabs(node) {
+        false
+    } else {
+        *node = WorkbenchNodeSpec::Group(
+            TabGroupSpec::new(WORKBENCH_GROUP_ID, None, Vec::new())
+                .with_panel_appearance("workbench")
+                .with_panel_header_appearance("secondary")
+                .with_tab_strip_appearance("editor"),
+        );
+        insert_tab_in_first_workbench_group(node, estimate_workbench_tab())
+    }
+}
+
+fn normalize_empty_workbench_groups(node: &mut WorkbenchNodeSpec) -> bool {
+    normalize_empty_workbench_node(node).1
+}
+
+fn normalize_empty_workbench_node(node: &mut WorkbenchNodeSpec) -> (bool, bool) {
+    match node {
+        WorkbenchNodeSpec::Group(group) => (group.tabs.is_empty(), false),
+        WorkbenchNodeSpec::Split { children, .. } => {
+            let mut changed = false;
+            let mut index = 0usize;
+            while index < children.len() {
+                let (empty, child_changed) = normalize_empty_workbench_node(&mut children[index]);
+                changed |= child_changed;
+                if empty {
+                    children.remove(index);
+                    changed = true;
+                } else {
+                    index += 1;
+                }
+            }
+            if children.is_empty() {
+                (true, changed)
+            } else if children.len() == 1 {
+                *node = children.remove(0);
+                (false, true)
+            } else {
+                (false, changed)
+            }
+        }
+    }
+}
+
+fn workbench_has_tabs(node: &WorkbenchNodeSpec) -> bool {
+    match node {
+        WorkbenchNodeSpec::Group(group) => !group.tabs.is_empty(),
+        WorkbenchNodeSpec::Split { children, .. } => children.iter().any(workbench_has_tabs),
+    }
+}
+
+fn ensure_workbench_tab(
+    handle: &maruzzella::MaruzzellaHandle,
+    default_shell: &ShellSpec,
+    tab: TabSpec,
+) {
+    let workspace_persistence_id = layout::scoped_persistence_id(PERSISTENCE_ID, WORKSPACE_SLOT);
+    let mut shell = layout::load_for_slot(PERSISTENCE_ID, WORKSPACE_SLOT, default_shell);
+    if !ensure_tab_active_in_workbench(&mut shell.spec.workbench, tab) {
+        return;
+    }
+
+    let spec = shell.spec.clone();
+    layout::save(&workspace_persistence_id, &shell);
+    let _ = handle.switch_to_workspace(WorkspaceSession::new(spec));
+}
+
+fn ensure_tab_active_in_workbench(node: &mut WorkbenchNodeSpec, tab: TabSpec) -> bool {
+    if let Some(changed) = activate_existing_workbench_tab(node, &tab) {
+        return changed;
+    }
+    insert_tab_in_first_workbench_group(node, tab)
+}
+
+fn activate_existing_workbench_tab(node: &mut WorkbenchNodeSpec, tab: &TabSpec) -> Option<bool> {
+    match node {
+        WorkbenchNodeSpec::Group(group) => {
+            let tab_id = group
+                .tabs
+                .iter()
+                .find(|candidate| tab_matches(candidate, tab))
+                .map(|candidate| candidate.id.clone())?;
+            if group.active_tab_id.as_deref() == Some(tab_id.as_str()) {
+                Some(false)
+            } else {
+                group.active_tab_id = Some(tab_id);
+                Some(true)
+            }
+        }
+        WorkbenchNodeSpec::Split { children, .. } => children
+            .iter_mut()
+            .find_map(|child| activate_existing_workbench_tab(child, tab)),
+    }
+}
+
+fn insert_tab_in_first_workbench_group(node: &mut WorkbenchNodeSpec, mut tab: TabSpec) -> bool {
+    match node {
+        WorkbenchNodeSpec::Group(group) => {
+            tab.panel_id = group.id.clone();
+            let tab_id = tab.id.clone();
+            group.tabs.push(tab);
+            group.active_tab_id = Some(tab_id);
+            true
+        }
+        WorkbenchNodeSpec::Split { children, .. } => children
+            .iter_mut()
+            .any(|child| insert_tab_in_first_workbench_group(child, tab.clone())),
+    }
+}
+
+fn tab_matches(candidate: &TabSpec, tab: &TabSpec) -> bool {
+    candidate.id == tab.id
+        || match (
+            candidate.plugin_view_id.as_deref(),
+            tab.plugin_view_id.as_deref(),
+        ) {
+            (Some(candidate_view_id), Some(view_id)) => candidate_view_id == view_id,
+            _ => false,
+        }
 }
 
 fn no_project_launcher(product: &maruzzella::ProductSpec) -> LauncherSpec {

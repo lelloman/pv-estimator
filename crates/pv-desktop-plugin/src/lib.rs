@@ -80,6 +80,8 @@ impl Default for DesktopState {
 struct ShellModeHandlers {
     show_workspace: Box<dyn Fn()>,
     show_launcher: Box<dyn Fn()>,
+    show_estimate_panel: Box<dyn Fn()>,
+    show_simulation_panel: Box<dyn Fn()>,
 }
 
 thread_local! {
@@ -95,11 +97,15 @@ thread_local! {
 pub fn install_shell_mode_handlers(
     show_workspace: impl Fn() + 'static,
     show_launcher: impl Fn() + 'static,
+    show_estimate_panel: impl Fn() + 'static,
+    show_simulation_panel: impl Fn() + 'static,
 ) {
     SHELL_MODE_HANDLERS.with(|handlers| {
         *handlers.borrow_mut() = Some(ShellModeHandlers {
             show_workspace: Box::new(show_workspace),
             show_launcher: Box::new(show_launcher),
+            show_estimate_panel: Box::new(show_estimate_panel),
+            show_simulation_panel: Box::new(show_simulation_panel),
         });
     });
 }
@@ -287,6 +293,8 @@ extern "C" fn command_run_estimate(
         return maruzzella_sdk::ffi::MzStatus::OK;
     }
 
+    show_estimate_workbench_panel();
+
     match run_estimate() {
         Ok(()) => maruzzella_sdk::ffi::MzStatus::OK,
         Err(message) => {
@@ -300,6 +308,14 @@ extern "C" fn command_run_estimate(
 extern "C" fn command_run_simulation(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
+    if !has_open_project() {
+        append_log("Open or create a project first".to_string());
+        refresh_views();
+        return maruzzella_sdk::ffi::MzStatus::OK;
+    }
+
+    show_simulation_workbench_panel();
+
     match run_simulation() {
         Ok(()) => maruzzella_sdk::ffi::MzStatus::OK,
         Err(RunSimulationError::NeedsProject) => {
@@ -608,6 +624,22 @@ fn show_no_project_launcher() {
     SHELL_MODE_HANDLERS.with(|handlers| {
         if let Some(handlers) = handlers.borrow().as_ref() {
             (handlers.show_launcher)();
+        }
+    });
+}
+
+fn show_estimate_workbench_panel() {
+    SHELL_MODE_HANDLERS.with(|handlers| {
+        if let Some(handlers) = handlers.borrow().as_ref() {
+            (handlers.show_estimate_panel)();
+        }
+    });
+}
+
+fn show_simulation_workbench_panel() {
+    SHELL_MODE_HANDLERS.with(|handlers| {
+        if let Some(handlers) = handlers.borrow().as_ref() {
+            (handlers.show_simulation_panel)();
         }
     });
 }
