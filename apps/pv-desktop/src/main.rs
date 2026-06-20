@@ -74,6 +74,14 @@ fn main() {
         command("pv.app.exit", "Exit"),
     ];
     product.toolbar_items = vec![
+        toolbar_item_with_display(
+            "save",
+            Some("document-save-symbolic"),
+            "Save",
+            "pv.project.save",
+            false,
+            ToolbarDisplayMode::IconAndText,
+        ),
         toolbar_item(
             "estimate",
             Some("x-office-spreadsheet-symbolic"),
@@ -415,6 +423,24 @@ fn toolbar_item(
     command_id: &str,
     secondary: bool,
 ) -> ToolbarItemSpec {
+    toolbar_item_with_display(
+        id,
+        icon_name,
+        label,
+        command_id,
+        secondary,
+        ToolbarDisplayMode::IconOnly,
+    )
+}
+
+fn toolbar_item_with_display(
+    id: &str,
+    icon_name: Option<&str>,
+    label: &str,
+    command_id: &str,
+    secondary: bool,
+    display_mode: ToolbarDisplayMode,
+) -> ToolbarItemSpec {
     ToolbarItemSpec {
         id: id.to_string(),
         icon_name: icon_name.map(str::to_string),
@@ -422,7 +448,7 @@ fn toolbar_item(
         command_id: command_id.to_string(),
         payload: Vec::new(),
         secondary,
-        display_mode: ToolbarDisplayMode::IconOnly,
+        display_mode,
         appearance_id: "toolbar".to_string(),
         options: Vec::new(),
         selected_index: 0,
