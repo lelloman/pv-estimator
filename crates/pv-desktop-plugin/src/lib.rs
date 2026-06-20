@@ -1922,7 +1922,7 @@ fn add_simulation_summary_row(
     summary: MetricSummary,
     kind: SimulationValueKind,
 ) {
-    add_estimate_table_cell(&grid, 0, row, label, 0.0, EstimateTone::Muted);
+    add_estimate_table_cell(grid, 0, row, label, 0.0, EstimateTone::Muted);
     add_estimate_table_cell(
         grid,
         1,
@@ -1984,7 +1984,7 @@ fn simulation_scenario_table(result: &SimulationResult) -> Grid {
 }
 
 fn add_simulation_scenario_row(grid: &Grid, row: i32, label: &str, metrics: SimulationRunMetrics) {
-    add_estimate_table_cell(&grid, 0, row, label, 0.0, EstimateTone::Muted);
+    add_estimate_table_cell(grid, 0, row, label, 0.0, EstimateTone::Muted);
     add_estimate_table_cell(
         grid,
         1,
