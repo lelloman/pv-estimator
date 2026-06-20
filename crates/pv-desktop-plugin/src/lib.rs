@@ -47,6 +47,7 @@ const CMD_RUN_ESTIMATE: &str = "pv.project.run_estimate";
 const CMD_RUN_SIMULATION: &str = "pv.project.run_simulation";
 const CMD_SET_SIMULATION_RUNS: &str = "pv.project.set_simulation_runs";
 const CMD_EXIT: &str = "pv.app.exit";
+const SAVE_ACTION_IDS: &[&str] = &["pv-project-save", "file-save", "save"];
 
 #[derive(Clone, Debug)]
 struct DesktopState {
@@ -145,7 +146,7 @@ impl Plugin for PvDesktopPlugin {
         host.register_command(
             CommandSpec::new(PLUGIN_ID, CMD_SAVE, "Save Project")
                 .with_handler(command_save_project)
-                .with_enabled(has_open_project_for_command),
+                .with_enabled(has_dirty_project_for_command),
         )?;
         host.register_command(
             CommandSpec::new(PLUGIN_ID, CMD_SAVE_AS, "Save Project As")
@@ -563,6 +564,18 @@ extern "C" fn has_open_project_for_command() -> bool {
     has_open_project()
 }
 
+extern "C" fn has_dirty_project_for_command() -> bool {
+    has_dirty_project()
+}
+
+fn has_dirty_project() -> bool {
+    ensure_session_loaded();
+    STATE.with(|state| {
+        let state = state.borrow();
+        state.project.is_some() && state.dirty
+    })
+}
+
 fn has_open_project() -> bool {
     ensure_session_loaded();
     STATE.with(|state| state.borrow().project.is_some())
@@ -965,6 +978,24 @@ fn refresh_views() {
 fn refresh_workbench_views() {
     refresh_view_group(&ESTIMATE_VIEWS, render_estimate_into);
     refresh_view_group(&SIMULATION_VIEWS, render_simulation_into);
+    refresh_save_action_enabled();
+}
+
+fn refresh_save_action_enabled() {
+    let enabled = has_dirty_project();
+    let Some(window) =
+        active_window().and_then(|window| window.downcast::<gtk::ApplicationWindow>().ok())
+    else {
+        return;
+    };
+    for action_id in SAVE_ACTION_IDS {
+        if let Some(action) = window
+            .lookup_action(action_id)
+            .and_then(|action| action.downcast::<gtk::gio::SimpleAction>().ok())
+        {
+            action.set_enabled(enabled);
+        }
+    }
 }
 
 fn refresh_view_group(
