@@ -18,8 +18,8 @@ use maruzzella_sdk::{
     PluginDescriptor, SurfaceContributionSpec, Version, ViewFactorySpec, export_plugin,
 };
 use pv_core::simulation::{
-    BuiltInLoadShapeId, LoadProfile, LoadShape, ProductionProfile, SimulationRequest,
-    StorageConfig, simulate,
+    BuiltInLoadShapeId, LoadProfile, LoadShape, MetricSummary, ProductionProfile,
+    SimulationRequest, SimulationResult, SimulationRunMetrics, StorageConfig, simulate,
 };
 use pv_core::source_model::SourceEnsembleEstimateDocument;
 use pv_data::{CitySearchResult, search_cities};
@@ -308,6 +308,10 @@ extern "C" fn command_run_estimate(
 extern "C" fn command_run_simulation(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
+    run_simulation_action()
+}
+
+fn run_simulation_action() -> maruzzella_sdk::ffi::MzStatus {
     if !has_open_project() {
         append_log("Open or create a project first".to_string());
         refresh_views();
@@ -1777,37 +1781,305 @@ fn render_simulation_into(root: &GtkBox) {
         root.append(&scroller);
         return;
     };
-    content.append(&header_label("Simulation"));
-    content.append(&meta_label(&state.status));
-    content.append(&section_separator());
     if let Some(result) = &project.results.simulation {
-        content.append(&metric_label(
-            "Completed runs",
-            &format!("{} / {}", result.completed_runs, result.requested_runs),
-        ));
-        content.append(&metric_label(
-            "Self consumption",
-            &percent(result.summaries.self_consumption_ratio.p50),
-        ));
-        content.append(&metric_label(
-            "Self sufficiency",
-            &percent(result.summaries.self_sufficiency_ratio.p50),
-        ));
-        content.append(&metric_label(
-            "Grid import",
-            &format!("{:.0} kWh", result.summaries.grid_import_kwh.p50),
-        ));
-        content.append(&metric_label(
-            "Grid export",
-            &format!("{:.0} kWh", result.summaries.grid_export_kwh.p50),
-        ));
+        append_simulation_result(&content, result);
     } else {
-        content.append(&body_label(
-            "No simulation yet. Run an estimate first, then Run Simulation.",
-        ));
+        append_simulation_empty_state(&content);
     }
     scroller.set_child(Some(&content));
     root.append(&scroller);
+}
+
+fn append_simulation_result(content: &GtkBox, result: &SimulationResult) {
+    content.append(&simulation_run_summary(result));
+    content.append(&section_separator());
+    content.append(&simulation_summary_table(result));
+    content.append(&section_separator());
+    content.append(&simulation_scenario_table(result));
+}
+
+fn simulation_run_summary(result: &SimulationResult) -> Grid {
+    let status = if result.cancelled {
+        "Cancelled"
+    } else {
+        "Completed"
+    };
+    let grid = Grid::new();
+    grid.set_column_spacing(18);
+    grid.set_row_spacing(8);
+    grid.set_hexpand(true);
+    add_estimate_metric_row(&grid, 0, "Status", status, EstimateTone::Strong);
+    add_estimate_metric_row(
+        &grid,
+        1,
+        "Runs",
+        &format!("{} / {}", result.completed_runs, result.requested_runs),
+        EstimateTone::Normal,
+    );
+    grid
+}
+
+fn simulation_summary_table(result: &SimulationResult) -> Grid {
+    let grid = Grid::new();
+    grid.set_column_spacing(14);
+    grid.set_row_spacing(5);
+    grid.set_hexpand(true);
+    grid.set_column_homogeneous(true);
+
+    add_estimate_table_header(&grid, 0, 0, "Metric", 0.0);
+    add_estimate_table_header(&grid, 1, 0, "mean", 1.0);
+    add_estimate_table_header(&grid, 2, 0, "p50", 1.0);
+    add_estimate_table_header(&grid, 3, 0, "p10", 1.0);
+    add_estimate_table_header(&grid, 4, 0, "p90", 1.0);
+
+    let summaries = &result.summaries;
+    let rows = [
+        (
+            "Production kWh",
+            summaries.production_kwh,
+            SimulationValueKind::Kwh,
+        ),
+        ("Load kWh", summaries.load_kwh, SimulationValueKind::Kwh),
+        (
+            "Self consumed kWh",
+            summaries.self_consumed_kwh,
+            SimulationValueKind::Kwh,
+        ),
+        (
+            "Grid import kWh",
+            summaries.grid_import_kwh,
+            SimulationValueKind::Kwh,
+        ),
+        (
+            "Grid export kWh",
+            summaries.grid_export_kwh,
+            SimulationValueKind::Kwh,
+        ),
+        (
+            "Battery losses kWh",
+            summaries.battery_losses_kwh,
+            SimulationValueKind::Kwh,
+        ),
+        (
+            "Ending charge kWh",
+            summaries.ending_soc_kwh,
+            SimulationValueKind::Kwh,
+        ),
+        (
+            "Self consumption %",
+            summaries.self_consumption_ratio,
+            SimulationValueKind::Percent,
+        ),
+        (
+            "Self sufficiency %",
+            summaries.self_sufficiency_ratio,
+            SimulationValueKind::Percent,
+        ),
+    ];
+
+    for (index, (label, summary, kind)) in rows.iter().enumerate() {
+        add_simulation_summary_row(&grid, index as i32 + 1, label, *summary, *kind);
+    }
+
+    grid
+}
+
+fn add_simulation_summary_row(
+    grid: &Grid,
+    row: i32,
+    label: &str,
+    summary: MetricSummary,
+    kind: SimulationValueKind,
+) {
+    add_estimate_table_cell(&grid, 0, row, label, 0.0, EstimateTone::Muted);
+    add_estimate_table_cell(
+        grid,
+        1,
+        row,
+        &format_simulation_value(summary.mean, kind),
+        1.0,
+        EstimateTone::Mean,
+    );
+    add_estimate_table_cell(
+        grid,
+        2,
+        row,
+        &format_simulation_value(summary.p50, kind),
+        1.0,
+        EstimateTone::Strong,
+    );
+    add_estimate_table_cell(
+        grid,
+        3,
+        row,
+        &format_simulation_value(summary.p10, kind),
+        1.0,
+        EstimateTone::Normal,
+    );
+    add_estimate_table_cell(
+        grid,
+        4,
+        row,
+        &format_simulation_value(summary.p90, kind),
+        1.0,
+        EstimateTone::Normal,
+    );
+}
+
+fn simulation_scenario_table(result: &SimulationResult) -> Grid {
+    let grid = Grid::new();
+    grid.set_column_spacing(14);
+    grid.set_row_spacing(5);
+    grid.set_hexpand(true);
+    grid.set_column_homogeneous(true);
+
+    add_estimate_table_group_header(&grid, 1, 7, "kWh");
+    add_estimate_table_group_header(&grid, 8, 2, "%");
+    add_estimate_table_header(&grid, 0, 1, "Case", 0.0);
+    add_estimate_table_header(&grid, 1, 1, "prod", 1.0);
+    add_estimate_table_header(&grid, 2, 1, "load", 1.0);
+    add_estimate_table_header(&grid, 3, 1, "self", 1.0);
+    add_estimate_table_header(&grid, 4, 1, "import", 1.0);
+    add_estimate_table_header(&grid, 5, 1, "export", 1.0);
+    add_estimate_table_header(&grid, 6, 1, "loss", 1.0);
+    add_estimate_table_header(&grid, 7, 1, "end", 1.0);
+    add_estimate_table_header(&grid, 8, 1, "cons", 1.0);
+    add_estimate_table_header(&grid, 9, 1, "suff", 1.0);
+
+    add_simulation_scenario_row(&grid, 2, "Low", result.scenarios.low);
+    add_simulation_scenario_row(&grid, 3, "Mean", result.scenarios.mean);
+    add_simulation_scenario_row(&grid, 4, "High", result.scenarios.high);
+    grid
+}
+
+fn add_simulation_scenario_row(grid: &Grid, row: i32, label: &str, metrics: SimulationRunMetrics) {
+    add_estimate_table_cell(&grid, 0, row, label, 0.0, EstimateTone::Muted);
+    add_estimate_table_cell(
+        grid,
+        1,
+        row,
+        &format_kwh_value(metrics.production_kwh),
+        1.0,
+        EstimateTone::Normal,
+    );
+    add_estimate_table_cell(
+        grid,
+        2,
+        row,
+        &format_kwh_value(metrics.load_kwh),
+        1.0,
+        EstimateTone::Normal,
+    );
+    add_estimate_table_cell(
+        grid,
+        3,
+        row,
+        &format_kwh_value(metrics.self_consumed_kwh),
+        1.0,
+        EstimateTone::Normal,
+    );
+    add_estimate_table_cell(
+        grid,
+        4,
+        row,
+        &format_kwh_value(metrics.grid_import_kwh),
+        1.0,
+        EstimateTone::Normal,
+    );
+    add_estimate_table_cell(
+        grid,
+        5,
+        row,
+        &format_kwh_value(metrics.grid_export_kwh),
+        1.0,
+        EstimateTone::Normal,
+    );
+    add_estimate_table_cell(
+        grid,
+        6,
+        row,
+        &format_kwh_value(metrics.battery_losses_kwh),
+        1.0,
+        EstimateTone::Normal,
+    );
+    add_estimate_table_cell(
+        grid,
+        7,
+        row,
+        &format_kwh_value(metrics.ending_soc_kwh),
+        1.0,
+        EstimateTone::Normal,
+    );
+    add_estimate_table_cell(
+        grid,
+        8,
+        row,
+        &format_percent_value(metrics.self_consumption_ratio),
+        1.0,
+        EstimateTone::Mean,
+    );
+    add_estimate_table_cell(
+        grid,
+        9,
+        row,
+        &format_percent_value(metrics.self_sufficiency_ratio),
+        1.0,
+        EstimateTone::Mean,
+    );
+}
+
+#[derive(Clone, Copy)]
+enum SimulationValueKind {
+    Kwh,
+    Percent,
+}
+
+fn format_simulation_value(value: f64, kind: SimulationValueKind) -> String {
+    match kind {
+        SimulationValueKind::Kwh => format_kwh_value(value),
+        SimulationValueKind::Percent => format_percent_value(value),
+    }
+}
+
+fn format_kwh_value(value: f64) -> String {
+    format!("{value:.0}")
+}
+
+fn format_percent_value(value: f64) -> String {
+    format!("{:.0}%", value * 100.0)
+}
+
+fn append_simulation_empty_state(content: &GtkBox) {
+    content.append(&simulation_empty_label());
+    let run = Button::new();
+    run.set_halign(Align::Start);
+    run.set_tooltip_text(Some("Run simulation"));
+    run.set_size_request(96, 40);
+    run.add_css_class("suggested-action");
+    run.set_child(Some(&simulation_run_button_content()));
+    run.connect_clicked(|_| {
+        let _ = run_simulation_action();
+    });
+    content.append(&run);
+}
+
+fn simulation_run_button_content() -> GtkBox {
+    let content = GtkBox::new(Orientation::Horizontal, 8);
+    content.set_margin_top(7);
+    content.set_margin_bottom(7);
+    content.set_margin_start(12);
+    content.set_margin_end(14);
+    let icon = Image::from_icon_name("media-playback-start-symbolic");
+    icon.set_icon_size(gtk::IconSize::Normal);
+    content.append(&icon);
+    content.append(&Label::new(Some("Run")));
+    content
+}
+
+fn simulation_empty_label() -> Label {
+    let label = body_label("No simulation run yet.");
+    label.add_css_class("title-4");
+    label
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2323,20 +2595,6 @@ fn meta_label(text: &str) -> Label {
     label
 }
 
-fn metric_label(label: &str, value: &str) -> GtkBox {
-    let row = GtkBox::new(Orientation::Horizontal, 12);
-    row.set_hexpand(true);
-    let left = Label::new(Some(label));
-    left.set_xalign(0.0);
-    left.set_hexpand(true);
-    let right = Label::new(Some(value));
-    right.set_xalign(1.0);
-    right.add_css_class("monospace");
-    row.append(&left);
-    row.append(&right);
-    row
-}
-
 fn section_separator() -> Separator {
     Separator::new(Orientation::Horizontal)
 }
@@ -2375,10 +2633,6 @@ fn add_table_cell(grid: &Grid, column: i32, row: i32, text: &str, xalign: f32, e
         label.add_css_class("monospace");
     }
     grid.attach(&label, column, row, 1, 1);
-}
-
-fn percent(value: f64) -> String {
-    format!("{:.0}%", value * 100.0)
 }
 
 fn load_shape(load_profile: &LoadProfile) -> LoadShape {
