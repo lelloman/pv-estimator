@@ -4,6 +4,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 
 const HOURS_PER_YEAR: usize = 8760;
 #[cfg(test)]
@@ -238,17 +239,17 @@ pub fn simulate_with_progress(
                     let end = start
                         .saturating_add(SIMULATION_BATCH_RUNS)
                         .min(requested_runs);
-                    let batch = (start..end)
-                        .map(|run_index| {
-                            (
-                                run_index,
-                                simulate_run_index(
-                                    production, load, capacity, base_seed, run_index,
-                                ),
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    if sender.send(batch).is_err() {
+                    let mut batch = Vec::with_capacity(end - start);
+                    for run_index in start..end {
+                        if cancel_flag.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        batch.push((
+                            run_index,
+                            simulate_run_index(production, load, capacity, base_seed, run_index),
+                        ));
+                    }
+                    if batch.is_empty() || sender.send(batch).is_err() {
                         break;
                     }
                 }
@@ -257,8 +258,16 @@ pub fn simulate_with_progress(
         drop(sender);
 
         while completed_runs < requested_runs {
-            let Ok(batch) = receiver.recv() else {
-                break;
+            let batch = match receiver.recv_timeout(Duration::from_millis(50)) {
+                Ok(batch) => batch,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if cancelled() {
+                        cancel_flag.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             };
             let mut batch_completed = 0;
             for (run_index, metrics) in batch {

@@ -193,6 +193,20 @@ mod tests {
     }
 
     #[test]
+    fn project_save_load_preserves_simulation_runs() {
+        let mut project = PvProjectDocument::default();
+        project.inputs.simulation_options.runs = 1_000_000;
+        let path =
+            std::env::temp_dir().join(format!("pv-estimator-runs-{}.pvproj", std::process::id()));
+
+        save_project(&path, &project).expect("save project");
+        let restored = load_project(&path).expect("load project");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(restored.inputs.simulation_options.runs, 1_000_000);
+    }
+
+    #[test]
     fn rejects_wrong_kind() {
         let project = PvProjectDocument {
             kind: "wrong".to_string(),

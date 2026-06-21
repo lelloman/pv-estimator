@@ -4,14 +4,19 @@ use std::cell::RefCell;
 use std::ffi::c_void;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 use directories::ProjectDirs;
 use gtk::glib::translate::IntoGlibPtr;
 use gtk::prelude::*;
 use gtk::{
     Align, Box as GtkBox, Button, DropDown, Entry, FileChooserAction, FileChooserDialog,
-    FileFilter, Grid, Image, Label, ListBox, Orientation, PolicyType, Popover, ResponseType,
-    ScrolledWindow, SelectionMode, Separator, Window,
+    FileFilter, Grid, Image, Label, ListBox, Orientation, PolicyType, Popover, ProgressBar,
+    ResponseType, ScrolledWindow, SelectionMode, Separator, Window,
 };
 use maruzzella_sdk::{
     CommandSpec, HostApi, MzStatusCode, MzViewPlacement, Plugin, PluginDependency,
@@ -19,7 +24,8 @@ use maruzzella_sdk::{
 };
 use pv_core::simulation::{
     BuiltInLoadShapeId, LoadProfile, LoadShape, MetricSummary, ProductionProfile,
-    SimulationRequest, SimulationResult, SimulationRunMetrics, StorageConfig, simulate,
+    SimulationRequest, SimulationResult, SimulationRunMetrics, StorageConfig,
+    simulate_with_progress,
 };
 use pv_core::source_model::SourceEnsembleEstimateDocument;
 use pv_data::{CitySearchResult, search_cities};
@@ -57,6 +63,7 @@ struct DesktopState {
     status: String,
     log: Vec<String>,
     session_loaded: bool,
+    simulation_generation: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +81,7 @@ impl Default for DesktopState {
             status: "No project open".to_string(),
             log: vec!["No project open".to_string()],
             session_loaded: false,
+            simulation_generation: 0,
         }
     }
 }
@@ -85,11 +93,44 @@ struct ShellModeHandlers {
     show_simulation_panel: Box<dyn Fn()>,
 }
 
+struct SimulationRunState {
+    requested_runs: usize,
+    completed_runs: usize,
+    cancel: Arc<AtomicBool>,
+    cancelling: bool,
+    receiver: mpsc::Receiver<SimulationRunMessage>,
+    generation: u64,
+}
+
+#[derive(Debug)]
+enum SimulationRunMessage {
+    Progress(usize),
+    Finished(Result<SimulationResult, String>),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SimulationRunSnapshot {
+    requested_runs: usize,
+    completed_runs: usize,
+    cancelling: bool,
+}
+
+struct SimulationProgressWidgets {
+    heading: gtk::glib::WeakRef<Label>,
+    count: gtk::glib::WeakRef<Label>,
+    progress: gtk::glib::WeakRef<ProgressBar>,
+    status: gtk::glib::WeakRef<Label>,
+    cancel: gtk::glib::WeakRef<Button>,
+    cancel_label: gtk::glib::WeakRef<Label>,
+}
+
 thread_local! {
     static STATE: RefCell<DesktopState> = RefCell::new(DesktopState::default());
     static ESTIMATOR: RefCell<Option<SourceModelEstimator>> = const { RefCell::new(None) };
     static SHELL_MODE_HANDLERS: RefCell<Option<ShellModeHandlers>> = const { RefCell::new(None) };
     static ACTIVE_FILE_CHOOSER: RefCell<Option<FileChooserDialog>> = const { RefCell::new(None) };
+    static SIMULATION_RUN: RefCell<Option<SimulationRunState>> = const { RefCell::new(None) };
+    static SIMULATION_PROGRESS_VIEWS: RefCell<Vec<SimulationProgressWidgets>> = const { RefCell::new(Vec::new()) };
     static SYSTEM_VIEWS: RefCell<Vec<gtk::glib::WeakRef<GtkBox>>> = const { RefCell::new(Vec::new()) };
     static ESTIMATE_VIEWS: RefCell<Vec<gtk::glib::WeakRef<GtkBox>>> = const { RefCell::new(Vec::new()) };
     static SIMULATION_VIEWS: RefCell<Vec<gtk::glib::WeakRef<GtkBox>>> = const { RefCell::new(Vec::new()) };
@@ -222,6 +263,7 @@ extern "C" fn command_new_project(
 fn create_new_project() {
     STATE.with(|state| {
         let mut state = state.borrow_mut();
+        invalidate_running_simulation(&mut state);
         state.project = Some(PvProjectDocument::default());
         state.path = None;
         state.dirty = true;
@@ -333,11 +375,6 @@ fn run_simulation_action() -> maruzzella_sdk::ffi::MzStatus {
             refresh_views();
             maruzzella_sdk::ffi::MzStatus::OK
         }
-        Err(RunSimulationError::Failed(message)) => {
-            append_log(message);
-            refresh_views();
-            maruzzella_sdk::ffi::MzStatus::new(MzStatusCode::InternalError)
-        }
     }
 }
 
@@ -359,25 +396,38 @@ extern "C" fn command_set_simulation_runs(
         return maruzzella_sdk::ffi::MzStatus::new(MzStatusCode::InvalidArgument);
     };
 
-    let updated = STATE.with(|state| {
+    set_simulation_runs(runs);
+    maruzzella_sdk::ffi::MzStatus::OK
+}
+
+fn set_simulation_runs(runs: usize) {
+    STATE.with(|state| {
         let mut state = state.borrow_mut();
         let Some(project) = state.project.as_mut() else {
             let message = "Open or create a project first".to_string();
             state.status = message.clone();
             state.log.push(message);
-            return false;
+            return;
         };
         project.inputs.simulation_options.runs = runs;
-        project.results.simulation = None;
         state.dirty = true;
         let message = format!("Simulation runs set to {}", format_runs(runs));
         state.status = message.clone();
         state.log.push(message);
-        true
     });
     refresh_views();
-    let _ = updated;
-    maruzzella_sdk::ffi::MzStatus::OK
+}
+
+pub fn current_simulation_runs() -> usize {
+    ensure_session_loaded();
+    STATE.with(|state| {
+        state
+            .borrow()
+            .project
+            .as_ref()
+            .map(|project| project.inputs.simulation_options.runs)
+            .unwrap_or(10_000)
+    })
 }
 
 fn simulation_runs_from_payload(payload: maruzzella_sdk::ffi::MzBytes) -> Option<usize> {
@@ -448,12 +498,15 @@ fn store_estimate_result(
 ) {
     STATE.with(|state| {
         let mut state = state.borrow_mut();
-        let Some(project) = state.project.as_mut() else {
-            return;
-        };
-        project.results.estimate = Some(estimate);
-        project.results.production_profile = Some(production_profile);
-        project.results.simulation = None;
+        {
+            let Some(project) = state.project.as_mut() else {
+                return;
+            };
+            project.results.estimate = Some(estimate);
+            project.results.production_profile = Some(production_profile);
+            project.results.simulation = None;
+        }
+        invalidate_running_simulation(&mut state);
         if mark_dirty {
             state.dirty = true;
         }
@@ -501,11 +554,16 @@ fn ensure_estimate_loaded() {
 enum RunSimulationError {
     NeedsProject,
     NeedsEstimate,
-    Failed(String),
 }
 
 fn run_simulation() -> Result<(), RunSimulationError> {
-    let Some((production, load, storage, options)) = STATE.with(|state| {
+    if simulation_run_snapshot().is_some() {
+        append_log("Simulation already running".to_string());
+        refresh_workbench_views();
+        return Ok(());
+    }
+
+    let Some((production, load, storage, options, generation)) = STATE.with(|state| {
         let state = state.borrow();
         state.project.as_ref().map(|project| {
             (
@@ -513,6 +571,7 @@ fn run_simulation() -> Result<(), RunSimulationError> {
                 project.inputs.load_profile.clone(),
                 project.inputs.estimate_request.storage_usable_kwh,
                 project.inputs.simulation_options,
+                state.simulation_generation,
             )
         })
     }) else {
@@ -521,10 +580,7 @@ fn run_simulation() -> Result<(), RunSimulationError> {
     let Some(production) = production else {
         return Err(RunSimulationError::NeedsEstimate);
     };
-    append_log(format!(
-        "Running simulation with {} runs",
-        format_runs(options.runs)
-    ));
+
     let request = SimulationRequest {
         production,
         load,
@@ -533,25 +589,222 @@ fn run_simulation() -> Result<(), RunSimulationError> {
         }),
         options,
     };
-    let result = simulate(&request)
-        .map_err(|error| RunSimulationError::Failed(format!("Simulation failed: {error}")))?;
-    let self_sufficiency = result.summaries.self_sufficiency_ratio.p50;
+    let requested_runs = request.options.runs;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
+    let (sender, receiver) = mpsc::channel();
+
+    thread::spawn(move || {
+        let progress_sender = sender.clone();
+        let progress_step = (requested_runs / 200).max(1);
+        let mut last_reported = 0usize;
+        let result = simulate_with_progress(
+            &request,
+            || worker_cancel.load(Ordering::Relaxed),
+            |completed_runs| {
+                let should_report = completed_runs == 1
+                    || completed_runs == requested_runs
+                    || completed_runs.saturating_sub(last_reported) >= progress_step;
+                if should_report {
+                    last_reported = completed_runs;
+                    let _ = progress_sender.send(SimulationRunMessage::Progress(completed_runs));
+                }
+            },
+        )
+        .map_err(|error| format!("Simulation failed: {error}"));
+        let _ = sender.send(SimulationRunMessage::Finished(result));
+    });
+
+    SIMULATION_RUN.with(|run| {
+        *run.borrow_mut() = Some(SimulationRunState {
+            requested_runs,
+            completed_runs: 0,
+            cancel,
+            cancelling: false,
+            receiver,
+            generation,
+        });
+    });
     STATE.with(|state| {
         let mut state = state.borrow_mut();
-        let Some(project) = state.project.as_mut() else {
+        if let Some(project) = state.project.as_mut() {
+            project.results.simulation = None;
+            state.dirty = true;
+        }
+        let message = format!(
+            "Running simulation with {} runs",
+            format_runs(requested_runs)
+        );
+        state.status = message.clone();
+        state.log.push(message);
+    });
+    schedule_simulation_poll();
+    refresh_workbench_views();
+    Ok(())
+}
+
+fn schedule_simulation_poll() {
+    gtk::glib::timeout_add_local(Duration::from_millis(100), || {
+        poll_simulation_run();
+        if simulation_run_snapshot().is_some() {
+            gtk::glib::ControlFlow::Continue
+        } else {
+            gtk::glib::ControlFlow::Break
+        }
+    });
+}
+
+fn simulation_run_snapshot() -> Option<SimulationRunSnapshot> {
+    SIMULATION_RUN.with(|run| {
+        run.borrow().as_ref().map(|run| SimulationRunSnapshot {
+            requested_runs: run.requested_runs,
+            completed_runs: run.completed_runs,
+            cancelling: run.cancelling,
+        })
+    })
+}
+
+fn cancel_simulation_run() {
+    if request_simulation_cancel() {
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.status = "Cancelling simulation".to_string();
+        });
+        if let Some(run) = simulation_run_snapshot() {
+            update_simulation_progress_views(run);
+        }
+    }
+}
+
+fn request_simulation_cancel() -> bool {
+    SIMULATION_RUN.with(|run| {
+        let mut run = run.borrow_mut();
+        let Some(run) = run.as_mut() else {
+            return false;
+        };
+        run.cancelling = true;
+        run.cancel.store(true, Ordering::Relaxed);
+        true
+    })
+}
+
+fn invalidate_running_simulation(state: &mut DesktopState) {
+    state.simulation_generation = state.simulation_generation.wrapping_add(1);
+    let _ = request_simulation_cancel();
+}
+
+fn poll_simulation_run() {
+    let mut finished = None;
+    let mut progress_changed = false;
+    let mut progress_status = None;
+
+    SIMULATION_RUN.with(|run| {
+        let mut run = run.borrow_mut();
+        let Some(run) = run.as_mut() else {
             return;
         };
-        project.results.simulation = Some(result);
-        state.dirty = true;
-        let status = format!(
-            "Simulation complete: {:.0}% self sufficiency",
-            self_sufficiency * 100.0
-        );
-        state.status = status.clone();
-        state.log.push(status);
+        loop {
+            match run.receiver.try_recv() {
+                Ok(SimulationRunMessage::Progress(completed_runs)) => {
+                    if completed_runs > run.completed_runs {
+                        run.completed_runs = completed_runs.min(run.requested_runs);
+                        progress_changed = true;
+                    }
+                }
+                Ok(SimulationRunMessage::Finished(result)) => {
+                    finished = Some((result, run.generation));
+                    break;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    finished = Some((
+                        Err("Simulation worker disconnected".to_string()),
+                        run.generation,
+                    ));
+                    break;
+                }
+            }
+        }
+        if progress_changed {
+            progress_status = Some(simulation_progress_status(
+                run.completed_runs,
+                run.requested_runs,
+                run.cancelling,
+            ));
+        }
     });
-    refresh_views();
-    Ok(())
+
+    if let Some((result, generation)) = finished {
+        SIMULATION_RUN.with(|run| {
+            run.borrow_mut().take();
+        });
+        finish_simulation_run(result, generation);
+        refresh_workbench_views();
+    } else if let Some(status) = progress_status {
+        STATE.with(|state| {
+            state.borrow_mut().status = status;
+        });
+        if let Some(run) = simulation_run_snapshot() {
+            update_simulation_progress_views(run);
+        }
+    }
+}
+
+fn finish_simulation_run(result: Result<SimulationResult, String>, generation: u64) {
+    match result {
+        Ok(result) => {
+            let self_sufficiency = result.summaries.self_sufficiency_ratio.p50;
+            let status = if result.cancelled {
+                format!(
+                    "Simulation cancelled: {} / {} runs",
+                    format_runs(result.completed_runs),
+                    format_runs(result.requested_runs)
+                )
+            } else {
+                format!(
+                    "Simulation complete: {:.0}% self sufficiency",
+                    self_sufficiency * 100.0
+                )
+            };
+            STATE.with(|state| {
+                let mut state = state.borrow_mut();
+                if state.simulation_generation != generation {
+                    let status = "Simulation result discarded because inputs changed".to_string();
+                    state.status = status.clone();
+                    state.log.push(status);
+                    return;
+                }
+                let Some(project) = state.project.as_mut() else {
+                    return;
+                };
+                project.results.simulation = Some(result);
+                state.dirty = true;
+                state.status = status.clone();
+                state.log.push(status);
+            });
+        }
+        Err(message) => append_log(message),
+    }
+}
+
+fn simulation_progress_status(
+    completed_runs: usize,
+    requested_runs: usize,
+    cancelling: bool,
+) -> String {
+    if cancelling {
+        format!(
+            "Cancelling simulation: {} / {} runs",
+            format_runs(completed_runs),
+            format_runs(requested_runs)
+        )
+    } else {
+        format!(
+            "Simulation running: {} / {} runs",
+            format_runs(completed_runs),
+            format_runs(requested_runs)
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -616,6 +869,7 @@ fn open_project(path: PathBuf) {
 fn close_project() {
     STATE.with(|state| {
         let mut state = state.borrow_mut();
+        invalidate_running_simulation(&mut state);
         state.project = None;
         state.path = None;
         state.dirty = false;
@@ -666,6 +920,7 @@ fn load_project_into_state(path: &Path, remember: bool) -> bool {
         Ok(project) => {
             STATE.with(|state| {
                 let mut state = state.borrow_mut();
+                invalidate_running_simulation(&mut state);
                 state.project = Some(project);
                 state.path = Some(path.to_path_buf());
                 state.dirty = false;
@@ -1812,13 +2067,178 @@ fn render_simulation_into(root: &GtkBox) {
         root.append(&scroller);
         return;
     };
-    if let Some(result) = &project.results.simulation {
+    if let Some(run) = simulation_run_snapshot() {
+        append_simulation_progress(&content, run);
+    } else if let Some(result) = &project.results.simulation {
         append_simulation_result(&content, result);
     } else {
         append_simulation_empty_state(&content);
     }
     scroller.set_child(Some(&content));
     root.append(&scroller);
+}
+
+fn append_simulation_progress(content: &GtkBox, run: SimulationRunSnapshot) {
+    let heading = section_label(simulation_progress_heading(run.cancelling));
+    content.append(&heading);
+
+    let row = GtkBox::new(Orientation::Horizontal, 12);
+    row.set_hexpand(true);
+
+    let progress_column = GtkBox::new(Orientation::Vertical, 6);
+    progress_column.set_hexpand(true);
+    progress_column.set_halign(Align::Fill);
+
+    let count = meta_label(&simulation_progress_label(run));
+    progress_column.append(&count);
+
+    let progress = ProgressBar::new();
+    progress.set_hexpand(true);
+    progress.set_halign(Align::Fill);
+    progress.set_show_text(false);
+    progress.set_fraction(simulation_progress_fraction(run));
+    progress_column.append(&progress);
+    row.append(&progress_column);
+
+    let (cancel, cancel_label) = simulation_cancel_button(run.cancelling);
+    cancel.connect_clicked(|_| cancel_simulation_run());
+    row.append(&cancel);
+
+    content.append(&row);
+    let status = meta_label(&simulation_progress_status(
+        run.completed_runs,
+        run.requested_runs,
+        run.cancelling,
+    ));
+    content.append(&status);
+
+    remember_simulation_progress_widgets(
+        &heading,
+        &count,
+        &progress,
+        &status,
+        &cancel,
+        &cancel_label,
+    );
+}
+
+fn remember_simulation_progress_widgets(
+    heading: &Label,
+    count: &Label,
+    progress: &ProgressBar,
+    status: &Label,
+    cancel: &Button,
+    cancel_label: &Label,
+) {
+    let heading_ref = gtk::glib::WeakRef::new();
+    heading_ref.set(Some(heading));
+    let count_ref = gtk::glib::WeakRef::new();
+    count_ref.set(Some(count));
+    let progress_ref = gtk::glib::WeakRef::new();
+    progress_ref.set(Some(progress));
+    let status_ref = gtk::glib::WeakRef::new();
+    status_ref.set(Some(status));
+    let cancel_ref = gtk::glib::WeakRef::new();
+    cancel_ref.set(Some(cancel));
+    let cancel_label_ref = gtk::glib::WeakRef::new();
+    cancel_label_ref.set(Some(cancel_label));
+
+    SIMULATION_PROGRESS_VIEWS.with(|views| {
+        views.borrow_mut().push(SimulationProgressWidgets {
+            heading: heading_ref,
+            count: count_ref,
+            progress: progress_ref,
+            status: status_ref,
+            cancel: cancel_ref,
+            cancel_label: cancel_label_ref,
+        });
+    });
+}
+
+fn update_simulation_progress_views(run: SimulationRunSnapshot) {
+    SIMULATION_PROGRESS_VIEWS.with(|views| {
+        views.borrow_mut().retain(|view| {
+            let Some(heading) = view.heading.upgrade() else {
+                return false;
+            };
+            let Some(count) = view.count.upgrade() else {
+                return false;
+            };
+            let Some(progress) = view.progress.upgrade() else {
+                return false;
+            };
+            let Some(status) = view.status.upgrade() else {
+                return false;
+            };
+            let Some(cancel) = view.cancel.upgrade() else {
+                return false;
+            };
+            let Some(cancel_label) = view.cancel_label.upgrade() else {
+                return false;
+            };
+
+            heading.set_text(simulation_progress_heading(run.cancelling));
+            count.set_text(&simulation_progress_label(run));
+            progress.set_fraction(simulation_progress_fraction(run));
+            status.set_text(&simulation_progress_status(
+                run.completed_runs,
+                run.requested_runs,
+                run.cancelling,
+            ));
+            cancel.set_sensitive(!run.cancelling);
+            cancel_label.set_text(simulation_cancel_label(run.cancelling));
+            true
+        });
+    });
+}
+
+fn simulation_progress_heading(cancelling: bool) -> &'static str {
+    if cancelling {
+        "Cancelling simulation"
+    } else {
+        "Simulation running"
+    }
+}
+
+fn simulation_progress_fraction(run: SimulationRunSnapshot) -> f64 {
+    if run.requested_runs > 0 {
+        (run.completed_runs as f64 / run.requested_runs as f64).min(1.0)
+    } else {
+        0.0
+    }
+}
+
+fn simulation_progress_label(run: SimulationRunSnapshot) -> String {
+    let percent = simulation_progress_fraction(run) * 100.0;
+    format!(
+        "{} of {} runs ({percent:.0}%)",
+        format_runs(run.completed_runs),
+        format_runs(run.requested_runs)
+    )
+}
+
+fn simulation_cancel_button(cancelling: bool) -> (Button, Label) {
+    let button = Button::new();
+    button.set_tooltip_text(Some("Cancel simulation"));
+    button.set_valign(Align::End);
+    button.set_sensitive(!cancelling);
+
+    let content = GtkBox::new(Orientation::Horizontal, 8);
+    content.set_margin_top(7);
+    content.set_margin_bottom(7);
+    content.set_margin_start(12);
+    content.set_margin_end(14);
+    let icon = Image::from_icon_name("process-stop-symbolic");
+    icon.set_icon_size(gtk::IconSize::Normal);
+    content.append(&icon);
+    let label = Label::new(Some(simulation_cancel_label(cancelling)));
+    content.append(&label);
+    button.set_child(Some(&content));
+    (button, label)
+}
+
+fn simulation_cancel_label(cancelling: bool) -> &'static str {
+    if cancelling { "Cancelling" } else { "Cancel" }
 }
 
 fn append_simulation_result(content: &GtkBox, result: &SimulationResult) {
@@ -1839,12 +2259,21 @@ fn simulation_run_summary(result: &SimulationResult) -> Grid {
     grid.set_column_spacing(18);
     grid.set_row_spacing(8);
     grid.set_hexpand(true);
-    add_estimate_metric_row(&grid, 0, "Status", status, EstimateTone::Strong);
+    let status_tone = if result.cancelled {
+        EstimateTone::Minimum
+    } else {
+        EstimateTone::Strong
+    };
+    add_estimate_metric_row(&grid, 0, "Status", status, status_tone);
     add_estimate_metric_row(
         &grid,
         1,
         "Runs",
-        &format!("{} / {}", result.completed_runs, result.requested_runs),
+        &format!(
+            "{} / {}",
+            format_runs(result.completed_runs),
+            format_runs(result.requested_runs)
+        ),
         EstimateTone::Normal,
     );
     grid
@@ -2163,12 +2592,16 @@ fn update_project_inputs(update: impl FnOnce(&mut DesktopState), refresh_scope: 
         }
         update(&mut state);
         state.dirty = true;
-        if let Some(project) = state.project.as_mut() {
+        let project = if let Some(project) = state.project.as_mut() {
             project.results.simulation = None;
             Some(project.clone())
         } else {
             None
+        };
+        if project.is_some() {
+            invalidate_running_simulation(&mut state);
         }
+        project
     });
 
     let Some(project) = project else {
@@ -2186,10 +2619,16 @@ fn update_project_inputs(update: impl FnOnce(&mut DesktopState), refresh_scope: 
         ),
         Err(message) => STATE.with(|state| {
             let mut state = state.borrow_mut();
-            if let Some(project) = state.project.as_mut() {
+            let invalidated = if let Some(project) = state.project.as_mut() {
                 project.results.estimate = None;
                 project.results.production_profile = None;
                 project.results.simulation = None;
+                true
+            } else {
+                false
+            };
+            if invalidated {
+                invalidate_running_simulation(&mut state);
             }
             state.status = message;
         }),
@@ -2208,7 +2647,6 @@ fn set_energy_price(value: Option<f64>) {
             return;
         };
         project.inputs.energy_price_eur_per_kwh = value;
-        project.results.simulation = None;
         state.dirty = true;
         state.status = "Energy price updated".to_string();
     });
@@ -2294,7 +2732,7 @@ fn format_runs(runs: usize) -> String {
     let mut output = String::new();
     for (index, character) in text.chars().rev().enumerate() {
         if index > 0 && index % 3 == 0 {
-            output.push('_');
+            output.push(',');
         }
         output.push(character);
     }
