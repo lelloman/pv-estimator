@@ -105,7 +105,7 @@ struct SimulationRunState {
 #[derive(Debug)]
 enum SimulationRunMessage {
     Progress(usize),
-    Finished(Result<SimulationResult, String>),
+    Finished(Box<Result<SimulationResult, String>>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -619,7 +619,7 @@ fn run_simulation() -> Result<(), RunSimulationError> {
             },
         )
         .map_err(|error| format!("Simulation failed: {error}"));
-        let _ = sender.send(SimulationRunMessage::Finished(result));
+        let _ = sender.send(SimulationRunMessage::Finished(Box::new(result)));
     });
 
     SIMULATION_RUN.with(|run| {
@@ -719,7 +719,7 @@ fn poll_simulation_run() {
                     }
                 }
                 Ok(SimulationRunMessage::Finished(result)) => {
-                    finished = Some((result, run.generation));
+                    finished = Some((*result, run.generation));
                     break;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -2417,6 +2417,19 @@ fn day_of_year_index(date: DailyProjectionDate) -> usize {
     days + usize::from(date.day.saturating_sub(1))
 }
 
+#[derive(Clone, Copy)]
+struct ChartScale {
+    top: f64,
+    height: f64,
+    max_value: f64,
+}
+
+#[derive(Clone, Copy)]
+struct BarStyle {
+    width: f64,
+    color: (f64, f64, f64),
+}
+
 fn draw_monthly_chart(
     context: &gtk::cairo::Context,
     width: i32,
@@ -2441,25 +2454,30 @@ fn draw_monthly_chart(
     let bar_width = (group_width * 0.30).max(2.0);
     for index in 0..12 {
         let x = left + group_width * index as f64 + group_width * 0.19;
+        let scale = ChartScale {
+            top,
+            height: chart_height,
+            max_value,
+        };
         draw_bar(
             context,
             x,
-            top,
-            bar_width,
-            chart_height,
             production[index],
-            max_value,
-            (0.18, 0.76, 0.43),
+            scale,
+            BarStyle {
+                width: bar_width,
+                color: (0.18, 0.76, 0.43),
+            },
         );
         draw_bar(
             context,
             x + bar_width + 3.0,
-            top,
-            bar_width,
-            chart_height,
             load[index],
-            max_value,
-            (0.96, 0.64, 0.23),
+            scale,
+            BarStyle {
+                width: bar_width,
+                color: (0.96, 0.64, 0.23),
+            },
         );
         draw_axis_label(
             context,
@@ -2494,25 +2512,30 @@ fn draw_daily_chart(
     let bar_width = (group_width * 0.28).max(1.0);
     for hour in 0..24 {
         let x = left + group_width * hour as f64 + group_width * 0.18;
+        let scale = ChartScale {
+            top,
+            height: chart_height,
+            max_value,
+        };
         draw_bar(
             context,
             x,
-            top,
-            bar_width,
-            chart_height,
             production[hour],
-            max_value,
-            (0.18, 0.76, 0.43),
+            scale,
+            BarStyle {
+                width: bar_width,
+                color: (0.18, 0.76, 0.43),
+            },
         );
         draw_bar(
             context,
             x + bar_width + 2.0,
-            top,
-            bar_width,
-            chart_height,
             load[hour],
-            max_value,
-            (0.96, 0.64, 0.23),
+            scale,
+            BarStyle {
+                width: bar_width,
+                color: (0.96, 0.64, 0.23),
+            },
         );
         if hour % 3 == 0 {
             draw_axis_label(context, x, f64::from(height) - 18.0, &format!("{hour}"));
@@ -2553,19 +2576,15 @@ fn draw_chart_background(
     draw_axis_label(context, 6.0, top - 4.0, unit);
 }
 
-fn draw_bar(
-    context: &gtk::cairo::Context,
-    x: f64,
-    top: f64,
-    width: f64,
-    chart_height: f64,
-    value: f64,
-    max_value: f64,
-    color: (f64, f64, f64),
-) {
-    let height = (value / max_value).clamp(0.0, 1.0) * chart_height;
-    context.set_source_rgb(color.0, color.1, color.2);
-    context.rectangle(x, top + chart_height - height, width, height.max(1.0));
+fn draw_bar(context: &gtk::cairo::Context, x: f64, value: f64, scale: ChartScale, style: BarStyle) {
+    let height = (value / scale.max_value).clamp(0.0, 1.0) * scale.height;
+    context.set_source_rgb(style.color.0, style.color.1, style.color.2);
+    context.rectangle(
+        x,
+        scale.top + scale.height - height,
+        style.width,
+        height.max(1.0),
+    );
     let _ = context.fill();
 }
 
