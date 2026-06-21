@@ -109,6 +109,8 @@ pub struct SimulationRunMetrics {
     pub self_consumed_kwh: f64,
     pub grid_import_kwh: f64,
     pub grid_export_kwh: f64,
+    #[serde(default)]
+    pub storage_consumed_kwh: f64,
     pub battery_losses_kwh: f64,
     pub ending_soc_kwh: f64,
     pub self_consumption_ratio: f64,
@@ -122,6 +124,8 @@ pub struct SimulationMetricSummaries {
     pub self_consumed_kwh: MetricSummary,
     pub grid_import_kwh: MetricSummary,
     pub grid_export_kwh: MetricSummary,
+    #[serde(default)]
+    pub storage_consumed_kwh: MetricSummary,
     pub battery_losses_kwh: MetricSummary,
     pub ending_soc_kwh: MetricSummary,
     pub self_consumption_ratio: MetricSummary,
@@ -589,6 +593,7 @@ fn dispatch_run(production: &[f64], load: &[f64], capacity_kwh: f64) -> Simulati
         self_consumed_kwh: 0.0,
         grid_import_kwh: 0.0,
         grid_export_kwh: 0.0,
+        storage_consumed_kwh: 0.0,
         battery_losses_kwh: 0.0,
         ending_soc_kwh: 0.0,
         self_consumption_ratio: 0.0,
@@ -619,6 +624,7 @@ fn dispatch_run(production: &[f64], load: &[f64], capacity_kwh: f64) -> Simulati
             let removed = delivered / discharge_efficiency;
             soc -= removed;
             metrics.self_consumed_kwh += delivered;
+            metrics.storage_consumed_kwh += delivered;
             metrics.battery_losses_kwh += removed - delivered;
             metrics.grid_import_kwh += deficit - delivered;
         } else {
@@ -648,6 +654,7 @@ fn summarize_runs(runs: &[SimulationRunMetrics]) -> SimulationMetricSummaries {
         self_consumed_kwh: summarize_metric(runs.iter().map(|run| run.self_consumed_kwh)),
         grid_import_kwh: summarize_metric(runs.iter().map(|run| run.grid_import_kwh)),
         grid_export_kwh: summarize_metric(runs.iter().map(|run| run.grid_export_kwh)),
+        storage_consumed_kwh: summarize_metric(runs.iter().map(|run| run.storage_consumed_kwh)),
         battery_losses_kwh: summarize_metric(runs.iter().map(|run| run.battery_losses_kwh)),
         ending_soc_kwh: summarize_metric(runs.iter().map(|run| run.ending_soc_kwh)),
         self_consumption_ratio: summarize_metric(runs.iter().map(|run| run.self_consumption_ratio)),
@@ -796,6 +803,20 @@ mod tests {
         let result = simulate(&request(profile, Some(5.0))).expect("simulation succeeds");
 
         assert!(result.summaries.battery_losses_kwh.mean > 0.0);
+    }
+
+    #[test]
+    fn storage_consumed_tracks_battery_delivery_to_load() {
+        let mut production = vec![0.0; HOURS_PER_YEAR];
+        let mut load = vec![0.0; HOURS_PER_YEAR];
+        production[0] = 10.0;
+        load[1] = 4.0;
+
+        let metrics = dispatch_run(&production, &load, 10.0);
+
+        assert!(metrics.storage_consumed_kwh > 0.0);
+        assert!((metrics.self_consumed_kwh - metrics.storage_consumed_kwh).abs() < 1.0e-9);
+        assert_eq!(metrics.grid_import_kwh, 0.0);
     }
 
     #[test]
