@@ -42,6 +42,10 @@ impl SourceModelEstimator {
                 let bytes = embedded_onnx_bytes(&source.onnx_path)?;
                 let session = Session::builder()
                     .context("creating ONNX Runtime session builder")?
+                    .with_intra_threads(1)
+                    .map_err(|error| anyhow!(error.to_string()))?
+                    .with_inter_threads(1)
+                    .map_err(|error| anyhow!(error.to_string()))?
                     .commit_from_memory(bytes)
                     .with_context(|| {
                         format!(
@@ -64,6 +68,10 @@ impl SourceModelEstimator {
             .map(|source| {
                 let session = Session::builder()
                     .context("creating ONNX Runtime session builder")?
+                    .with_intra_threads(1)
+                    .map_err(|error| anyhow!(error.to_string()))?
+                    .with_inter_threads(1)
+                    .map_err(|error| anyhow!(error.to_string()))?
                     .commit_from_file(&source.onnx_path)
                     .with_context(|| {
                         format!("loading ONNX model {}", source.onnx_path.display())
