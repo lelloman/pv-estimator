@@ -14,9 +14,9 @@ use directories::ProjectDirs;
 use gtk::glib::translate::IntoGlibPtr;
 use gtk::prelude::*;
 use gtk::{
-    Align, Box as GtkBox, Button, DropDown, Entry, FileChooserAction, FileChooserDialog,
-    FileFilter, Grid, Image, Label, ListBox, Orientation, PolicyType, Popover, ProgressBar,
-    ResponseType, ScrolledWindow, SelectionMode, Separator, Window,
+    Align, Box as GtkBox, Button, DrawingArea, DropDown, Entry, FileChooserAction,
+    FileChooserDialog, FileFilter, Grid, Image, Label, ListBox, Orientation, PolicyType, Popover,
+    ProgressBar, ResponseType, ScrolledWindow, SelectionMode, Separator, Window,
 };
 use maruzzella_sdk::{
     CommandSpec, HostApi, MzStatusCode, MzViewPlacement, Plugin, PluginDependency,
@@ -25,7 +25,7 @@ use maruzzella_sdk::{
 use pv_core::simulation::{
     BuiltInLoadShapeId, LoadProfile, LoadShape, MetricSummary, ProductionProfile,
     SimulationRequest, SimulationResult, SimulationRunMetrics, StorageConfig,
-    simulate_with_progress,
+    deterministic_hourly_load_kwh, simulate_with_progress,
 };
 use pv_core::source_model::SourceEnsembleEstimateDocument;
 use pv_data::{CitySearchResult, search_cities};
@@ -115,6 +115,12 @@ struct SimulationRunSnapshot {
     cancelling: bool,
 }
 
+#[derive(Clone, Copy)]
+struct DailyProjectionDate {
+    month: u8,
+    day: u8,
+}
+
 struct SimulationProgressWidgets {
     heading: gtk::glib::WeakRef<Label>,
     count: gtk::glib::WeakRef<Label>,
@@ -130,6 +136,7 @@ thread_local! {
     static SHELL_MODE_HANDLERS: RefCell<Option<ShellModeHandlers>> = const { RefCell::new(None) };
     static ACTIVE_FILE_CHOOSER: RefCell<Option<FileChooserDialog>> = const { RefCell::new(None) };
     static SIMULATION_RUN: RefCell<Option<SimulationRunState>> = const { RefCell::new(None) };
+    static SIMULATION_GRAPH_DATE: RefCell<DailyProjectionDate> = const { RefCell::new(DailyProjectionDate { month: 6, day: 21 }) };
     static SIMULATION_PROGRESS_VIEWS: RefCell<Vec<SimulationProgressWidgets>> = const { RefCell::new(Vec::new()) };
     static SYSTEM_VIEWS: RefCell<Vec<gtk::glib::WeakRef<GtkBox>>> = const { RefCell::new(Vec::new()) };
     static ESTIMATE_VIEWS: RefCell<Vec<gtk::glib::WeakRef<GtkBox>>> = const { RefCell::new(Vec::new()) };
@@ -2070,7 +2077,7 @@ fn render_simulation_into(root: &GtkBox) {
     if let Some(run) = simulation_run_snapshot() {
         append_simulation_progress(&content, run);
     } else if let Some(result) = &project.results.simulation {
-        append_simulation_result(&content, result);
+        append_simulation_result(&content, project, result);
     } else {
         append_simulation_empty_state(&content);
     }
@@ -2241,12 +2248,337 @@ fn simulation_cancel_label(cancelling: bool) -> &'static str {
     if cancelling { "Cancelling" } else { "Cancel" }
 }
 
-fn append_simulation_result(content: &GtkBox, result: &SimulationResult) {
+fn append_simulation_result(
+    content: &GtkBox,
+    project: &PvProjectDocument,
+    result: &SimulationResult,
+) {
     content.append(&simulation_run_summary(result));
     content.append(&section_separator());
     content.append(&simulation_summary_table(result));
     content.append(&section_separator());
     content.append(&simulation_scenario_table(result));
+    append_simulation_graphs(content, project);
+}
+
+fn append_simulation_graphs(content: &GtkBox, project: &PvProjectDocument) {
+    let Some((production, load)) = simulation_graph_series(project) else {
+        return;
+    };
+    content.append(&section_separator());
+    content.append(&chart_legend());
+    content.append(&monthly_simulation_chart(&production, &load));
+    content.append(&section_separator());
+    append_daily_projection_graph(content, &production, &load);
+}
+
+fn simulation_graph_series(project: &PvProjectDocument) -> Option<(Vec<f64>, Vec<f64>)> {
+    let production = project
+        .results
+        .production_profile
+        .as_ref()?
+        .hourly_mean_kwh
+        .clone();
+    if production.len() != 8760 {
+        return None;
+    }
+    let load = deterministic_hourly_load_kwh(&project.inputs.load_profile).ok()?;
+    if load.len() != 8760 {
+        return None;
+    }
+    Some((production, load))
+}
+
+fn chart_legend() -> GtkBox {
+    let legend = GtkBox::new(Orientation::Horizontal, 16);
+    legend.append(&legend_label("Production", "#2ec27e"));
+    legend.append(&legend_label("Load", "#f6a43a"));
+    legend
+}
+
+fn legend_label(text: &str, color: &str) -> Label {
+    let label = Label::new(None);
+    label.set_markup(&format!(
+        r##"<span foreground="{color}" weight="bold">--</span> {text}"##,
+        text = escape_markup(text),
+    ));
+    label
+}
+
+fn monthly_simulation_chart(production: &[f64], load: &[f64]) -> DrawingArea {
+    let production_months = monthly_totals(production);
+    let load_months = monthly_totals(load);
+    let chart = DrawingArea::new();
+    chart.set_content_height(260);
+    chart.set_hexpand(true);
+    chart.set_draw_func(move |_, context, width, height| {
+        draw_monthly_chart(context, width, height, &production_months, &load_months);
+    });
+    chart
+}
+
+fn append_daily_projection_graph(content: &GtkBox, production: &[f64], load: &[f64]) {
+    let date = selected_daily_projection_date();
+    content.append(&daily_projection_controls(date));
+    let production_day = daily_slice(production, date);
+    let load_day = daily_slice(load, date);
+    content.append(&daily_projection_chart(production_day, load_day));
+}
+
+fn daily_projection_controls(date: DailyProjectionDate) -> GtkBox {
+    let row = GtkBox::new(Orientation::Horizontal, 10);
+    row.set_hexpand(true);
+
+    let month_names = (1..=12)
+        .map(|month| short_month_name(month).unwrap_or("?").to_string())
+        .collect::<Vec<_>>();
+    let month_refs = month_names.iter().map(String::as_str).collect::<Vec<_>>();
+    let month = DropDown::from_strings(&month_refs);
+    month.set_tooltip_text(Some("Projection month"));
+    month.set_selected(u32::from(date.month.saturating_sub(1)));
+    month.connect_selected_notify(|dropdown| {
+        let month = (dropdown.selected() as u8).saturating_add(1).clamp(1, 12);
+        SIMULATION_GRAPH_DATE.with(|selection| {
+            let mut selection = selection.borrow_mut();
+            selection.month = month;
+            selection.day = selection.day.min(calendar_days_in_month(month));
+        });
+        refresh_workbench_views();
+    });
+    row.append(&field_row("Month", &month));
+
+    let days = calendar_days_in_month(date.month);
+    let day_labels = (1..=days).map(|day| day.to_string()).collect::<Vec<_>>();
+    let day_refs = day_labels.iter().map(String::as_str).collect::<Vec<_>>();
+    let day = DropDown::from_strings(&day_refs);
+    day.set_tooltip_text(Some("Projection day"));
+    day.set_selected(u32::from(
+        date.day.saturating_sub(1).min(days.saturating_sub(1)),
+    ));
+    day.connect_selected_notify(|dropdown| {
+        let day = (dropdown.selected() as u8).saturating_add(1).clamp(1, 31);
+        SIMULATION_GRAPH_DATE.with(|selection| selection.borrow_mut().day = day);
+        refresh_workbench_views();
+    });
+    row.append(&field_row("Day", &day));
+    row
+}
+
+fn daily_projection_chart(production: Vec<f64>, load: Vec<f64>) -> DrawingArea {
+    let chart = DrawingArea::new();
+    chart.set_content_height(260);
+    chart.set_hexpand(true);
+    chart.set_draw_func(move |_, context, width, height| {
+        draw_daily_chart(context, width, height, &production, &load);
+    });
+    chart
+}
+
+fn selected_daily_projection_date() -> DailyProjectionDate {
+    SIMULATION_GRAPH_DATE.with(|selection| {
+        let mut selection = selection.borrow_mut();
+        selection.month = selection.month.clamp(1, 12);
+        let days = calendar_days_in_month(selection.month);
+        selection.day = selection.day.clamp(1, days);
+        *selection
+    })
+}
+
+fn calendar_days_in_month(month: u8) -> u8 {
+    days_in_month(month).unwrap_or(30.0) as u8
+}
+
+fn monthly_totals(values: &[f64]) -> Vec<f64> {
+    let mut totals = Vec::with_capacity(12);
+    let mut start = 0usize;
+    for month in 1..=12 {
+        let hours = calendar_days_in_month(month) as usize * 24;
+        let end = start.saturating_add(hours).min(values.len());
+        totals.push(values[start..end].iter().sum());
+        start = end;
+    }
+    totals
+}
+
+fn daily_slice(values: &[f64], date: DailyProjectionDate) -> Vec<f64> {
+    let day_index = day_of_year_index(date);
+    let start = day_index.saturating_mul(24).min(values.len());
+    let end = start.saturating_add(24).min(values.len());
+    let mut output = values[start..end].to_vec();
+    output.resize(24, 0.0);
+    output
+}
+
+fn day_of_year_index(date: DailyProjectionDate) -> usize {
+    let mut days = 0usize;
+    for month in 1..date.month {
+        days += calendar_days_in_month(month) as usize;
+    }
+    days + usize::from(date.day.saturating_sub(1))
+}
+
+fn draw_monthly_chart(
+    context: &gtk::cairo::Context,
+    width: i32,
+    height: i32,
+    production: &[f64],
+    load: &[f64],
+) {
+    let max_value = production
+        .iter()
+        .chain(load.iter())
+        .copied()
+        .fold(0.0_f64, f64::max)
+        .max(1.0);
+    draw_chart_background(context, width, height, max_value, "kWh");
+    let left = 52.0;
+    let right = 14.0;
+    let top = 18.0;
+    let bottom = 42.0;
+    let chart_width = (f64::from(width) - left - right).max(1.0);
+    let chart_height = (f64::from(height) - top - bottom).max(1.0);
+    let group_width = chart_width / 12.0;
+    let bar_width = (group_width * 0.30).max(2.0);
+    for index in 0..12 {
+        let x = left + group_width * index as f64 + group_width * 0.19;
+        draw_bar(
+            context,
+            x,
+            top,
+            bar_width,
+            chart_height,
+            production[index],
+            max_value,
+            (0.18, 0.76, 0.43),
+        );
+        draw_bar(
+            context,
+            x + bar_width + 3.0,
+            top,
+            bar_width,
+            chart_height,
+            load[index],
+            max_value,
+            (0.96, 0.64, 0.23),
+        );
+        draw_axis_label(
+            context,
+            x + bar_width * 0.5,
+            f64::from(height) - 18.0,
+            short_month_name((index + 1) as u8).unwrap_or("?"),
+        );
+    }
+}
+
+fn draw_daily_chart(
+    context: &gtk::cairo::Context,
+    width: i32,
+    height: i32,
+    production: &[f64],
+    load: &[f64],
+) {
+    let max_value = production
+        .iter()
+        .chain(load.iter())
+        .copied()
+        .fold(0.0_f64, f64::max)
+        .max(1.0);
+    draw_chart_background(context, width, height, max_value, "kWh/h");
+    let left = 52.0;
+    let right = 14.0;
+    let top = 18.0;
+    let bottom = 42.0;
+    let chart_width = (f64::from(width) - left - right).max(1.0);
+    let chart_height = (f64::from(height) - top - bottom).max(1.0);
+    let group_width = chart_width / 24.0;
+    let bar_width = (group_width * 0.28).max(1.0);
+    for hour in 0..24 {
+        let x = left + group_width * hour as f64 + group_width * 0.18;
+        draw_bar(
+            context,
+            x,
+            top,
+            bar_width,
+            chart_height,
+            production[hour],
+            max_value,
+            (0.18, 0.76, 0.43),
+        );
+        draw_bar(
+            context,
+            x + bar_width + 2.0,
+            top,
+            bar_width,
+            chart_height,
+            load[hour],
+            max_value,
+            (0.96, 0.64, 0.23),
+        );
+        if hour % 3 == 0 {
+            draw_axis_label(context, x, f64::from(height) - 18.0, &format!("{hour}"));
+        }
+    }
+}
+
+fn draw_chart_background(
+    context: &gtk::cairo::Context,
+    width: i32,
+    height: i32,
+    max_value: f64,
+    unit: &str,
+) {
+    let width = f64::from(width);
+    let height = f64::from(height);
+    let left = 52.0;
+    let right = 14.0;
+    let top = 18.0;
+    let bottom = 42.0;
+    let chart_width = (width - left - right).max(1.0);
+    let chart_height = (height - top - bottom).max(1.0);
+
+    context.set_source_rgb(0.12, 0.12, 0.13);
+    context.rectangle(0.0, 0.0, width, height);
+    let _ = context.fill();
+
+    context.set_line_width(1.0);
+    context.set_source_rgb(0.28, 0.28, 0.30);
+    for tick in 0..=4 {
+        let y = top + chart_height * tick as f64 / 4.0;
+        context.move_to(left, y);
+        context.line_to(left + chart_width, y);
+        let _ = context.stroke();
+        let value = max_value * (1.0 - tick as f64 / 4.0);
+        draw_axis_label(context, 6.0, y + 4.0, &format!("{value:.0}"));
+    }
+    draw_axis_label(context, 6.0, top - 4.0, unit);
+}
+
+fn draw_bar(
+    context: &gtk::cairo::Context,
+    x: f64,
+    top: f64,
+    width: f64,
+    chart_height: f64,
+    value: f64,
+    max_value: f64,
+    color: (f64, f64, f64),
+) {
+    let height = (value / max_value).clamp(0.0, 1.0) * chart_height;
+    context.set_source_rgb(color.0, color.1, color.2);
+    context.rectangle(x, top + chart_height - height, width, height.max(1.0));
+    let _ = context.fill();
+}
+
+fn draw_axis_label(context: &gtk::cairo::Context, x: f64, y: f64, text: &str) {
+    context.set_source_rgb(0.70, 0.70, 0.72);
+    context.select_font_face(
+        "Sans",
+        gtk::cairo::FontSlant::Normal,
+        gtk::cairo::FontWeight::Normal,
+    );
+    context.set_font_size(10.0);
+    context.move_to(x, y);
+    let _ = context.show_text(text);
 }
 
 fn simulation_run_summary(result: &SimulationResult) -> Grid {

@@ -446,6 +446,10 @@ fn validate_request(request: &SimulationRequest) -> Result<(), SimulationError> 
     Ok(())
 }
 
+pub fn deterministic_hourly_load_kwh(load: &LoadProfile) -> Result<Vec<f64>, SimulationError> {
+    hourly_load_profile(load)
+}
+
 fn hourly_load_profile(load: &LoadProfile) -> Result<Vec<f64>, SimulationError> {
     let (energy_kwh, shape) = match load {
         LoadProfile::AnnualKwh { annual_kwh, shape } => (*annual_kwh, shape),
