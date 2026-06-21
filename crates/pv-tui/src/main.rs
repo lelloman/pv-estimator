@@ -3141,6 +3141,11 @@ fn simulation_result_lines(result: &SimulationResult) -> Vec<Line<'static>> {
             Style::default(),
         ),
         estimate_metric_line(
+            "Storage kWh",
+            format_kwh_summary(summaries.storage_consumed_kwh),
+            Style::default(),
+        ),
+        estimate_metric_line(
             "Self cons",
             format_ratio_summary(summaries.self_consumption_ratio),
             Style::default(),
@@ -3866,6 +3871,7 @@ mod tests {
             self_consumed_kwh: 4200.0 * self_sufficiency,
             grid_import_kwh: import,
             grid_export_kwh: 0.0,
+            storage_consumed_kwh: 100.0,
             battery_losses_kwh: 0.0,
             ending_soc_kwh: 0.0,
             self_consumption_ratio: 0.65,
@@ -3881,6 +3887,7 @@ mod tests {
                 self_consumed_kwh: summary(1100.0, 1000.0, 1200.0),
                 grid_import_kwh: summary(3100.0, 3000.0, 3200.0),
                 grid_export_kwh: summary(600.0, 500.0, 700.0),
+                storage_consumed_kwh: summary(100.0, 80.0, 120.0),
                 battery_losses_kwh: summary(0.0, 0.0, 0.0),
                 ending_soc_kwh: summary(0.0, 0.0, 0.0),
                 self_consumption_ratio: summary(0.65, 0.60, 0.70),

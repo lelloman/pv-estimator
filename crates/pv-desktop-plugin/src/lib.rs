@@ -2667,6 +2667,11 @@ fn simulation_summary_table(result: &SimulationResult) -> Grid {
             SimulationValueKind::Kwh,
         ),
         (
+            "Storage consumed kWh",
+            summaries.storage_consumed_kwh,
+            SimulationValueKind::Kwh,
+        ),
+        (
             "Battery losses kWh",
             summaries.battery_losses_kwh,
             SimulationValueKind::Kwh,
@@ -2744,18 +2749,19 @@ fn simulation_scenario_table(result: &SimulationResult) -> Grid {
     grid.set_hexpand(true);
     grid.set_column_homogeneous(true);
 
-    add_estimate_table_group_header(&grid, 1, 7, "kWh");
-    add_estimate_table_group_header(&grid, 8, 2, "%");
+    add_estimate_table_group_header(&grid, 1, 8, "kWh");
+    add_estimate_table_group_header(&grid, 9, 2, "%");
     add_estimate_table_header(&grid, 0, 1, "Case", 0.0);
     add_estimate_table_header(&grid, 1, 1, "prod", 1.0);
     add_estimate_table_header(&grid, 2, 1, "load", 1.0);
     add_estimate_table_header(&grid, 3, 1, "self", 1.0);
     add_estimate_table_header(&grid, 4, 1, "import", 1.0);
     add_estimate_table_header(&grid, 5, 1, "export", 1.0);
-    add_estimate_table_header(&grid, 6, 1, "loss", 1.0);
-    add_estimate_table_header(&grid, 7, 1, "end", 1.0);
-    add_estimate_table_header(&grid, 8, 1, "cons", 1.0);
-    add_estimate_table_header(&grid, 9, 1, "suff", 1.0);
+    add_estimate_table_header(&grid, 6, 1, "storage", 1.0);
+    add_estimate_table_header(&grid, 7, 1, "loss", 1.0);
+    add_estimate_table_header(&grid, 8, 1, "end", 1.0);
+    add_estimate_table_header(&grid, 9, 1, "cons", 1.0);
+    add_estimate_table_header(&grid, 10, 1, "suff", 1.0);
 
     add_simulation_scenario_row(&grid, 2, "Low", result.scenarios.low);
     add_simulation_scenario_row(&grid, 3, "Mean", result.scenarios.mean);
@@ -2809,7 +2815,7 @@ fn add_simulation_scenario_row(grid: &Grid, row: i32, label: &str, metrics: Simu
         grid,
         6,
         row,
-        &format_kwh_value(metrics.battery_losses_kwh),
+        &format_kwh_value(metrics.storage_consumed_kwh),
         1.0,
         EstimateTone::Normal,
     );
@@ -2817,7 +2823,7 @@ fn add_simulation_scenario_row(grid: &Grid, row: i32, label: &str, metrics: Simu
         grid,
         7,
         row,
-        &format_kwh_value(metrics.ending_soc_kwh),
+        &format_kwh_value(metrics.battery_losses_kwh),
         1.0,
         EstimateTone::Normal,
     );
@@ -2825,13 +2831,21 @@ fn add_simulation_scenario_row(grid: &Grid, row: i32, label: &str, metrics: Simu
         grid,
         8,
         row,
+        &format_kwh_value(metrics.ending_soc_kwh),
+        1.0,
+        EstimateTone::Normal,
+    );
+    add_estimate_table_cell(
+        grid,
+        9,
+        row,
         &format_percent_value(metrics.self_consumption_ratio),
         1.0,
         EstimateTone::Mean,
     );
     add_estimate_table_cell(
         grid,
-        9,
+        10,
         row,
         &format_percent_value(metrics.self_sufficiency_ratio),
         1.0,
