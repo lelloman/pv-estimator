@@ -101,13 +101,13 @@ fn main() {
             "Simulation runs",
             "pv.project.set_simulation_runs",
             &[
-                ("1_000 runs", "1000"),
-                ("10_000 runs", "10000"),
-                ("100_000 runs", "100000"),
-                ("1_000_000 runs", "1000000"),
-                ("10_000_000 runs", "10000000"),
-                ("100_000_000 runs", "100000000"),
-                ("1_000_000_000 runs", "1000000000"),
+                ("1,000 runs", "1000"),
+                ("10,000 runs", "10000"),
+                ("100,000 runs", "100000"),
+                ("1,000,000 runs", "1000000"),
+                ("10,000,000 runs", "10000000"),
+                ("100,000,000 runs", "100000000"),
+                ("1,000,000,000 runs", "1000000000"),
             ],
             1,
             true,
@@ -142,9 +142,12 @@ fn main() {
             .with_tab_strip_appearance("editor"),
     );
 
+    let has_restorable_session = pv_desktop_plugin::has_restorable_desktop_session();
+    if has_restorable_session {
+        sync_simulation_runs_toolbar_items(&mut product.toolbar_items);
+    }
     let project_shell = product.shell_spec();
     let launcher = no_project_launcher(&product);
-    let has_restorable_session = pv_desktop_plugin::has_restorable_desktop_session();
     if has_restorable_session {
         repair_empty_workspace_workbench(&project_shell);
     }
@@ -241,10 +244,38 @@ fn repaired_workspace_spec(default_shell: &ShellSpec) -> ShellSpec {
     if ensure_workbench_has_any_tab(&mut shell.spec.workbench) {
         changed = true;
     }
+    sync_simulation_runs_toolbar(&mut shell.spec);
     if changed {
         layout::save(&workspace_persistence_id, &shell);
     }
     shell.spec
+}
+
+fn sync_simulation_runs_toolbar(spec: &mut ShellSpec) {
+    sync_simulation_runs_toolbar_items(&mut spec.toolbar_items);
+}
+
+fn sync_simulation_runs_toolbar_items(items: &mut [ToolbarItemSpec]) {
+    let selected_index =
+        simulation_runs_toolbar_index(pv_desktop_plugin::current_simulation_runs());
+    for item in items {
+        if item.id == "simulation-runs" {
+            item.selected_index = selected_index;
+        }
+    }
+}
+
+fn simulation_runs_toolbar_index(runs: usize) -> u32 {
+    match runs {
+        1_000 => 0,
+        10_000 => 1,
+        100_000 => 2,
+        1_000_000 => 3,
+        10_000_000 => 4,
+        100_000_000 => 5,
+        1_000_000_000 => 6,
+        _ => 1,
+    }
 }
 
 fn ensure_workbench_has_any_tab(node: &mut WorkbenchNodeSpec) -> bool {
