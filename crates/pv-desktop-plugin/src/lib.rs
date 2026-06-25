@@ -2264,7 +2264,7 @@ fn append_estimate_details(content: &GtkBox, state: &DesktopState) {
     append_detail_row(content, "Sources", &estimate_sources_label(document));
     append_detail_row(content, "Band", &estimate_uncertainty_label(document));
     append_detail_row(content, "Spread", &estimate_source_spread_label(document));
-    append_detail_row(content, "Coverage", &estimate_coverage_label(document));
+    append_detail_row(content, "Coverage", estimate_coverage_label(document));
 
     content.append(&section_separator());
     content.append(&section_label("Highlights"));
