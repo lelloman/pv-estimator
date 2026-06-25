@@ -2,9 +2,10 @@ use gtk::gio::prelude::ApplicationExtManual;
 use maruzzella::{
     CommandSpec, LauncherSpec, MaruzzellaConfig, MenuItemSpec, MenuRootSpec, PanelResizePolicy,
     ShellChrome, ShellMode, ShellSpec, TabGroupSpec, TabSpec, ToolbarDisplayMode, ToolbarItemSpec,
-    ToolbarOptionSpec, WorkbenchNodeSpec, WorkspaceSession, build_application_with_handle,
-    default_product_spec, layout, load_static_plugin, plugin_tab,
+    ToolbarOptionSpec, ToolbarPlacement, WorkbenchNodeSpec, WorkspaceSession,
+    build_application_with_handle, default_product_spec, layout, load_static_plugin, plugin_tab,
 };
+use maruzzella::{MzContextActivationPolicy, MzSurfaceRole};
 
 const PERSISTENCE_ID: &str = "pv-estimator-desktop";
 const WORKSPACE_SLOT: &str = "workspace";
@@ -13,6 +14,8 @@ const ESTIMATE_TAB_ID: &str = "estimate";
 const ESTIMATE_VIEW_ID: &str = "com.lelloman.pv_estimator.estimate";
 const SIMULATION_TAB_ID: &str = "simulation";
 const SIMULATION_VIEW_ID: &str = "com.lelloman.pv_estimator.simulation";
+const DETAILS_TAB_ID: &str = "details";
+const DETAILS_VIEW_ID: &str = "com.lelloman.pv_estimator.details";
 
 fn main() {
     let mut product = default_product_spec();
@@ -133,7 +136,15 @@ fn main() {
     .with_panel_appearance("primary")
     .with_panel_header_appearance("secondary")
     .with_tab_strip_appearance("utility");
-    product.layout.right_panel = TabGroupSpec::new("panel-right", None, Vec::new());
+    product.layout.right_panel = TabGroupSpec::new(
+        "panel-right",
+        Some(DETAILS_TAB_ID),
+        vec![details_panel_tab()],
+    )
+    .with_tab_strip_hidden()
+    .with_panel_appearance("primary")
+    .with_panel_header_appearance("secondary")
+    .with_tab_strip_appearance("utility");
     product.layout.bottom_panel = TabGroupSpec::new("panel-bottom", None, Vec::new());
     product.layout.workbench = WorkbenchNodeSpec::Group(
         TabGroupSpec::new("workbench-main", Some("estimate"), project_workbench_tabs())
@@ -199,6 +210,7 @@ fn workspace_chrome() -> ShellChrome {
         show_menu_bar: true,
         show_toolbar: true,
         show_search: false,
+        toolbar_placement: ToolbarPlacement::BelowMenu,
     }
 }
 
@@ -228,6 +240,19 @@ fn simulation_workbench_tab() -> TabSpec {
     )
 }
 
+fn details_panel_tab() -> TabSpec {
+    plugin_tab(
+        DETAILS_TAB_ID,
+        "panel-right",
+        "Details",
+        DETAILS_VIEW_ID,
+        "The PV details view could not be created.",
+        false,
+    )
+    .with_surface_role(MzSurfaceRole::Inspector)
+    .with_context_activation(MzContextActivationPolicy::Never)
+}
+
 fn switch_to_project_workspace(handle: &maruzzella::MaruzzellaHandle, default_shell: &ShellSpec) {
     let spec = repaired_workspace_spec(default_shell);
     let _ = handle.switch_to_workspace(WorkspaceSession::new(spec));
@@ -242,6 +267,9 @@ fn repaired_workspace_spec(default_shell: &ShellSpec) -> ShellSpec {
     let mut shell = layout::load_for_slot(PERSISTENCE_ID, WORKSPACE_SLOT, default_shell);
     let mut changed = normalize_empty_workbench_groups(&mut shell.spec.workbench);
     if ensure_workbench_has_any_tab(&mut shell.spec.workbench) {
+        changed = true;
+    }
+    if ensure_right_panel_detail_tab(&mut shell.spec.right_panel) {
         changed = true;
     }
     sync_simulation_runs_toolbar(&mut shell.spec);
@@ -275,6 +303,24 @@ fn simulation_runs_toolbar_index(runs: usize) -> u32 {
         100_000_000 => 5,
         1_000_000_000 => 6,
         _ => 1,
+    }
+}
+
+fn ensure_right_panel_detail_tab(group: &mut TabGroupSpec) -> bool {
+    if let Some(tab_id) = group
+        .tabs
+        .iter()
+        .find(|tab| {
+            tab.id == DETAILS_TAB_ID || tab.plugin_view_id.as_deref() == Some(DETAILS_VIEW_ID)
+        })
+        .map(|tab| tab.id.clone())
+    {
+        group.active_tab_id = Some(tab_id);
+        false
+    } else {
+        group.tabs.push(details_panel_tab());
+        group.active_tab_id = Some(DETAILS_TAB_ID.to_string());
+        true
     }
 }
 

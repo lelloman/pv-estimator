@@ -19,8 +19,9 @@ use gtk::{
     ProgressBar, ResponseType, ScrolledWindow, SelectionMode, Separator, Window,
 };
 use maruzzella_sdk::{
-    CommandSpec, HostApi, MzStatusCode, MzViewPlacement, Plugin, PluginDependency,
-    PluginDescriptor, SurfaceContributionSpec, Version, ViewFactorySpec, export_plugin,
+    CommandSpec, HostApi, MzHostEvent, MzStatusCode, MzSurfaceFocusEvent, MzViewPlacement, Plugin,
+    PluginDependency, PluginDescriptor, SurfaceContributionSpec, Version, ViewFactorySpec,
+    decode_json_payload, export_plugin,
 };
 use pv_core::simulation::{
     BuiltInLoadShapeId, LoadProfile, LoadShape, MetricSummary, ProductionProfile,
@@ -42,6 +43,7 @@ const VIEW_LAUNCHER: &str = "com.lelloman.pv_estimator.launcher";
 const VIEW_SYSTEM: &str = "com.lelloman.pv_estimator.system";
 const VIEW_ESTIMATE: &str = "com.lelloman.pv_estimator.estimate";
 const VIEW_SIMULATION: &str = "com.lelloman.pv_estimator.simulation";
+const VIEW_DETAILS: &str = "com.lelloman.pv_estimator.details";
 const DESKTOP_SESSION_SCHEMA_VERSION: u32 = 1;
 
 const CMD_NEW: &str = "pv.project.new";
@@ -141,6 +143,8 @@ thread_local! {
     static SYSTEM_VIEWS: RefCell<Vec<gtk::glib::WeakRef<GtkBox>>> = const { RefCell::new(Vec::new()) };
     static ESTIMATE_VIEWS: RefCell<Vec<gtk::glib::WeakRef<GtkBox>>> = const { RefCell::new(Vec::new()) };
     static SIMULATION_VIEWS: RefCell<Vec<gtk::glib::WeakRef<GtkBox>>> = const { RefCell::new(Vec::new()) };
+    static DETAIL_VIEWS: RefCell<Vec<gtk::glib::WeakRef<GtkBox>>> = const { RefCell::new(Vec::new()) };
+    static ACTIVE_CONTEXT: RefCell<Option<MzSurfaceFocusEvent>> = const { RefCell::new(None) };
 }
 
 pub fn install_shell_mode_handlers(
@@ -157,6 +161,26 @@ pub fn install_shell_mode_handlers(
             show_simulation_panel: Box::new(show_simulation_panel),
         });
     });
+}
+
+extern "C" fn observe_context_event(
+    payload: maruzzella_sdk::ffi::MzBytes,
+) -> maruzzella_sdk::ffi::MzStatus {
+    let event = match decode_json_payload::<MzHostEvent>(payload) {
+        Ok(Some(event)) => event,
+        Ok(None) | Err(_) => {
+            return maruzzella_sdk::ffi::MzStatus::new(MzStatusCode::InvalidArgument);
+        }
+    };
+    let context = match MzSurfaceFocusEvent::from_bytes(&event.payload) {
+        Ok(context) => context,
+        Err(_) => return maruzzella_sdk::ffi::MzStatus::new(MzStatusCode::InvalidArgument),
+    };
+    ACTIVE_CONTEXT.with(|slot| {
+        *slot.borrow_mut() = Some(context);
+    });
+    refresh_detail_views();
+    maruzzella_sdk::ffi::MzStatus::OK
 }
 
 pub fn has_restorable_desktop_session() -> bool {
@@ -227,6 +251,11 @@ impl Plugin for PvDesktopPlugin {
             "Engineering workbench for photovoltaic production and consumption simulations.",
         ))?;
 
+        host.register_host_event_subscriber(
+            "maruzzella.context.active_changed",
+            observe_context_event,
+        )?;
+
         host.register_view_factory(ViewFactorySpec::new(
             PLUGIN_ID,
             VIEW_LAUNCHER,
@@ -254,6 +283,13 @@ impl Plugin for PvDesktopPlugin {
             "Simulation",
             MzViewPlacement::Workbench,
             create_simulation_view,
+        ))?;
+        host.register_view_factory(ViewFactorySpec::new(
+            PLUGIN_ID,
+            VIEW_DETAILS,
+            "Details",
+            MzViewPlacement::SidePanel,
+            create_details_view,
         ))?;
 
         Ok(())
@@ -680,6 +716,7 @@ fn cancel_simulation_run() {
         if let Some(run) = simulation_run_snapshot() {
             update_simulation_progress_views(run);
         }
+        refresh_detail_views();
     }
 }
 
@@ -754,6 +791,7 @@ fn poll_simulation_run() {
         if let Some(run) = simulation_run_snapshot() {
             update_simulation_progress_views(run);
         }
+        refresh_detail_views();
     }
 }
 
@@ -1216,6 +1254,23 @@ extern "C" fn create_simulation_view(
     widget_ptr(root)
 }
 
+extern "C" fn create_details_view(
+    _host: *const maruzzella_sdk::ffi::MzHostApi,
+    _request: *const maruzzella_sdk::ffi::MzViewRequest,
+) -> *mut c_void {
+    if !gtk::is_initialized_main_thread() && gtk::init().is_err() {
+        return std::ptr::null_mut();
+    }
+    ensure_session_loaded();
+    ensure_estimate_loaded();
+    let root = GtkBox::new(Orientation::Vertical, 0);
+    root.set_hexpand(true);
+    root.set_vexpand(true);
+    render_details_into(&root);
+    remember_view(&DETAIL_VIEWS, &root);
+    widget_ptr(root)
+}
+
 fn widget_ptr<W: IsA<gtk::Widget>>(widget: W) -> *mut c_void {
     unsafe {
         <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(widget.upcast())
@@ -1240,7 +1295,12 @@ fn refresh_views() {
 fn refresh_workbench_views() {
     refresh_view_group(&ESTIMATE_VIEWS, render_estimate_into);
     refresh_view_group(&SIMULATION_VIEWS, render_simulation_into);
+    refresh_detail_views();
     refresh_save_action_enabled();
+}
+
+fn refresh_detail_views() {
+    refresh_view_group(&DETAIL_VIEWS, render_details_into);
 }
 
 fn refresh_save_action_enabled() {
@@ -2057,6 +2117,213 @@ fn append_estimate_result(content: &GtkBox, project: &PvProjectDocument) {
 
     let rows = monthly_estimate_rows(estimate);
     content.append(&estimate_monthly_table(&rows));
+}
+
+fn render_details_into(root: &GtkBox) {
+    clear_box(root);
+    let state = snapshot();
+    let context = ACTIVE_CONTEXT.with(|slot| slot.borrow().clone());
+    let scroller = workbench_scroller();
+    let content = details_content();
+
+    content.append(&header_label("Details"));
+    if let Some(context) = &context {
+        content.append(&meta_label(&format!("Following {}", context.current.title)));
+    } else {
+        content.append(&meta_label("Select a workbench tab to show its details."));
+    }
+    content.append(&section_separator());
+
+    let view_id = context
+        .as_ref()
+        .and_then(|event| event.current.plugin_view_id.as_deref());
+    let tab_id = context.as_ref().map(|event| event.current.tab_id.as_str());
+
+    match (view_id, tab_id) {
+        (Some(VIEW_SIMULATION), _) | (_, Some("simulation")) => {
+            append_simulation_details(&content, &state);
+        }
+        (Some(VIEW_ESTIMATE), _) | (_, Some("estimate")) => {
+            append_estimate_details(&content, &state);
+        }
+        _ => append_estimate_details(&content, &state),
+    }
+
+    scroller.set_child(Some(&content));
+    root.append(&scroller);
+}
+
+fn append_estimate_details(content: &GtkBox, state: &DesktopState) {
+    content.append(&section_label("Estimate"));
+    let Some(project) = &state.project else {
+        content.append(&body_label("No project open."));
+        append_project_actions(content);
+        return;
+    };
+
+    append_detail_row(content, "Project", &project.title_for_window());
+    append_detail_row(content, "Location", &project.inputs.estimate_request.name);
+    append_detail_row(
+        content,
+        "Arrays",
+        &format!(
+            "{} / {:.1} kWp",
+            project.inputs.arrays.len(),
+            project
+                .inputs
+                .arrays
+                .iter()
+                .map(|array| array.peak_power_kwp)
+                .sum::<f64>()
+        ),
+    );
+    append_detail_row(
+        content,
+        "Tilt",
+        &format!("{:.0} deg", project.inputs.estimate_request.tilt_deg),
+    );
+    append_detail_row(
+        content,
+        "Azimuth",
+        &format!(
+            "{:.0} deg {}",
+            project.inputs.estimate_request.azimuth_deg,
+            azimuth_direction_label(project.inputs.estimate_request.azimuth_deg)
+        ),
+    );
+
+    content.append(&section_separator());
+    if let Some(document) = &project.results.estimate {
+        append_detail_row(content, "Annual", &annual_energy_value(document));
+        if let Some(price) = project.inputs.energy_price_eur_per_kwh {
+            append_detail_row(content, "Revenue", &annual_revenue_value(document, price));
+        }
+        append_detail_row(
+            content,
+            "POA",
+            &format!(
+                "{:.2} kWh/m2",
+                document
+                    .ensemble_estimate
+                    .annual_in_plane_irradiation
+                    .mean
+                    .as_kilowatt_hours_per_square_meter()
+            ),
+        );
+        append_detail_row(
+            content,
+            "Sources",
+            &document.coverage.applicable_sources.len().to_string(),
+        );
+    } else {
+        content.append(&body_label("No estimate result is available."));
+    }
+
+    let run = Button::with_label("Run Estimate");
+    run.connect_clicked(|_| {
+        show_estimate_workbench_panel();
+        if let Err(message) = run_estimate() {
+            append_log(message);
+            refresh_workbench_views();
+        }
+    });
+    content.append(&run);
+}
+
+fn append_simulation_details(content: &GtkBox, state: &DesktopState) {
+    content.append(&section_label("Simulation"));
+    let Some(project) = &state.project else {
+        content.append(&body_label("No project open."));
+        append_project_actions(content);
+        return;
+    };
+
+    append_detail_row(
+        content,
+        "Runs",
+        &format_runs(project.inputs.simulation_options.runs),
+    );
+    append_detail_row(
+        content,
+        "Storage",
+        &project
+            .inputs
+            .estimate_request
+            .storage_usable_kwh
+            .map(|value| format!("{value:.1} kWh"))
+            .unwrap_or_else(|| "none".to_string()),
+    );
+
+    if let Some(run) = simulation_run_snapshot() {
+        content.append(&section_separator());
+        content.append(&body_label(&simulation_progress_status(
+            run.completed_runs,
+            run.requested_runs,
+            run.cancelling,
+        )));
+        let cancel = Button::with_label(simulation_cancel_label(run.cancelling));
+        cancel.set_sensitive(!run.cancelling);
+        cancel.connect_clicked(|_| cancel_simulation_run());
+        content.append(&cancel);
+        return;
+    }
+
+    content.append(&section_separator());
+    if let Some(result) = &project.results.simulation {
+        append_detail_row(content, "Completed", &format_runs(result.completed_runs));
+        append_detail_row(
+            content,
+            "Self use",
+            &format_percent(result.summaries.self_consumption_ratio.p50),
+        );
+        append_detail_row(
+            content,
+            "Autarky",
+            &format_percent(result.summaries.self_sufficiency_ratio.p50),
+        );
+        append_detail_row(
+            content,
+            "Import",
+            &format!("{:.0} kWh", result.summaries.grid_import_kwh.mean),
+        );
+        append_detail_row(
+            content,
+            "Export",
+            &format!("{:.0} kWh", result.summaries.grid_export_kwh.mean),
+        );
+    } else {
+        content.append(&body_label("No simulation result is available."));
+    }
+
+    let run = Button::with_label("Run Simulation");
+    run.connect_clicked(|_| {
+        let _ = run_simulation_action();
+    });
+    content.append(&run);
+}
+
+fn append_project_actions(content: &GtkBox) {
+    let actions = GtkBox::new(Orientation::Horizontal, 6);
+    actions.set_halign(Align::Start);
+    let new_project = Button::with_label("New Project");
+    new_project.connect_clicked(|_| create_new_project());
+    actions.append(&new_project);
+    let open_project = Button::with_label("Open Project");
+    open_project.connect_clicked(|_| show_open_project_dialog());
+    actions.append(&open_project);
+    content.append(&actions);
+}
+
+fn append_detail_row(content: &GtkBox, label: &str, value: &str) {
+    let value = Label::new(Some(value));
+    value.set_xalign(0.0);
+    value.set_wrap(true);
+    value.add_css_class("monospace");
+    content.append(&field_row(label, &value));
+}
+
+fn format_percent(value: f64) -> String {
+    format!("{:.0}%", value * 100.0)
 }
 
 fn render_simulation_into(root: &GtkBox) {
@@ -3448,6 +3715,15 @@ fn workbench_content() -> GtkBox {
     content.set_margin_bottom(22);
     content.set_margin_start(22);
     content.set_margin_end(22);
+    content
+}
+
+fn details_content() -> GtkBox {
+    let content = GtkBox::new(Orientation::Vertical, 12);
+    content.set_margin_top(16);
+    content.set_margin_bottom(16);
+    content.set_margin_start(14);
+    content.set_margin_end(14);
     content
 }
 
