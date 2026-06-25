@@ -158,10 +158,13 @@ fn main() {
         sync_simulation_runs_toolbar_items(&mut product.toolbar_items);
     }
     let project_shell = product.shell_spec();
+    let startup_workspace_shell = if has_restorable_session {
+        Some(repaired_workspace_spec(&project_shell))
+    } else {
+        None
+    };
+    seed_initial_details_view(startup_workspace_shell.as_ref().unwrap_or(&project_shell));
     let launcher = no_project_launcher(&product);
-    if has_restorable_session {
-        repair_empty_workspace_workbench(&project_shell);
-    }
     let startup_mode = if has_restorable_session {
         ShellMode::Workspace
     } else {
@@ -258,10 +261,6 @@ fn switch_to_project_workspace(handle: &maruzzella::MaruzzellaHandle, default_sh
     let _ = handle.switch_to_workspace(WorkspaceSession::new(spec));
 }
 
-fn repair_empty_workspace_workbench(default_shell: &ShellSpec) {
-    let _ = repaired_workspace_spec(default_shell);
-}
-
 fn repaired_workspace_spec(default_shell: &ShellSpec) -> ShellSpec {
     let workspace_persistence_id = layout::scoped_persistence_id(PERSISTENCE_ID, WORKSPACE_SLOT);
     let mut shell = layout::load_for_slot(PERSISTENCE_ID, WORKSPACE_SLOT, default_shell);
@@ -277,6 +276,29 @@ fn repaired_workspace_spec(default_shell: &ShellSpec) -> ShellSpec {
         layout::save(&workspace_persistence_id, &shell);
     }
     shell.spec
+}
+
+fn seed_initial_details_view(shell: &ShellSpec) {
+    if let Some(view_id) = active_workbench_plugin_view_id(&shell.workbench) {
+        pv_desktop_plugin::set_initial_details_view(view_id);
+    }
+}
+
+fn active_workbench_plugin_view_id(node: &WorkbenchNodeSpec) -> Option<&'static str> {
+    match node {
+        WorkbenchNodeSpec::Group(group) => {
+            let tab_id = group.active_tab_id.as_deref()?;
+            let tab = group.tabs.iter().find(|tab| tab.id == tab_id)?;
+            match tab.plugin_view_id.as_deref() {
+                Some(ESTIMATE_VIEW_ID) => Some(ESTIMATE_VIEW_ID),
+                Some(SIMULATION_VIEW_ID) => Some(SIMULATION_VIEW_ID),
+                _ => None,
+            }
+        }
+        WorkbenchNodeSpec::Split { children, .. } => {
+            children.iter().find_map(active_workbench_plugin_view_id)
+        }
+    }
 }
 
 fn sync_simulation_runs_toolbar(spec: &mut ShellSpec) {

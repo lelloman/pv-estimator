@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use directories::ProjectDirs;
 use gtk::glib::translate::IntoGlibPtr;
@@ -30,7 +30,9 @@ use pv_core::simulation::{
 };
 use pv_core::source_model::SourceEnsembleEstimateDocument;
 use pv_data::{CitySearchResult, search_cities};
-use pv_desktop_core::{PROJECT_EXTENSION, PvProjectDocument, load_project, save_project};
+use pv_desktop_core::{
+    PROJECT_EXTENSION, PvProjectDocument, SimulationRunMetadata, load_project, save_project,
+};
 use pv_model::{
     EstimateArray, EstimateRequest, SourceModelEstimator, days_in_month, short_month_name,
 };
@@ -102,6 +104,8 @@ struct SimulationRunState {
     cancelling: bool,
     receiver: mpsc::Receiver<SimulationRunMessage>,
     generation: u64,
+    started_at: Instant,
+    started_wall_time: SystemTime,
 }
 
 #[derive(Debug)]
@@ -115,6 +119,8 @@ struct SimulationRunSnapshot {
     requested_runs: usize,
     completed_runs: usize,
     cancelling: bool,
+    started_at: Instant,
+    started_wall_time: SystemTime,
 }
 
 #[derive(Clone, Copy)]
@@ -145,6 +151,7 @@ thread_local! {
     static SIMULATION_VIEWS: RefCell<Vec<gtk::glib::WeakRef<GtkBox>>> = const { RefCell::new(Vec::new()) };
     static DETAIL_VIEWS: RefCell<Vec<gtk::glib::WeakRef<GtkBox>>> = const { RefCell::new(Vec::new()) };
     static ACTIVE_CONTEXT: RefCell<Option<MzSurfaceFocusEvent>> = const { RefCell::new(None) };
+    static INITIAL_DETAILS_VIEW: RefCell<Option<&'static str>> = const { RefCell::new(None) };
 }
 
 pub fn install_shell_mode_handlers(
@@ -181,6 +188,12 @@ extern "C" fn observe_context_event(
     });
     refresh_detail_views();
     maruzzella_sdk::ffi::MzStatus::OK
+}
+
+pub fn set_initial_details_view(plugin_view_id: &'static str) {
+    INITIAL_DETAILS_VIEW.with(|slot| {
+        *slot.borrow_mut() = Some(plugin_view_id);
+    });
 }
 
 pub fn has_restorable_desktop_session() -> bool {
@@ -548,6 +561,7 @@ fn store_estimate_result(
             project.results.estimate = Some(estimate);
             project.results.production_profile = Some(production_profile);
             project.results.simulation = None;
+            project.results.simulation_metadata = None;
         }
         invalidate_running_simulation(&mut state);
         if mark_dirty {
@@ -633,6 +647,8 @@ fn run_simulation() -> Result<(), RunSimulationError> {
         options,
     };
     let requested_runs = request.options.runs;
+    let started_at = Instant::now();
+    let started_wall_time = SystemTime::now();
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_cancel = Arc::clone(&cancel);
     let (sender, receiver) = mpsc::channel();
@@ -666,12 +682,15 @@ fn run_simulation() -> Result<(), RunSimulationError> {
             cancelling: false,
             receiver,
             generation,
+            started_at,
+            started_wall_time,
         });
     });
     STATE.with(|state| {
         let mut state = state.borrow_mut();
         if let Some(project) = state.project.as_mut() {
             project.results.simulation = None;
+            project.results.simulation_metadata = None;
             state.dirty = true;
         }
         let message = format!(
@@ -703,6 +722,8 @@ fn simulation_run_snapshot() -> Option<SimulationRunSnapshot> {
             requested_runs: run.requested_runs,
             completed_runs: run.completed_runs,
             cancelling: run.cancelling,
+            started_at: run.started_at,
+            started_wall_time: run.started_wall_time,
         })
     })
 }
@@ -739,6 +760,7 @@ fn invalidate_running_simulation(state: &mut DesktopState) {
 
 fn poll_simulation_run() {
     let mut finished = None;
+    let mut finished_metadata = None;
     let mut progress_changed = false;
     let mut progress_status = None;
 
@@ -756,11 +778,21 @@ fn poll_simulation_run() {
                     }
                 }
                 Ok(SimulationRunMessage::Finished(result)) => {
+                    finished_metadata = Some(build_simulation_run_metadata(
+                        run.started_at,
+                        run.started_wall_time,
+                        SystemTime::now(),
+                    ));
                     finished = Some((*result, run.generation));
                     break;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    finished_metadata = Some(build_simulation_run_metadata(
+                        run.started_at,
+                        run.started_wall_time,
+                        SystemTime::now(),
+                    ));
                     finished = Some((
                         Err("Simulation worker disconnected".to_string()),
                         run.generation,
@@ -782,7 +814,7 @@ fn poll_simulation_run() {
         SIMULATION_RUN.with(|run| {
             run.borrow_mut().take();
         });
-        finish_simulation_run(result, generation);
+        finish_simulation_run(result, generation, finished_metadata);
         refresh_workbench_views();
     } else if let Some(status) = progress_status {
         STATE.with(|state| {
@@ -795,7 +827,11 @@ fn poll_simulation_run() {
     }
 }
 
-fn finish_simulation_run(result: Result<SimulationResult, String>, generation: u64) {
+fn finish_simulation_run(
+    result: Result<SimulationResult, String>,
+    generation: u64,
+    metadata: Option<SimulationRunMetadata>,
+) {
     match result {
         Ok(result) => {
             let self_sufficiency = result.summaries.self_sufficiency_ratio.p50;
@@ -823,12 +859,56 @@ fn finish_simulation_run(result: Result<SimulationResult, String>, generation: u
                     return;
                 };
                 project.results.simulation = Some(result);
+                project.results.simulation_metadata = metadata;
                 state.dirty = true;
                 state.status = status.clone();
                 state.log.push(status);
             });
         }
         Err(message) => append_log(message),
+    }
+}
+
+fn build_simulation_run_metadata(
+    started_at: Instant,
+    started_wall_time: SystemTime,
+    completed_wall_time: SystemTime,
+) -> SimulationRunMetadata {
+    SimulationRunMetadata {
+        started_at: format_system_time(started_wall_time),
+        completed_at: format_system_time(completed_wall_time),
+        elapsed_ms: started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+    }
+}
+
+fn format_system_time(time: SystemTime) -> String {
+    unix_seconds(time)
+        .and_then(|seconds| {
+            gtk::glib::DateTime::from_unix_local(seconds)
+                .ok()
+                .and_then(|datetime| datetime.format_iso8601().ok())
+                .map(|value| value.to_string())
+        })
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn unix_seconds(time: SystemTime) -> Option<i64> {
+    let seconds = time.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    i64::try_from(seconds).ok()
+}
+
+fn format_duration(duration: Duration) -> String {
+    let total_ms = duration.as_millis();
+    if total_ms < 1_000 {
+        return format!("{} ms", total_ms);
+    }
+    let total_seconds = duration.as_secs();
+    let minutes = total_seconds / 60;
+    let seconds = total_seconds % 60;
+    if minutes == 0 {
+        format!("{seconds}s")
+    } else {
+        format!("{minutes}m {seconds}s")
     }
 }
 
@@ -2126,17 +2206,11 @@ fn render_details_into(root: &GtkBox) {
     let scroller = workbench_scroller();
     let content = details_content();
 
-    content.append(&header_label("Details"));
-    if let Some(context) = &context {
-        content.append(&meta_label(&format!("Following {}", context.current.title)));
-    } else {
-        content.append(&meta_label("Select a workbench tab to show its details."));
-    }
-    content.append(&section_separator());
-
+    let initial_view_id = INITIAL_DETAILS_VIEW.with(|slot| *slot.borrow());
     let view_id = context
         .as_ref()
-        .and_then(|event| event.current.plugin_view_id.as_deref());
+        .and_then(|event| event.current.plugin_view_id.as_deref())
+        .or(initial_view_id);
     let tab_id = context.as_ref().map(|event| event.current.tab_id.as_str());
 
     match (view_id, tab_id) {
@@ -2161,106 +2235,95 @@ fn append_estimate_details(content: &GtkBox, state: &DesktopState) {
         return;
     };
 
-    append_detail_row(content, "Project", &project.title_for_window());
-    append_detail_row(content, "Location", &project.inputs.estimate_request.name);
+    let Some(document) = &project.results.estimate else {
+        content.append(&body_label("No estimate result is available."));
+        append_estimate_actions(content);
+        return;
+    };
+
+    content.append(&section_label("Result"));
+    append_detail_row(content, "Annual", &annual_energy_value(document));
+    if let Some(price) = project.inputs.energy_price_eur_per_kwh {
+        append_detail_row(content, "Revenue", &annual_revenue_value(document, price));
+    }
     append_detail_row(
         content,
-        "Arrays",
+        "POA",
         &format!(
-            "{} / {:.1} kWp",
-            project.inputs.arrays.len(),
-            project
-                .inputs
-                .arrays
-                .iter()
-                .map(|array| array.peak_power_kwp)
-                .sum::<f64>()
-        ),
-    );
-    append_detail_row(
-        content,
-        "Tilt",
-        &format!("{:.0} deg", project.inputs.estimate_request.tilt_deg),
-    );
-    append_detail_row(
-        content,
-        "Azimuth",
-        &format!(
-            "{:.0} deg {}",
-            project.inputs.estimate_request.azimuth_deg,
-            azimuth_direction_label(project.inputs.estimate_request.azimuth_deg)
+            "{:.2} kWh/m2",
+            document
+                .ensemble_estimate
+                .annual_in_plane_irradiation
+                .mean
+                .as_kilowatt_hours_per_square_meter()
         ),
     );
 
     content.append(&section_separator());
-    if let Some(document) = &project.results.estimate {
-        append_detail_row(content, "Annual", &annual_energy_value(document));
-        if let Some(price) = project.inputs.energy_price_eur_per_kwh {
-            append_detail_row(content, "Revenue", &annual_revenue_value(document, price));
-        }
-        append_detail_row(
-            content,
-            "POA",
-            &format!(
-                "{:.2} kWh/m2",
-                document
-                    .ensemble_estimate
-                    .annual_in_plane_irradiation
-                    .mean
-                    .as_kilowatt_hours_per_square_meter()
-            ),
-        );
-        append_detail_row(
-            content,
-            "Sources",
-            &document.coverage.applicable_sources.len().to_string(),
-        );
-    } else {
-        content.append(&body_label("No estimate result is available."));
+    content.append(&section_label("Quality"));
+    append_detail_row(content, "Sources", &estimate_sources_label(document));
+    append_detail_row(content, "Band", &estimate_uncertainty_label(document));
+    append_detail_row(content, "Spread", &estimate_source_spread_label(document));
+    append_detail_row(content, "Coverage", &estimate_coverage_label(document));
+
+    content.append(&section_separator());
+    content.append(&section_label("Highlights"));
+    if let Some(best) = estimate_month_highlight(&document.ensemble_estimate, MonthRank::Best) {
+        append_detail_row(content, "Best month", &best);
+    }
+    if let Some(worst) = estimate_month_highlight(&document.ensemble_estimate, MonthRank::Worst) {
+        append_detail_row(content, "Lowest month", &worst);
+    }
+    append_detail_note(
+        content,
+        &estimate_seasonality_label(&document.ensemble_estimate),
+    );
+
+    content.append(&section_separator());
+    content.append(&section_label("Diagnostics"));
+    for note in estimate_diagnostics(project, document) {
+        append_detail_note(content, &note);
     }
 
-    let run = Button::with_label("Run Estimate");
-    run.connect_clicked(|_| {
-        show_estimate_workbench_panel();
-        if let Err(message) = run_estimate() {
-            append_log(message);
-            refresh_workbench_views();
-        }
-    });
-    content.append(&run);
+    append_estimate_actions(content);
 }
 
 fn append_simulation_details(content: &GtkBox, state: &DesktopState) {
-    content.append(&section_label("Simulation"));
     let Some(project) = &state.project else {
         content.append(&body_label("No project open."));
         append_project_actions(content);
         return;
     };
 
-    append_detail_row(
-        content,
-        "Runs",
-        &format_runs(project.inputs.simulation_options.runs),
-    );
-    append_detail_row(
-        content,
-        "Storage",
-        &project
-            .inputs
-            .estimate_request
-            .storage_usable_kwh
-            .map(|value| format!("{value:.1} kWh"))
-            .unwrap_or_else(|| "none".to_string()),
-    );
-
     if let Some(run) = simulation_run_snapshot() {
-        content.append(&section_separator());
-        content.append(&body_label(&simulation_progress_status(
-            run.completed_runs,
-            run.requested_runs,
-            run.cancelling,
-        )));
+        append_detail_row(
+            content,
+            "Status",
+            if run.cancelling {
+                "cancelling"
+            } else {
+                "running"
+            },
+        );
+        append_detail_row(
+            content,
+            "Runs",
+            &format!(
+                "{} / {}",
+                format_runs(run.completed_runs),
+                format_runs(run.requested_runs)
+            ),
+        );
+        append_detail_row(
+            content,
+            "Started",
+            &format_system_time(run.started_wall_time),
+        );
+        append_detail_row(
+            content,
+            "Elapsed",
+            &format_duration(run.started_at.elapsed()),
+        );
         let cancel = Button::with_label(simulation_cancel_label(run.cancelling));
         cancel.set_sensitive(!run.cancelling);
         cancel.connect_clicked(|_| cancel_simulation_run());
@@ -2268,36 +2331,233 @@ fn append_simulation_details(content: &GtkBox, state: &DesktopState) {
         return;
     }
 
-    content.append(&section_separator());
-    if let Some(result) = &project.results.simulation {
-        append_detail_row(content, "Completed", &format_runs(result.completed_runs));
+    let Some(result) = &project.results.simulation else {
+        content.append(&body_label("No simulation result is available."));
+        content.append(&section_separator());
+        content.append(&section_label("Diagnostics"));
+        for note in missing_simulation_diagnostics(project) {
+            append_detail_note(content, &note);
+        }
+        return;
+    };
+
+    append_detail_row(
+        content,
+        "Status",
+        if result.cancelled {
+            "cancelled"
+        } else {
+            "complete"
+        },
+    );
+    append_detail_row(
+        content,
+        "Runs",
+        &format!(
+            "{} / {}",
+            format_runs(result.completed_runs),
+            format_runs(result.requested_runs)
+        ),
+    );
+    if let Some(metadata) = &project.results.simulation_metadata {
+        append_detail_row(content, "Started", &metadata.started_at);
+        append_detail_row(content, "Completed", &metadata.completed_at);
         append_detail_row(
             content,
-            "Self use",
-            &format_percent(result.summaries.self_consumption_ratio.p50),
-        );
-        append_detail_row(
-            content,
-            "Autarky",
-            &format_percent(result.summaries.self_sufficiency_ratio.p50),
-        );
-        append_detail_row(
-            content,
-            "Import",
-            &format!("{:.0} kWh", result.summaries.grid_import_kwh.mean),
-        );
-        append_detail_row(
-            content,
-            "Export",
-            &format!("{:.0} kWh", result.summaries.grid_export_kwh.mean),
+            "Elapsed",
+            &format_duration(Duration::from_millis(metadata.elapsed_ms)),
         );
     } else {
-        content.append(&body_label("No simulation result is available."));
+        append_detail_note(content, "Timing metadata is not available for this result.");
     }
+}
 
-    let run = Button::with_label("Run Simulation");
+#[derive(Clone, Copy)]
+enum MonthRank {
+    Best,
+    Worst,
+}
+
+fn estimate_sources_label(document: &SourceEnsembleEstimateDocument) -> String {
+    if document.coverage.applicable_sources.is_empty() {
+        "none".to_string()
+    } else {
+        document
+            .coverage
+            .applicable_sources
+            .iter()
+            .map(|source| source.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+fn estimate_uncertainty_label(document: &SourceEnsembleEstimateDocument) -> String {
+    let estimate = &document.ensemble_estimate;
+    match estimate.uncertainty.annual_energy {
+        Some(band) => format!(
+            "{:.0}..{:.0} kWh, +/- {:.0} kWh",
+            band.low.as_kilowatt_hours().round(),
+            band.high.as_kilowatt_hours().round(),
+            band.half_width.as_kilowatt_hours().round()
+        ),
+        None => "not calibrated; only one source contributed".to_string(),
+    }
+}
+
+fn estimate_source_spread_label(document: &SourceEnsembleEstimateDocument) -> String {
+    let source_values = document
+        .ensemble_estimate
+        .source_estimates
+        .iter()
+        .map(|estimate| estimate.annual_energy.as_kilowatt_hours())
+        .collect::<Vec<_>>();
+    if source_values.len() < 2 {
+        return "single source".to_string();
+    }
+    let min = source_values.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = source_values
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
+    let mean = document
+        .ensemble_estimate
+        .annual_energy
+        .mean
+        .as_kilowatt_hours();
+    let spread_pct = if mean.abs() > f64::EPSILON {
+        ((max - min) / mean) * 100.0
+    } else {
+        0.0
+    };
+    format!(
+        "{:.0}..{:.0} kWh ({spread_pct:.0}%)",
+        min.round(),
+        max.round()
+    )
+}
+
+fn estimate_coverage_label(document: &SourceEnsembleEstimateDocument) -> &'static str {
+    if document.coverage.pvgis_sarah3_applicable {
+        "PVGIS SARAH3 available"
+    } else {
+        "PVGIS SARAH3 outside coverage"
+    }
+}
+
+fn estimate_month_highlight(
+    estimate: &pv_core::source_model::AnnualPvEnsembleEstimate,
+    rank: MonthRank,
+) -> Option<String> {
+    let monthly = match rank {
+        MonthRank::Best => estimate.monthly_estimates.iter().max_by(|left, right| {
+            left.energy
+                .mean
+                .as_kilowatt_hours()
+                .total_cmp(&right.energy.mean.as_kilowatt_hours())
+        }),
+        MonthRank::Worst => estimate.monthly_estimates.iter().min_by(|left, right| {
+            left.energy
+                .mean
+                .as_kilowatt_hours()
+                .total_cmp(&right.energy.mean.as_kilowatt_hours())
+        }),
+    }?;
+    let month = short_month_name(monthly.month.value()).unwrap_or("?");
+    Some(format!(
+        "{} {:.0} kWh",
+        month,
+        monthly.energy.mean.as_kilowatt_hours().round()
+    ))
+}
+
+fn estimate_seasonality_label(
+    estimate: &pv_core::source_model::AnnualPvEnsembleEstimate,
+) -> String {
+    let Some(best) = estimate.monthly_estimates.iter().max_by(|left, right| {
+        left.energy
+            .mean
+            .as_kilowatt_hours()
+            .total_cmp(&right.energy.mean.as_kilowatt_hours())
+    }) else {
+        return "No monthly estimate rows are available.".to_string();
+    };
+    let Some(worst) = estimate.monthly_estimates.iter().min_by(|left, right| {
+        left.energy
+            .mean
+            .as_kilowatt_hours()
+            .total_cmp(&right.energy.mean.as_kilowatt_hours())
+    }) else {
+        return "No monthly estimate rows are available.".to_string();
+    };
+    let worst_kwh = worst.energy.mean.as_kilowatt_hours();
+    if worst_kwh <= f64::EPSILON {
+        return "Seasonality cannot be compared because the lowest month is near zero.".to_string();
+    }
+    format!(
+        "Best month produces {:.1}x the lowest month.",
+        best.energy.mean.as_kilowatt_hours() / worst_kwh
+    )
+}
+
+fn estimate_diagnostics(
+    project: &PvProjectDocument,
+    document: &SourceEnsembleEstimateDocument,
+) -> Vec<String> {
+    let mut diagnostics = Vec::new();
+    let uncertainty = &document.ensemble_estimate.uncertainty;
+    if uncertainty.calibrated {
+        diagnostics.push(format!(
+            "Uncertainty band is calibrated from {} sources.",
+            uncertainty.source_count
+        ));
+    } else {
+        diagnostics
+            .push("Uncertainty is limited because fewer than two sources contributed.".to_string());
+    }
+    if document.ensemble_estimate.annual_energy.spread_fraction > 0.20 {
+        diagnostics
+            .push("Source disagreement is high; review monthly spread before sizing.".to_string());
+    }
+    if project.inputs.energy_price_eur_per_kwh.is_none() {
+        diagnostics.push("Revenue is hidden because no energy price is set.".to_string());
+    }
+    if !document.coverage.pvgis_sarah3_applicable {
+        diagnostics.push("SARAH3 coverage is unavailable at this location; the estimate relies on remaining sources.".to_string());
+    }
+    if diagnostics.is_empty() {
+        diagnostics.push("No estimate quality issues flagged.".to_string());
+    }
+    diagnostics
+}
+
+fn missing_simulation_diagnostics(project: &PvProjectDocument) -> Vec<String> {
+    let mut diagnostics = Vec::new();
+    if project.results.production_profile.is_none() {
+        diagnostics.push(
+            "Run an estimate before simulation so hourly production is available.".to_string(),
+        );
+    } else {
+        diagnostics
+            .push("Run a simulation to inspect grid interaction and load coverage.".to_string());
+    }
+    if project.inputs.estimate_request.storage_usable_kwh.is_none() {
+        diagnostics.push(
+            "No battery is configured; simulation will route surplus directly to export."
+                .to_string(),
+        );
+    }
+    diagnostics
+}
+
+fn append_estimate_actions(content: &GtkBox) {
+    let run = Button::with_label("Run Estimate");
     run.connect_clicked(|_| {
-        let _ = run_simulation_action();
+        show_estimate_workbench_panel();
+        if let Err(message) = run_estimate() {
+            append_log(message);
+            refresh_workbench_views();
+        }
     });
     content.append(&run);
 }
@@ -2322,8 +2582,8 @@ fn append_detail_row(content: &GtkBox, label: &str, value: &str) {
     content.append(&field_row(label, &value));
 }
 
-fn format_percent(value: f64) -> String {
-    format!("{:.0}%", value * 100.0)
+fn append_detail_note(content: &GtkBox, text: &str) {
+    content.append(&meta_label(text));
 }
 
 fn render_simulation_into(root: &GtkBox) {
@@ -2520,8 +2780,6 @@ fn append_simulation_result(
     project: &PvProjectDocument,
     result: &SimulationResult,
 ) {
-    content.append(&simulation_run_summary(result));
-    content.append(&section_separator());
     content.append(&simulation_summary_table(result));
     content.append(&section_separator());
     content.append(&simulation_scenario_table(result));
@@ -2867,36 +3125,6 @@ fn draw_axis_label(context: &gtk::cairo::Context, x: f64, y: f64, text: &str) {
     let _ = context.show_text(text);
 }
 
-fn simulation_run_summary(result: &SimulationResult) -> Grid {
-    let status = if result.cancelled {
-        "Cancelled"
-    } else {
-        "Completed"
-    };
-    let grid = Grid::new();
-    grid.set_column_spacing(18);
-    grid.set_row_spacing(8);
-    grid.set_hexpand(true);
-    let status_tone = if result.cancelled {
-        EstimateTone::Minimum
-    } else {
-        EstimateTone::Strong
-    };
-    add_estimate_metric_row(&grid, 0, "Status", status, status_tone);
-    add_estimate_metric_row(
-        &grid,
-        1,
-        "Runs",
-        &format!(
-            "{} / {}",
-            format_runs(result.completed_runs),
-            format_runs(result.requested_runs)
-        ),
-        EstimateTone::Normal,
-    );
-    grid
-}
-
 fn simulation_summary_table(result: &SimulationResult) -> Grid {
     let grid = Grid::new();
     grid.set_column_spacing(14);
@@ -3226,6 +3454,7 @@ fn update_project_inputs(update: impl FnOnce(&mut DesktopState), refresh_scope: 
         state.dirty = true;
         let project = if let Some(project) = state.project.as_mut() {
             project.results.simulation = None;
+            project.results.simulation_metadata = None;
             Some(project.clone())
         } else {
             None
@@ -3255,6 +3484,7 @@ fn update_project_inputs(update: impl FnOnce(&mut DesktopState), refresh_scope: 
                 project.results.estimate = None;
                 project.results.production_profile = None;
                 project.results.simulation = None;
+                project.results.simulation_metadata = None;
                 true
             } else {
                 false

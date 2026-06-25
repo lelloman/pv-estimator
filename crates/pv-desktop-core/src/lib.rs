@@ -48,6 +48,15 @@ pub struct ProjectResults {
     pub estimate: Option<SourceEnsembleEstimateDocument>,
     pub production_profile: Option<ProductionProfile>,
     pub simulation: Option<SimulationResult>,
+    #[serde(default)]
+    pub simulation_metadata: Option<SimulationRunMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SimulationRunMetadata {
+    pub started_at: String,
+    pub completed_at: String,
+    pub elapsed_ms: u64,
 }
 
 impl Default for PvProjectDocument {
