@@ -21,7 +21,7 @@ use gtk::{
 use maruzzella_sdk::{
     CommandSpec, HostApi, MzHostEvent, MzStatusCode, MzSurfaceFocusEvent, MzViewPlacement, Plugin,
     PluginDependency, PluginDescriptor, SurfaceContributionSpec, Version, ViewFactorySpec,
-    decode_json_payload, export_plugin,
+    button_css_class, decode_json_payload, export_plugin, input_css_class, text_css_class,
 };
 use pv_core::simulation::{
     BuiltInLoadShapeId, LoadProfile, LoadShape, MetricSummary, ProductionProfile,
@@ -58,6 +58,15 @@ const CMD_RUN_SIMULATION: &str = "pv.project.run_simulation";
 const CMD_SET_SIMULATION_RUNS: &str = "pv.project.set_simulation_runs";
 const CMD_EXIT: &str = "pv.app.exit";
 const SAVE_ACTION_IDS: &[&str] = &["pv-project-save", "file-save", "save"];
+const CHART_BACKGROUND: &str = "#111417";
+const CHART_GRID: &str = "#4a5261";
+const CHART_TEXT: &str = "#c8d0df";
+const CHART_PRODUCTION: &str = "#3574f0";
+const CHART_LOAD: &str = "#ffc66d";
+const ESTIMATE_MUTED: &str = "#8c90a0";
+const ESTIMATE_STRONG: &str = "#b1c5ff";
+const ESTIMATE_ERROR: &str = "#ffb4ab";
+const DETAILS_PANEL_MIN_WIDTH: i32 = 320;
 
 #[derive(Clone, Debug)]
 struct DesktopState {
@@ -1184,6 +1193,30 @@ fn prefer_dark_gtk_theme() {
     }
 }
 
+fn apply_text_role(label: &Label, role: &str) {
+    label.add_css_class(&text_css_class(role));
+}
+
+fn apply_button_role(button: &Button, role: &str) {
+    button.add_css_class(&button_css_class(role));
+}
+
+fn apply_input_role(entry: &Entry, role: &str) {
+    entry.add_css_class(&input_css_class(role));
+}
+
+fn field_entry() -> Entry {
+    let entry = Entry::new();
+    apply_input_role(&entry, "field");
+    entry
+}
+
+fn search_entry() -> Entry {
+    let entry = Entry::new();
+    apply_input_role(&entry, "search");
+    entry
+}
+
 fn keep_file_chooser_alive(dialog: &FileChooserDialog) {
     ACTIVE_FILE_CHOOSER.with(|active_dialog| {
         *active_dialog.borrow_mut() = Some(dialog.clone());
@@ -1346,6 +1379,7 @@ extern "C" fn create_details_view(
     let root = GtkBox::new(Orientation::Vertical, 0);
     root.set_hexpand(true);
     root.set_vexpand(true);
+    root.set_size_request(DETAILS_PANEL_MIN_WIDTH, -1);
     render_details_into(&root);
     remember_view(&DETAIL_VIEWS, &root);
     widget_ptr(root)
@@ -1418,11 +1452,11 @@ fn refresh_view_group(
 
 fn render_launcher_into(root: &GtkBox) {
     clear_box(root);
-    let content = GtkBox::new(Orientation::Vertical, 14);
-    content.set_margin_top(32);
-    content.set_margin_bottom(32);
-    content.set_margin_start(32);
-    content.set_margin_end(32);
+    let content = GtkBox::new(Orientation::Vertical, 8);
+    content.set_margin_top(12);
+    content.set_margin_bottom(12);
+    content.set_margin_start(12);
+    content.set_margin_end(12);
     append_no_project_state(
         &content,
         "No project open",
@@ -1440,7 +1474,7 @@ fn render_system_into(root: &GtkBox) {
         .hscrollbar_policy(PolicyType::Automatic)
         .vscrollbar_policy(PolicyType::Automatic)
         .build();
-    let content = GtkBox::new(Orientation::Vertical, 14);
+    let content = GtkBox::new(Orientation::Vertical, 8);
     content.set_margin_top(10);
     content.set_margin_bottom(10);
     content.set_margin_start(10);
@@ -1472,9 +1506,11 @@ fn append_no_project_state(content: &GtkBox, title: &str, message: &str) {
     let actions = GtkBox::new(Orientation::Horizontal, 6);
     actions.set_halign(Align::Start);
     let new_project = Button::with_label("New Project");
+    apply_button_role(&new_project, "primary");
     new_project.connect_clicked(|_| create_new_project());
     actions.append(&new_project);
     let open_project = Button::with_label("Open Project");
+    apply_button_role(&open_project, "secondary");
     open_project.connect_clicked(|_| show_open_project_dialog());
     actions.append(&open_project);
     content.append(&actions);
@@ -1509,6 +1545,7 @@ fn append_scenario_switcher(content: &GtkBox, project: &PvProjectDocument) {
     menu_content.set_margin_start(6);
     menu_content.set_margin_end(6);
     let rename = Button::with_label("Rename setup");
+    apply_button_role(&rename, "secondary");
     rename.set_halign(Align::Fill);
     let menu_for_rename = menu.clone();
     rename.connect_clicked(move |_| {
@@ -1554,7 +1591,7 @@ fn show_rename_setup_dialog() {
     content.set_margin_start(14);
     content.set_margin_end(14);
 
-    let name = Entry::new();
+    let name = field_entry();
     name.set_text(&current_name);
     name.set_placeholder_text(Some("Setup name"));
     content.append(&field_row("Name", &name));
@@ -1563,9 +1600,11 @@ fn show_rename_setup_dialog() {
     footer.set_halign(Align::End);
     footer.set_margin_bottom(0);
     let cancel = Button::with_label("Cancel");
+    apply_button_role(&cancel, "secondary");
     let window_for_cancel = window.clone();
     cancel.connect_clicked(move |_| window_for_cancel.close());
     let save = Button::with_label("Save");
+    apply_button_role(&save, "primary");
     let window_for_save = window.clone();
     let name_for_save = name.clone();
     save.connect_clicked(move |_| {
@@ -1585,6 +1624,7 @@ fn show_rename_setup_dialog() {
 fn append_location_fields(content: &GtkBox, request: &EstimateRequest) {
     content.append(&section_label("Location"));
     let name = Button::with_label(&request.name);
+    apply_button_role(&name, "secondary");
     name.set_halign(Align::Fill);
     name.connect_clicked(|_| show_location_search_dialog());
     content.append(&field_row("Name", &name));
@@ -1637,7 +1677,7 @@ fn show_location_search_dialog() {
     content.set_margin_start(14);
     content.set_margin_end(14);
 
-    let search = Entry::new();
+    let search = search_entry();
     search.set_placeholder_text(Some("Search city"));
     search.set_text(&current_query);
     content.append(&search);
@@ -1657,6 +1697,7 @@ fn show_location_search_dialog() {
     footer.set_halign(Align::End);
     footer.set_margin_bottom(0);
     let cancel = Button::with_label("Cancel");
+    apply_button_role(&cancel, "secondary");
     let window_for_cancel = window.clone();
     cancel.connect_clicked(move |_| window_for_cancel.close());
     footer.append(&cancel);
@@ -1699,6 +1740,7 @@ fn refresh_location_results(list: &ListBox, window: &Window, query: &str) {
 
 fn location_result_button(window: &Window, result: CitySearchResult) -> Button {
     let button = Button::new();
+    apply_button_role(&button, "secondary");
     button.set_halign(Align::Fill);
 
     let row = GtkBox::new(Orientation::Vertical, 2);
@@ -1717,7 +1759,7 @@ fn location_result_button(window: &Window, result: CitySearchResult) -> Button {
         result.latitude_degrees, result.longitude_degrees, result.population
     )));
     detail.set_xalign(0.0);
-    detail.add_css_class("dim-label");
+    apply_text_role(&detail, "meta");
 
     row.append(&title);
     row.append(&detail);
@@ -1895,7 +1937,7 @@ fn show_array_dialog(index: Option<usize>) {
     content.set_margin_start(14);
     content.set_margin_end(14);
 
-    let name = Entry::new();
+    let name = field_entry();
     name.set_text(array.name.as_deref().unwrap_or(""));
     content.append(&field_row("Name", &name));
 
@@ -1912,9 +1954,11 @@ fn show_array_dialog(index: Option<usize>) {
     footer.set_halign(Align::End);
     footer.set_margin_bottom(0);
     let cancel = Button::with_label("Cancel");
+    apply_button_role(&cancel, "secondary");
     let window_for_cancel = window.clone();
     cancel.connect_clicked(move |_| window_for_cancel.close());
     let save = Button::with_label("Save");
+    apply_button_role(&save, "primary");
     let window_for_save = window.clone();
     let name_for_save = name.clone();
     let kwp_for_save = kwp.clone();
@@ -1950,7 +1994,7 @@ fn default_array() -> EstimateArray {
 }
 
 fn dialog_number_entry(value: f64, digits: u32) -> Entry {
-    let entry = Entry::new();
+    let entry = field_entry();
     entry.set_input_purpose(gtk::InputPurpose::Number);
     entry.set_text(&format_number(value, digits));
     entry
@@ -2027,9 +2071,11 @@ fn confirm_delete_array(index: usize) {
     footer.set_halign(Align::End);
     footer.set_margin_bottom(0);
     let cancel = Button::with_label("Cancel");
+    apply_button_role(&cancel, "secondary");
     let window_for_cancel = window.clone();
     cancel.connect_clicked(move |_| window_for_cancel.close());
     let delete = Button::with_label("Delete");
+    apply_button_role(&delete, "danger");
     let window_for_delete = window.clone();
     delete.connect_clicked(move |_| {
         delete_array(index);
@@ -2325,6 +2371,7 @@ fn append_simulation_details(content: &GtkBox, state: &DesktopState) {
             &format_duration(run.started_at.elapsed()),
         );
         let cancel = Button::with_label(simulation_cancel_label(run.cancelling));
+        apply_button_role(&cancel, "secondary");
         cancel.set_sensitive(!run.cancelling);
         cancel.connect_clicked(|_| cancel_simulation_run());
         content.append(&cancel);
@@ -2552,6 +2599,7 @@ fn missing_simulation_diagnostics(project: &PvProjectDocument) -> Vec<String> {
 
 fn append_estimate_actions(content: &GtkBox) {
     let run = Button::with_label("Run Estimate");
+    apply_button_role(&run, "primary");
     run.connect_clicked(|_| {
         show_estimate_workbench_panel();
         if let Err(message) = run_estimate() {
@@ -2566,9 +2614,11 @@ fn append_project_actions(content: &GtkBox) {
     let actions = GtkBox::new(Orientation::Horizontal, 6);
     actions.set_halign(Align::Start);
     let new_project = Button::with_label("New Project");
+    apply_button_role(&new_project, "primary");
     new_project.connect_clicked(|_| create_new_project());
     actions.append(&new_project);
     let open_project = Button::with_label("Open Project");
+    apply_button_role(&open_project, "secondary");
     open_project.connect_clicked(|_| show_open_project_dialog());
     actions.append(&open_project);
     content.append(&actions);
@@ -2578,7 +2628,7 @@ fn append_detail_row(content: &GtkBox, label: &str, value: &str) {
     let value = Label::new(Some(value));
     value.set_xalign(0.0);
     value.set_wrap(true);
-    value.add_css_class("monospace");
+    apply_text_role(&value, "code");
     content.append(&field_row(label, &value));
 }
 
@@ -2753,6 +2803,7 @@ fn simulation_progress_label(run: SimulationRunSnapshot) -> String {
 
 fn simulation_cancel_button(cancelling: bool) -> (Button, Label) {
     let button = Button::new();
+    apply_button_role(&button, "secondary");
     button.set_tooltip_text(Some("Cancel simulation"));
     button.set_valign(Align::End);
     button.set_sensitive(!cancelling);
@@ -2816,8 +2867,8 @@ fn simulation_graph_series(project: &PvProjectDocument) -> Option<(Vec<f64>, Vec
 
 fn chart_legend() -> GtkBox {
     let legend = GtkBox::new(Orientation::Horizontal, 16);
-    legend.append(&legend_label("Production", "#2ec27e"));
-    legend.append(&legend_label("Load", "#f6a43a"));
+    legend.append(&legend_label("Production", CHART_PRODUCTION));
+    legend.append(&legend_label("Load", CHART_LOAD));
     legend
 }
 
@@ -2952,7 +3003,7 @@ struct ChartScale {
 #[derive(Clone, Copy)]
 struct BarStyle {
     width: f64,
-    color: (f64, f64, f64),
+    color: &'static str,
 }
 
 fn draw_monthly_chart(
@@ -2991,7 +3042,7 @@ fn draw_monthly_chart(
             scale,
             BarStyle {
                 width: bar_width,
-                color: (0.18, 0.76, 0.43),
+                color: CHART_PRODUCTION,
             },
         );
         draw_bar(
@@ -3001,7 +3052,7 @@ fn draw_monthly_chart(
             scale,
             BarStyle {
                 width: bar_width,
-                color: (0.96, 0.64, 0.23),
+                color: CHART_LOAD,
             },
         );
         draw_axis_label(
@@ -3049,7 +3100,7 @@ fn draw_daily_chart(
             scale,
             BarStyle {
                 width: bar_width,
-                color: (0.18, 0.76, 0.43),
+                color: CHART_PRODUCTION,
             },
         );
         draw_bar(
@@ -3059,7 +3110,7 @@ fn draw_daily_chart(
             scale,
             BarStyle {
                 width: bar_width,
-                color: (0.96, 0.64, 0.23),
+                color: CHART_LOAD,
             },
         );
         if hour % 3 == 0 {
@@ -3084,12 +3135,12 @@ fn draw_chart_background(
     let chart_width = (width - left - right).max(1.0);
     let chart_height = (height - top - bottom).max(1.0);
 
-    context.set_source_rgb(0.12, 0.12, 0.13);
+    set_source_hex(context, CHART_BACKGROUND);
     context.rectangle(0.0, 0.0, width, height);
     let _ = context.fill();
 
     context.set_line_width(1.0);
-    context.set_source_rgb(0.28, 0.28, 0.30);
+    set_source_hex(context, CHART_GRID);
     for tick in 0..=4 {
         let y = top + chart_height * tick as f64 / 4.0;
         context.move_to(left, y);
@@ -3103,7 +3154,7 @@ fn draw_chart_background(
 
 fn draw_bar(context: &gtk::cairo::Context, x: f64, value: f64, scale: ChartScale, style: BarStyle) {
     let height = (value / scale.max_value).clamp(0.0, 1.0) * scale.height;
-    context.set_source_rgb(style.color.0, style.color.1, style.color.2);
+    set_source_hex(context, style.color);
     context.rectangle(
         x,
         scale.top + scale.height - height,
@@ -3114,7 +3165,7 @@ fn draw_bar(context: &gtk::cairo::Context, x: f64, value: f64, scale: ChartScale
 }
 
 fn draw_axis_label(context: &gtk::cairo::Context, x: f64, y: f64, text: &str) {
-    context.set_source_rgb(0.70, 0.70, 0.72);
+    set_source_hex(context, CHART_TEXT);
     context.select_font_face(
         "Sans",
         gtk::cairo::FontSlant::Normal,
@@ -3123,6 +3174,28 @@ fn draw_axis_label(context: &gtk::cairo::Context, x: f64, y: f64, text: &str) {
     context.set_font_size(10.0);
     context.move_to(x, y);
     let _ = context.show_text(text);
+}
+
+fn set_source_hex(context: &gtk::cairo::Context, color: &str) {
+    let Some((red, green, blue)) = parse_hex_rgb(color) else {
+        return;
+    };
+    context.set_source_rgb(red, green, blue);
+}
+
+fn parse_hex_rgb(color: &str) -> Option<(f64, f64, f64)> {
+    let color = color.strip_prefix('#')?;
+    if color.len() != 6 {
+        return None;
+    }
+    let red = u8::from_str_radix(&color[0..2], 16).ok()?;
+    let green = u8::from_str_radix(&color[2..4], 16).ok()?;
+    let blue = u8::from_str_radix(&color[4..6], 16).ok()?;
+    Some((
+        f64::from(red) / 255.0,
+        f64::from(green) / 255.0,
+        f64::from(blue) / 255.0,
+    ))
 }
 
 fn simulation_summary_table(result: &SimulationResult) -> Grid {
@@ -3375,7 +3448,7 @@ fn append_simulation_empty_state(content: &GtkBox) {
     run.set_halign(Align::Start);
     run.set_tooltip_text(Some("Run simulation"));
     run.set_size_request(96, 40);
-    run.add_css_class("suggested-action");
+    apply_button_role(&run, "primary");
     run.set_child(Some(&simulation_run_button_content()));
     run.connect_clicked(|_| {
         let _ = run_simulation_action();
@@ -3398,7 +3471,7 @@ fn simulation_run_button_content() -> GtkBox {
 
 fn simulation_empty_label() -> Label {
     let label = body_label("No simulation run yet.");
-    label.add_css_class("title-4");
+    apply_text_role(&label, "section-label");
     label
 }
 
@@ -3533,6 +3606,7 @@ fn snapshot() -> DesktopState {
 
 fn icon_button(icon_name: &str, tooltip: &str) -> Button {
     let button = Button::new();
+    apply_button_role(&button, "icon");
     button.set_tooltip_text(Some(tooltip));
     let icon = Image::from_icon_name(icon_name);
     icon.set_icon_size(gtk::IconSize::Normal);
@@ -3541,7 +3615,7 @@ fn icon_button(icon_name: &str, tooltip: &str) -> Button {
 }
 
 fn number_entry(value: f64, digits: u32, update: impl Fn(f64) + 'static) -> Entry {
-    let entry = Entry::new();
+    let entry = field_entry();
     entry.set_input_purpose(gtk::InputPurpose::Number);
     entry.set_text(&format_number(value, digits));
     entry.connect_changed(move |entry| {
@@ -3557,7 +3631,7 @@ fn optional_number_entry(
     digits: u32,
     update: impl Fn(Option<f64>) + 'static,
 ) -> Entry {
-    let entry = Entry::new();
+    let entry = field_entry();
     entry.set_input_purpose(gtk::InputPurpose::Number);
     if let Some(value) = value {
         entry.set_text(&format_number(value, digits));
@@ -3612,7 +3686,7 @@ fn azimuth_field_row(azimuth: &Entry) -> GtkBox {
     )));
     direction.set_width_chars(3);
     direction.set_xalign(0.0);
-    direction.add_css_class("dim-label");
+    apply_text_role(&direction, "meta");
 
     let direction_for_change = direction.clone();
     azimuth.connect_changed(move |entry| {
@@ -3851,7 +3925,7 @@ fn estimate_text_label(text: &str, xalign: f32, tone: EstimateTone, monospace: b
     label.set_hexpand(true);
     label.set_halign(Align::Fill);
     if monospace {
-        label.add_css_class("monospace");
+        apply_text_role(&label, "code");
     }
     label.set_markup(&estimate_markup(text, tone));
     label
@@ -3862,13 +3936,17 @@ fn estimate_markup(text: &str, tone: EstimateTone) -> String {
     match tone {
         EstimateTone::Normal => format!(r##"<span size="large">{text}</span>"##),
         EstimateTone::Muted => {
-            format!(r##"<span size="large" foreground="#77767b">{text}</span>"##)
+            format!(r##"<span size="large" foreground="{ESTIMATE_MUTED}">{text}</span>"##)
         }
         EstimateTone::Strong | EstimateTone::Mean => {
-            format!(r##"<span size="large" foreground="#2ec27e" weight="bold">{text}</span>"##)
+            format!(
+                r##"<span size="large" foreground="{ESTIMATE_STRONG}" weight="bold">{text}</span>"##
+            )
         }
         EstimateTone::Minimum => {
-            format!(r##"<span size="large" foreground="#e01b24" weight="bold">{text}</span>"##)
+            format!(
+                r##"<span size="large" foreground="{ESTIMATE_ERROR}" weight="bold">{text}</span>"##
+            )
         }
     }
 }
@@ -3889,7 +3967,7 @@ fn field_row<W: IsA<gtk::Widget>>(label: &str, widget: &W) -> GtkBox {
     label.set_width_chars(15);
     label.set_max_width_chars(15);
     label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    label.add_css_class("dim-label");
+    apply_text_role(&label, "meta");
 
     widget.set_hexpand(true);
     widget.set_halign(Align::Fill);
@@ -3902,14 +3980,14 @@ fn field_row<W: IsA<gtk::Widget>>(label: &str, widget: &W) -> GtkBox {
 fn header_label(text: &str) -> Label {
     let label = Label::new(Some(text));
     label.set_xalign(0.0);
-    label.add_css_class("title-2");
+    apply_text_role(&label, "title");
     label
 }
 
 fn section_label(text: &str) -> Label {
     let label = Label::new(Some(text));
     label.set_xalign(0.0);
-    label.add_css_class("title-4");
+    apply_text_role(&label, "section-label");
     label
 }
 
@@ -3922,7 +4000,7 @@ fn body_label(text: &str) -> Label {
 
 fn meta_label(text: &str) -> Label {
     let label = body_label(text);
-    label.add_css_class("dim-label");
+    apply_text_role(&label, "meta");
     label
 }
 
@@ -3940,20 +4018,20 @@ fn workbench_scroller() -> ScrolledWindow {
 }
 
 fn workbench_content() -> GtkBox {
-    let content = GtkBox::new(Orientation::Vertical, 14);
-    content.set_margin_top(22);
-    content.set_margin_bottom(22);
-    content.set_margin_start(22);
-    content.set_margin_end(22);
+    let content = GtkBox::new(Orientation::Vertical, 8);
+    content.set_margin_top(12);
+    content.set_margin_bottom(12);
+    content.set_margin_start(12);
+    content.set_margin_end(12);
     content
 }
 
 fn details_content() -> GtkBox {
-    let content = GtkBox::new(Orientation::Vertical, 12);
-    content.set_margin_top(16);
-    content.set_margin_bottom(16);
-    content.set_margin_start(14);
-    content.set_margin_end(14);
+    let content = GtkBox::new(Orientation::Vertical, 8);
+    content.set_margin_top(10);
+    content.set_margin_bottom(10);
+    content.set_margin_start(10);
+    content.set_margin_end(10);
     content
 }
 
@@ -3961,7 +4039,7 @@ fn add_table_header(grid: &Grid, column: i32, text: &str, xalign: f32) {
     let label = Label::new(Some(text));
     label.set_xalign(xalign);
     label.set_hexpand(column == 0);
-    label.add_css_class("heading");
+    apply_text_role(&label, "section-label");
     grid.attach(&label, column, 0, 1, 1);
 }
 
@@ -3970,7 +4048,7 @@ fn add_table_cell(grid: &Grid, column: i32, row: i32, text: &str, xalign: f32, e
     label.set_xalign(xalign);
     label.set_hexpand(expands);
     if !expands {
-        label.add_css_class("monospace");
+        apply_text_role(&label, "code");
     }
     grid.attach(&label, column, row, 1, 1);
 }
