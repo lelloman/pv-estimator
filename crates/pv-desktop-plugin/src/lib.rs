@@ -58,14 +58,6 @@ const CMD_RUN_SIMULATION: &str = "pv.project.run_simulation";
 const CMD_SET_SIMULATION_RUNS: &str = "pv.project.set_simulation_runs";
 const CMD_EXIT: &str = "pv.app.exit";
 const SAVE_ACTION_IDS: &[&str] = &["pv-project-save", "file-save", "save"];
-const CHART_BACKGROUND: &str = "#111417";
-const CHART_GRID: &str = "#4a5261";
-const CHART_TEXT: &str = "#c8d0df";
-const CHART_PRODUCTION: &str = "#3574f0";
-const CHART_LOAD: &str = "#ffc66d";
-const ESTIMATE_MUTED: &str = "#8c90a0";
-const ESTIMATE_STRONG: &str = "#b1c5ff";
-const ESTIMATE_ERROR: &str = "#ffb4ab";
 const DETAILS_PANEL_MIN_WIDTH: i32 = 320;
 
 #[derive(Clone, Debug)]
@@ -2867,18 +2859,26 @@ fn simulation_graph_series(project: &PvProjectDocument) -> Option<(Vec<f64>, Vec
 
 fn chart_legend() -> GtkBox {
     let legend = GtkBox::new(Orientation::Horizontal, 16);
-    legend.append(&legend_label("Production", CHART_PRODUCTION));
-    legend.append(&legend_label("Load", CHART_LOAD));
+    legend.append(&legend_item("Production", ChartColorRole::Production));
+    legend.append(&legend_item("Load", ChartColorRole::Load));
     legend
 }
 
-fn legend_label(text: &str, color: &str) -> Label {
-    let label = Label::new(None);
-    label.set_markup(&format!(
-        r##"<span foreground="{color}" weight="bold">--</span> {text}"##,
-        text = escape_markup(text),
-    ));
-    label
+fn legend_item(text: &str, role: ChartColorRole) -> GtkBox {
+    let item = GtkBox::new(Orientation::Horizontal, 6);
+    let swatch = DrawingArea::new();
+    swatch.set_content_width(18);
+    swatch.set_content_height(10);
+    swatch.set_draw_func(move |swatch, context, width, height| {
+        let colors = ChartColors::from_widget(swatch);
+        set_source_rgba(context, colors.series(role));
+        let y = (f64::from(height) / 2.0 - 1.5).max(0.0);
+        context.rectangle(0.0, y, f64::from(width), 3.0);
+        let _ = context.fill();
+    });
+    item.append(&swatch);
+    item.append(&Label::new(Some(text)));
+    item
 }
 
 fn monthly_simulation_chart(production: &[f64], load: &[f64]) -> DrawingArea {
@@ -2887,8 +2887,16 @@ fn monthly_simulation_chart(production: &[f64], load: &[f64]) -> DrawingArea {
     let chart = DrawingArea::new();
     chart.set_content_height(260);
     chart.set_hexpand(true);
-    chart.set_draw_func(move |_, context, width, height| {
-        draw_monthly_chart(context, width, height, &production_months, &load_months);
+    chart.set_draw_func(move |chart, context, width, height| {
+        let colors = ChartColors::from_widget(chart);
+        draw_monthly_chart(
+            context,
+            width,
+            height,
+            &colors,
+            &production_months,
+            &load_months,
+        );
     });
     chart
 }
@@ -2944,8 +2952,9 @@ fn daily_projection_chart(production: Vec<f64>, load: Vec<f64>) -> DrawingArea {
     let chart = DrawingArea::new();
     chart.set_content_height(260);
     chart.set_hexpand(true);
-    chart.set_draw_func(move |_, context, width, height| {
-        draw_daily_chart(context, width, height, &production, &load);
+    chart.set_draw_func(move |chart, context, width, height| {
+        let colors = ChartColors::from_widget(chart);
+        draw_daily_chart(context, width, height, &colors, &production, &load);
     });
     chart
 }
@@ -3001,15 +3010,49 @@ struct ChartScale {
 }
 
 #[derive(Clone, Copy)]
+enum ChartColorRole {
+    Production,
+    Load,
+}
+
+struct ChartColors {
+    background: gtk::gdk::RGBA,
+    grid: gtk::gdk::RGBA,
+    text: gtk::gdk::RGBA,
+    production: gtk::gdk::RGBA,
+    load: gtk::gdk::RGBA,
+}
+
+impl ChartColors {
+    fn from_widget<W: IsA<gtk::Widget>>(widget: &W) -> Self {
+        Self {
+            background: theme_color(widget, "workbench", gtk::gdk::RGBA::new(0.0, 0.0, 0.0, 1.0)),
+            grid: theme_color(widget, "border", gtk::gdk::RGBA::new(0.35, 0.35, 0.35, 1.0)),
+            text: theme_color(widget, "text_1", gtk::gdk::RGBA::new(0.8, 0.8, 0.8, 1.0)),
+            production: theme_color(widget, "accent", gtk::gdk::RGBA::new(0.2, 0.45, 0.9, 1.0)),
+            load: theme_color(widget, "warning", gtk::gdk::RGBA::new(0.95, 0.7, 0.25, 1.0)),
+        }
+    }
+
+    fn series(&self, role: ChartColorRole) -> &gtk::gdk::RGBA {
+        match role {
+            ChartColorRole::Production => &self.production,
+            ChartColorRole::Load => &self.load,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 struct BarStyle {
     width: f64,
-    color: &'static str,
+    role: ChartColorRole,
 }
 
 fn draw_monthly_chart(
     context: &gtk::cairo::Context,
     width: i32,
     height: i32,
+    colors: &ChartColors,
     production: &[f64],
     load: &[f64],
 ) {
@@ -3019,7 +3062,7 @@ fn draw_monthly_chart(
         .copied()
         .fold(0.0_f64, f64::max)
         .max(1.0);
-    draw_chart_background(context, width, height, max_value, "kWh");
+    draw_chart_background(context, width, height, colors, max_value, "kWh");
     let left = 52.0;
     let right = 14.0;
     let top = 18.0;
@@ -3040,9 +3083,10 @@ fn draw_monthly_chart(
             x,
             production[index],
             scale,
+            colors,
             BarStyle {
                 width: bar_width,
-                color: CHART_PRODUCTION,
+                role: ChartColorRole::Production,
             },
         );
         draw_bar(
@@ -3050,15 +3094,17 @@ fn draw_monthly_chart(
             x + bar_width + 3.0,
             load[index],
             scale,
+            colors,
             BarStyle {
                 width: bar_width,
-                color: CHART_LOAD,
+                role: ChartColorRole::Load,
             },
         );
         draw_axis_label(
             context,
             x + bar_width * 0.5,
             f64::from(height) - 18.0,
+            colors,
             short_month_name((index + 1) as u8).unwrap_or("?"),
         );
     }
@@ -3068,6 +3114,7 @@ fn draw_daily_chart(
     context: &gtk::cairo::Context,
     width: i32,
     height: i32,
+    colors: &ChartColors,
     production: &[f64],
     load: &[f64],
 ) {
@@ -3077,7 +3124,7 @@ fn draw_daily_chart(
         .copied()
         .fold(0.0_f64, f64::max)
         .max(1.0);
-    draw_chart_background(context, width, height, max_value, "kWh/h");
+    draw_chart_background(context, width, height, colors, max_value, "kWh/h");
     let left = 52.0;
     let right = 14.0;
     let top = 18.0;
@@ -3098,9 +3145,10 @@ fn draw_daily_chart(
             x,
             production[hour],
             scale,
+            colors,
             BarStyle {
                 width: bar_width,
-                color: CHART_PRODUCTION,
+                role: ChartColorRole::Production,
             },
         );
         draw_bar(
@@ -3108,13 +3156,20 @@ fn draw_daily_chart(
             x + bar_width + 2.0,
             load[hour],
             scale,
+            colors,
             BarStyle {
                 width: bar_width,
-                color: CHART_LOAD,
+                role: ChartColorRole::Load,
             },
         );
         if hour % 3 == 0 {
-            draw_axis_label(context, x, f64::from(height) - 18.0, &format!("{hour}"));
+            draw_axis_label(
+                context,
+                x,
+                f64::from(height) - 18.0,
+                colors,
+                &format!("{hour}"),
+            );
         }
     }
 }
@@ -3123,6 +3178,7 @@ fn draw_chart_background(
     context: &gtk::cairo::Context,
     width: i32,
     height: i32,
+    colors: &ChartColors,
     max_value: f64,
     unit: &str,
 ) {
@@ -3135,26 +3191,33 @@ fn draw_chart_background(
     let chart_width = (width - left - right).max(1.0);
     let chart_height = (height - top - bottom).max(1.0);
 
-    set_source_hex(context, CHART_BACKGROUND);
+    set_source_rgba(context, &colors.background);
     context.rectangle(0.0, 0.0, width, height);
     let _ = context.fill();
 
     context.set_line_width(1.0);
-    set_source_hex(context, CHART_GRID);
+    set_source_rgba(context, &colors.grid);
     for tick in 0..=4 {
         let y = top + chart_height * tick as f64 / 4.0;
         context.move_to(left, y);
         context.line_to(left + chart_width, y);
         let _ = context.stroke();
         let value = max_value * (1.0 - tick as f64 / 4.0);
-        draw_axis_label(context, 6.0, y + 4.0, &format!("{value:.0}"));
+        draw_axis_label(context, 6.0, y + 4.0, colors, &format!("{value:.0}"));
     }
-    draw_axis_label(context, 6.0, top - 4.0, unit);
+    draw_axis_label(context, 6.0, top - 4.0, colors, unit);
 }
 
-fn draw_bar(context: &gtk::cairo::Context, x: f64, value: f64, scale: ChartScale, style: BarStyle) {
+fn draw_bar(
+    context: &gtk::cairo::Context,
+    x: f64,
+    value: f64,
+    scale: ChartScale,
+    colors: &ChartColors,
+    style: BarStyle,
+) {
     let height = (value / scale.max_value).clamp(0.0, 1.0) * scale.height;
-    set_source_hex(context, style.color);
+    set_source_rgba(context, colors.series(style.role));
     context.rectangle(
         x,
         scale.top + scale.height - height,
@@ -3164,8 +3227,14 @@ fn draw_bar(context: &gtk::cairo::Context, x: f64, value: f64, scale: ChartScale
     let _ = context.fill();
 }
 
-fn draw_axis_label(context: &gtk::cairo::Context, x: f64, y: f64, text: &str) {
-    set_source_hex(context, CHART_TEXT);
+fn draw_axis_label(
+    context: &gtk::cairo::Context,
+    x: f64,
+    y: f64,
+    colors: &ChartColors,
+    text: &str,
+) {
+    set_source_rgba(context, &colors.text);
     context.select_font_face(
         "Sans",
         gtk::cairo::FontSlant::Normal,
@@ -3176,26 +3245,34 @@ fn draw_axis_label(context: &gtk::cairo::Context, x: f64, y: f64, text: &str) {
     let _ = context.show_text(text);
 }
 
-fn set_source_hex(context: &gtk::cairo::Context, color: &str) {
-    let Some((red, green, blue)) = parse_hex_rgb(color) else {
-        return;
-    };
-    context.set_source_rgb(red, green, blue);
+fn set_source_rgba(context: &gtk::cairo::Context, color: &gtk::gdk::RGBA) {
+    context.set_source_rgba(
+        f64::from(color.red()),
+        f64::from(color.green()),
+        f64::from(color.blue()),
+        f64::from(color.alpha()),
+    );
 }
 
-fn parse_hex_rgb(color: &str) -> Option<(f64, f64, f64)> {
-    let color = color.strip_prefix('#')?;
-    if color.len() != 6 {
-        return None;
-    }
-    let red = u8::from_str_radix(&color[0..2], 16).ok()?;
-    let green = u8::from_str_radix(&color[2..4], 16).ok()?;
-    let blue = u8::from_str_radix(&color[4..6], 16).ok()?;
-    Some((
-        f64::from(red) / 255.0,
-        f64::from(green) / 255.0,
-        f64::from(blue) / 255.0,
-    ))
+fn theme_color<W: IsA<gtk::Widget>>(
+    widget: &W,
+    name: &str,
+    fallback: gtk::gdk::RGBA,
+) -> gtk::gdk::RGBA {
+    widget
+        .style_context()
+        .lookup_color(name)
+        .unwrap_or(fallback)
+}
+
+fn rgba_to_hex(color: &gtk::gdk::RGBA) -> String {
+    let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+    format!(
+        "#{:02x}{:02x}{:02x}",
+        channel(color.red()),
+        channel(color.green()),
+        channel(color.blue())
+    )
 }
 
 fn simulation_summary_table(result: &SimulationResult) -> Grid {
@@ -3927,28 +4004,39 @@ fn estimate_text_label(text: &str, xalign: f32, tone: EstimateTone, monospace: b
     if monospace {
         apply_text_role(&label, "code");
     }
-    label.set_markup(&estimate_markup(text, tone));
+    label.set_markup(&estimate_markup(&label, text, tone));
     label
 }
 
-fn estimate_markup(text: &str, tone: EstimateTone) -> String {
+fn estimate_markup(label: &Label, text: &str, tone: EstimateTone) -> String {
     let text = escape_markup(text);
     match tone {
         EstimateTone::Normal => format!(r##"<span size="large">{text}</span>"##),
         EstimateTone::Muted => {
-            format!(r##"<span size="large" foreground="{ESTIMATE_MUTED}">{text}</span>"##)
+            let color = theme_color_hex(label, "text_2", gtk::gdk::RGBA::new(0.55, 0.55, 0.6, 1.0));
+            format!(r##"<span size="large" foreground="{color}">{text}</span>"##)
         }
         EstimateTone::Strong | EstimateTone::Mean => {
-            format!(
-                r##"<span size="large" foreground="{ESTIMATE_STRONG}" weight="bold">{text}</span>"##
-            )
+            let color = theme_color_hex(
+                label,
+                "accent_strong",
+                gtk::gdk::RGBA::new(0.7, 0.78, 1.0, 1.0),
+            );
+            format!(r##"<span size="large" foreground="{color}" weight="bold">{text}</span>"##)
         }
         EstimateTone::Minimum => {
-            format!(
-                r##"<span size="large" foreground="{ESTIMATE_ERROR}" weight="bold">{text}</span>"##
-            )
+            let color = theme_color_hex(label, "danger", gtk::gdk::RGBA::new(1.0, 0.7, 0.67, 1.0));
+            format!(r##"<span size="large" foreground="{color}" weight="bold">{text}</span>"##)
         }
     }
+}
+
+fn theme_color_hex<W: IsA<gtk::Widget>>(
+    widget: &W,
+    name: &str,
+    fallback: gtk::gdk::RGBA,
+) -> String {
+    rgba_to_hex(&theme_color(widget, name, fallback))
 }
 fn escape_markup(text: &str) -> String {
     text.replace('&', "&amp;")
