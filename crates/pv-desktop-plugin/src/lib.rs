@@ -53,12 +53,47 @@ const CMD_OPEN: &str = "pv.project.open";
 const CMD_CLOSE: &str = "pv.project.close";
 const CMD_SAVE: &str = "pv.project.save";
 const CMD_SAVE_AS: &str = "pv.project.save_as";
-const CMD_RUN_ESTIMATE: &str = "pv.project.run_estimate";
-const CMD_RUN_SIMULATION: &str = "pv.project.run_simulation";
 const CMD_SET_SIMULATION_RUNS: &str = "pv.project.set_simulation_runs";
 const CMD_EXIT: &str = "pv.app.exit";
 const SAVE_ACTION_IDS: &[&str] = &["pv-project-save", "file-save", "save"];
 const DETAILS_PANEL_MIN_WIDTH: i32 = 320;
+const COMPUTATION_DEBOUNCE: Duration = Duration::from_millis(750);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ComputationImpact {
+    Simulation,
+    EstimateAndSimulation,
+}
+
+impl ComputationImpact {
+    fn merge(self, other: Self) -> Self {
+        if self == Self::EstimateAndSimulation || other == Self::EstimateAndSimulation {
+            Self::EstimateAndSimulation
+        } else {
+            Self::Simulation
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ComputationTrigger {
+    Debounced,
+    Immediate,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ComputationStage {
+    Estimate,
+    Simulation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ComputationPhase {
+    Idle,
+    Debouncing,
+    Estimating,
+    WaitingForSimulation,
+}
 
 #[derive(Clone, Debug)]
 struct DesktopState {
@@ -69,6 +104,8 @@ struct DesktopState {
     log: Vec<String>,
     session_loaded: bool,
     simulation_generation: u64,
+    computation_phase: ComputationPhase,
+    retry_stage: Option<ComputationStage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,15 +124,22 @@ impl Default for DesktopState {
             log: vec!["No project open".to_string()],
             session_loaded: false,
             simulation_generation: 0,
+            computation_phase: ComputationPhase::Idle,
+            retry_stage: None,
         }
     }
+}
+
+#[derive(Default)]
+struct AutomaticComputationState {
+    generation: u64,
+    pending: Option<ComputationImpact>,
+    debounce: Option<gtk::glib::SourceId>,
 }
 
 struct ShellModeHandlers {
     show_workspace: Box<dyn Fn()>,
     show_launcher: Box<dyn Fn()>,
-    show_estimate_panel: Box<dyn Fn()>,
-    show_simulation_panel: Box<dyn Fn()>,
 }
 
 struct SimulationRunState {
@@ -145,6 +189,7 @@ thread_local! {
     static SHELL_MODE_HANDLERS: RefCell<Option<ShellModeHandlers>> = const { RefCell::new(None) };
     static ACTIVE_FILE_CHOOSER: RefCell<Option<FileChooserDialog>> = const { RefCell::new(None) };
     static SIMULATION_RUN: RefCell<Option<SimulationRunState>> = const { RefCell::new(None) };
+    static AUTOMATIC_COMPUTATION: RefCell<AutomaticComputationState> = RefCell::new(AutomaticComputationState::default());
     static SIMULATION_GRAPH_DATE: RefCell<DailyProjectionDate> = const { RefCell::new(DailyProjectionDate { month: 6, day: 21 }) };
     static SIMULATION_PROGRESS_VIEWS: RefCell<Vec<SimulationProgressWidgets>> = const { RefCell::new(Vec::new()) };
     static SYSTEM_VIEWS: RefCell<Vec<gtk::glib::WeakRef<GtkBox>>> = const { RefCell::new(Vec::new()) };
@@ -158,15 +203,11 @@ thread_local! {
 pub fn install_shell_mode_handlers(
     show_workspace: impl Fn() + 'static,
     show_launcher: impl Fn() + 'static,
-    show_estimate_panel: impl Fn() + 'static,
-    show_simulation_panel: impl Fn() + 'static,
 ) {
     SHELL_MODE_HANDLERS.with(|handlers| {
         *handlers.borrow_mut() = Some(ShellModeHandlers {
             show_workspace: Box::new(show_workspace),
             show_launcher: Box::new(show_launcher),
-            show_estimate_panel: Box::new(show_estimate_panel),
-            show_simulation_panel: Box::new(show_simulation_panel),
         });
     });
 }
@@ -240,16 +281,6 @@ impl Plugin for PvDesktopPlugin {
                 .with_enabled(has_open_project_for_command),
         )?;
         host.register_command(
-            CommandSpec::new(PLUGIN_ID, CMD_RUN_ESTIMATE, "Run Estimate")
-                .with_handler(command_run_estimate)
-                .with_enabled(has_open_project_for_command),
-        )?;
-        host.register_command(
-            CommandSpec::new(PLUGIN_ID, CMD_RUN_SIMULATION, "Run Simulation")
-                .with_handler(command_run_simulation)
-                .with_enabled(has_open_project_for_command),
-        )?;
-        host.register_command(
             CommandSpec::new(PLUGIN_ID, CMD_SET_SIMULATION_RUNS, "Set Simulation Runs")
                 .with_handler(command_set_simulation_runs)
                 .with_enabled(has_open_project_for_command),
@@ -318,6 +349,7 @@ extern "C" fn command_new_project(
 }
 
 fn create_new_project() {
+    clear_automatic_computation();
     STATE.with(|state| {
         let mut state = state.borrow_mut();
         invalidate_running_simulation(&mut state);
@@ -330,7 +362,7 @@ fn create_new_project() {
         state.log.push(status);
     });
     save_desktop_session(None);
-    ensure_estimate_loaded();
+    ensure_results_loaded();
     show_project_workspace();
     refresh_views();
 }
@@ -384,57 +416,6 @@ extern "C" fn command_save_project_as(
     maruzzella_sdk::ffi::MzStatus::OK
 }
 
-extern "C" fn command_run_estimate(
-    _payload: maruzzella_sdk::ffi::MzBytes,
-) -> maruzzella_sdk::ffi::MzStatus {
-    if !has_open_project() {
-        append_log("Open or create a project first".to_string());
-        refresh_views();
-        return maruzzella_sdk::ffi::MzStatus::OK;
-    }
-
-    show_estimate_workbench_panel();
-
-    match run_estimate() {
-        Ok(()) => maruzzella_sdk::ffi::MzStatus::OK,
-        Err(message) => {
-            append_log(message);
-            refresh_views();
-            maruzzella_sdk::ffi::MzStatus::new(MzStatusCode::InternalError)
-        }
-    }
-}
-
-extern "C" fn command_run_simulation(
-    _payload: maruzzella_sdk::ffi::MzBytes,
-) -> maruzzella_sdk::ffi::MzStatus {
-    run_simulation_action()
-}
-
-fn run_simulation_action() -> maruzzella_sdk::ffi::MzStatus {
-    if !has_open_project() {
-        append_log("Open or create a project first".to_string());
-        refresh_views();
-        return maruzzella_sdk::ffi::MzStatus::OK;
-    }
-
-    show_simulation_workbench_panel();
-
-    match run_simulation() {
-        Ok(()) => maruzzella_sdk::ffi::MzStatus::OK,
-        Err(RunSimulationError::NeedsProject) => {
-            append_log("Open or create a project first".to_string());
-            refresh_views();
-            maruzzella_sdk::ffi::MzStatus::OK
-        }
-        Err(RunSimulationError::NeedsEstimate) => {
-            append_log("Run an estimate before simulation".to_string());
-            refresh_views();
-            maruzzella_sdk::ffi::MzStatus::OK
-        }
-    }
-}
-
 extern "C" fn command_exit_app(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
@@ -458,21 +439,15 @@ extern "C" fn command_set_simulation_runs(
 }
 
 fn set_simulation_runs(runs: usize) {
-    STATE.with(|state| {
-        let mut state = state.borrow_mut();
+    update_simulation_state(|state| {
         let Some(project) = state.project.as_mut() else {
-            let message = "Open or create a project first".to_string();
-            state.status = message.clone();
-            state.log.push(message);
             return;
         };
         project.inputs.simulation_options.runs = runs;
-        state.dirty = true;
         let message = format!("Simulation runs set to {}", format_runs(runs));
         state.status = message.clone();
         state.log.push(message);
     });
-    refresh_views();
 }
 
 pub fn current_simulation_runs() -> usize {
@@ -498,23 +473,6 @@ fn simulation_runs_from_payload(payload: maruzzella_sdk::ffi::MzBytes) -> Option
         .filter(|runs| *runs > 0)
 }
 
-fn run_estimate() -> Result<(), String> {
-    let Some(project) = STATE.with(|state| state.borrow().project.clone()) else {
-        return Err("Open or create a project first".to_string());
-    };
-    append_log("Running source-model estimate".to_string());
-    let (estimate, production_profile, annual_kwh) = compute_estimate_for_project(&project)?;
-    store_estimate_result(
-        estimate,
-        production_profile,
-        format!("Estimate complete: {annual_kwh:.0} kWh/year"),
-        true,
-        true,
-    );
-    refresh_views();
-    Ok(())
-}
-
 fn compute_estimate_for_project(
     project: &PvProjectDocument,
 ) -> Result<(SourceEnsembleEstimateDocument, ProductionProfile, f64), String> {
@@ -531,12 +489,11 @@ fn compute_estimate_for_project(
         let estimator = estimator
             .as_mut()
             .expect("embedded estimator is initialized above");
-        let estimate = estimator
-            .estimate_arrays(&request, &arrays)
+        let finished = estimator
+            .estimate_arrays_with_profile(&request, &arrays)
             .map_err(|error| format!("Estimate failed: {error:#}"))?;
-        let production_profile = estimator
-            .production_profile_arrays(&request, &arrays)
-            .map_err(|error| format!("Production profile failed: {error:#}"))?;
+        let estimate = finished.estimate;
+        let production_profile = finished.production_profile;
         let annual_kwh = estimate
             .ensemble_estimate
             .annual_energy
@@ -594,17 +551,220 @@ fn recompute_current_estimate(
     Ok(())
 }
 
-fn ensure_estimate_loaded() {
-    let needs_estimate = STATE.with(|state| {
-        let state = state.borrow();
-        state.project.as_ref().is_some_and(|project| {
+fn ensure_results_loaded() {
+    let work_in_flight = simulation_run_snapshot().is_some()
+        || AUTOMATIC_COMPUTATION.with(|automatic| automatic.borrow().pending.is_some());
+    if work_in_flight {
+        return;
+    }
+    let impact = STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let project = state.project.as_mut()?;
+        let impact = required_computation(
+            project.results.estimate.is_some(),
+            project.results.production_profile.is_some(),
+            project
+                .results
+                .simulation
+                .as_ref()
+                .map(|result| (result.cancelled, result.requested_runs)),
+            project.inputs.simulation_options.runs,
+        );
+        match impact {
+            Some(ComputationImpact::EstimateAndSimulation) => {
+                project.results.estimate = None;
+                project.results.production_profile = None;
+                project.results.simulation = None;
+                project.results.simulation_metadata = None;
+            }
+            Some(ComputationImpact::Simulation) => {
+                project.results.simulation = None;
+                project.results.simulation_metadata = None;
+            }
+            None => {}
+        }
+        impact
+    });
+    if let Some(impact) = impact {
+        schedule_automatic_computation(impact, ComputationTrigger::Immediate);
+    }
+}
+
+fn required_computation(
+    has_estimate: bool,
+    has_production_profile: bool,
+    simulation: Option<(bool, usize)>,
+    requested_runs: usize,
+) -> Option<ComputationImpact> {
+    if !has_estimate || !has_production_profile {
+        Some(ComputationImpact::EstimateAndSimulation)
+    } else if simulation.is_none_or(|(cancelled, completed_request)| {
+        cancelled || completed_request != requested_runs
+    }) {
+        Some(ComputationImpact::Simulation)
+    } else {
+        None
+    }
+}
+
+fn schedule_automatic_computation(impact: ComputationImpact, trigger: ComputationTrigger) {
+    let generation = AUTOMATIC_COMPUTATION.with(|automatic| {
+        let mut automatic = automatic.borrow_mut();
+        if let Some(source) = automatic.debounce.take() {
+            source.remove();
+        }
+        automatic.generation = automatic.generation.wrapping_add(1);
+        automatic.pending = Some(
+            automatic
+                .pending
+                .map_or(impact, |pending| pending.merge(impact)),
+        );
+        automatic.generation
+    });
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        state.computation_phase = match trigger {
+            ComputationTrigger::Debounced => ComputationPhase::Debouncing,
+            ComputationTrigger::Immediate => ComputationPhase::Idle,
+        };
+        state.retry_stage = None;
+    });
+
+    match trigger {
+        ComputationTrigger::Debounced => {
+            let source = gtk::glib::timeout_add_local_once(COMPUTATION_DEBOUNCE, move || {
+                AUTOMATIC_COMPUTATION.with(|automatic| {
+                    let mut automatic = automatic.borrow_mut();
+                    if automatic.generation == generation {
+                        automatic.debounce = None;
+                    }
+                });
+                execute_pending_computation(generation);
+            });
+            AUTOMATIC_COMPUTATION.with(|automatic| {
+                let mut automatic = automatic.borrow_mut();
+                if automatic.generation == generation {
+                    automatic.debounce = Some(source);
+                } else {
+                    source.remove();
+                }
+            });
+        }
+        ComputationTrigger::Immediate => {
+            gtk::glib::idle_add_local_once(move || execute_pending_computation(generation));
+        }
+    }
+    refresh_workbench_views();
+}
+
+fn flush_pending_computation() {
+    let generation = AUTOMATIC_COMPUTATION.with(|automatic| {
+        let mut automatic = automatic.borrow_mut();
+        automatic.pending?;
+        if let Some(source) = automatic.debounce.take() {
+            source.remove();
+        }
+        Some(automatic.generation)
+    });
+    if let Some(generation) = generation {
+        execute_pending_computation(generation);
+    }
+}
+
+fn execute_pending_computation(generation: u64) {
+    let impact = AUTOMATIC_COMPUTATION.with(|automatic| {
+        let mut automatic = automatic.borrow_mut();
+        if automatic.generation != generation {
+            return None;
+        }
+        if simulation_run_snapshot().is_some() {
+            STATE.with(|state| {
+                state.borrow_mut().computation_phase = ComputationPhase::WaitingForSimulation;
+            });
+            return None;
+        }
+        automatic.pending.take()
+    });
+    let Some(mut impact) = impact else {
+        return;
+    };
+
+    let missing_estimate = STATE.with(|state| {
+        state.borrow().project.as_ref().is_some_and(|project| {
             project.results.estimate.is_none() || project.results.production_profile.is_none()
         })
     });
-    if needs_estimate
-        && let Err(message) = recompute_current_estimate("Estimate ready", false, false)
-    {
-        append_log(message);
+    if missing_estimate {
+        impact = ComputationImpact::EstimateAndSimulation;
+    }
+
+    if impact == ComputationImpact::EstimateAndSimulation {
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.computation_phase = ComputationPhase::Estimating;
+            state.status = "Updating estimate".to_string();
+        });
+        refresh_workbench_views();
+        if let Err(message) = recompute_current_estimate("Estimate updated", false, true) {
+            computation_failed(ComputationStage::Estimate, message);
+            return;
+        }
+    }
+
+    STATE.with(|state| state.borrow_mut().computation_phase = ComputationPhase::Idle);
+    match run_simulation() {
+        Ok(()) => {}
+        Err(RunSimulationError::NeedsProject) => clear_automatic_computation(),
+        Err(RunSimulationError::NeedsEstimate) => computation_failed(
+            ComputationStage::Estimate,
+            "Estimate data is unavailable".to_string(),
+        ),
+    }
+}
+
+fn computation_failed(stage: ComputationStage, message: String) {
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        state.computation_phase = ComputationPhase::Idle;
+        state.retry_stage = Some(stage);
+        state.status = message.clone();
+        state.log.push(message);
+    });
+    refresh_workbench_views();
+}
+
+fn retry_automatic_computation(stage: ComputationStage) {
+    let impact = match stage {
+        ComputationStage::Estimate => ComputationImpact::EstimateAndSimulation,
+        ComputationStage::Simulation => ComputationImpact::Simulation,
+    };
+    schedule_automatic_computation(impact, ComputationTrigger::Immediate);
+}
+
+fn clear_automatic_computation() {
+    AUTOMATIC_COMPUTATION.with(|automatic| {
+        let mut automatic = automatic.borrow_mut();
+        if let Some(source) = automatic.debounce.take() {
+            source.remove();
+        }
+        automatic.generation = automatic.generation.wrapping_add(1);
+        automatic.pending = None;
+    });
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        state.computation_phase = ComputationPhase::Idle;
+        state.retry_stage = None;
+    });
+}
+
+fn resume_pending_computation() {
+    let generation = AUTOMATIC_COMPUTATION.with(|automatic| {
+        let automatic = automatic.borrow();
+        (automatic.pending.is_some() && automatic.debounce.is_none())
+            .then_some(automatic.generation)
+    });
+    if let Some(generation) = generation {
+        gtk::glib::idle_add_local_once(move || execute_pending_computation(generation));
     }
 }
 
@@ -689,6 +849,8 @@ fn run_simulation() -> Result<(), RunSimulationError> {
     });
     STATE.with(|state| {
         let mut state = state.borrow_mut();
+        state.computation_phase = ComputationPhase::Idle;
+        state.retry_stage = None;
         if let Some(project) = state.project.as_mut() {
             project.results.simulation = None;
             project.results.simulation_metadata = None;
@@ -730,10 +892,25 @@ fn simulation_run_snapshot() -> Option<SimulationRunSnapshot> {
 }
 
 fn cancel_simulation_run() {
-    if request_simulation_cancel() {
-        STATE.with(|state| {
-            let mut state = state.borrow_mut();
-            state.status = "Cancelling simulation".to_string();
+    let cancelled = STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        if simulation_run_snapshot().is_none() {
+            return false;
+        }
+        invalidate_running_simulation(&mut state);
+        state.computation_phase = ComputationPhase::Idle;
+        state.retry_stage = Some(ComputationStage::Simulation);
+        state.status = "Cancelling simulation".to_string();
+        true
+    });
+    if cancelled {
+        AUTOMATIC_COMPUTATION.with(|automatic| {
+            let mut automatic = automatic.borrow_mut();
+            if let Some(source) = automatic.debounce.take() {
+                source.remove();
+            }
+            automatic.generation = automatic.generation.wrapping_add(1);
+            automatic.pending = None;
         });
         if let Some(run) = simulation_run_snapshot() {
             update_simulation_progress_views(run);
@@ -816,6 +993,7 @@ fn poll_simulation_run() {
             run.borrow_mut().take();
         });
         finish_simulation_run(result, generation, finished_metadata);
+        resume_pending_computation();
         refresh_workbench_views();
     } else if let Some(status) = progress_status {
         STATE.with(|state| {
@@ -833,6 +1011,27 @@ fn finish_simulation_run(
     generation: u64,
     metadata: Option<SimulationRunMetadata>,
 ) {
+    let stale = STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        if state.simulation_generation == generation {
+            return false;
+        }
+        if state.project.is_none() {
+            return true;
+        }
+        if state.retry_stage == Some(ComputationStage::Simulation) {
+            state.status = "Simulation cancelled".to_string();
+        } else if state.computation_phase != ComputationPhase::WaitingForSimulation {
+            let status = "Simulation result discarded because inputs changed".to_string();
+            state.status = status.clone();
+            state.log.push(status);
+        }
+        true
+    });
+    if stale {
+        return;
+    }
+
     match result {
         Ok(result) => {
             let self_sufficiency = result.summaries.self_sufficiency_ratio.p50;
@@ -850,23 +1049,19 @@ fn finish_simulation_run(
             };
             STATE.with(|state| {
                 let mut state = state.borrow_mut();
-                if state.simulation_generation != generation {
-                    let status = "Simulation result discarded because inputs changed".to_string();
-                    state.status = status.clone();
-                    state.log.push(status);
-                    return;
-                }
                 let Some(project) = state.project.as_mut() else {
                     return;
                 };
                 project.results.simulation = Some(result);
                 project.results.simulation_metadata = metadata;
+                state.computation_phase = ComputationPhase::Idle;
+                state.retry_stage = None;
                 state.dirty = true;
                 state.status = status.clone();
                 state.log.push(status);
             });
         }
-        Err(message) => append_log(message),
+        Err(message) => computation_failed(ComputationStage::Simulation, message),
     }
 }
 
@@ -986,13 +1181,14 @@ fn save_current_project() -> Result<SaveDisposition, String> {
 
 fn open_project(path: PathBuf) {
     if load_project_into_state(&path, true) {
-        ensure_estimate_loaded();
+        ensure_results_loaded();
         show_project_workspace();
     }
     refresh_views();
 }
 
 fn close_project() {
+    clear_automatic_computation();
     STATE.with(|state| {
         let mut state = state.borrow_mut();
         invalidate_running_simulation(&mut state);
@@ -1025,25 +1221,10 @@ fn show_no_project_launcher() {
     });
 }
 
-fn show_estimate_workbench_panel() {
-    SHELL_MODE_HANDLERS.with(|handlers| {
-        if let Some(handlers) = handlers.borrow().as_ref() {
-            (handlers.show_estimate_panel)();
-        }
-    });
-}
-
-fn show_simulation_workbench_panel() {
-    SHELL_MODE_HANDLERS.with(|handlers| {
-        if let Some(handlers) = handlers.borrow().as_ref() {
-            (handlers.show_simulation_panel)();
-        }
-    });
-}
-
 fn load_project_into_state(path: &Path, remember: bool) -> bool {
     match load_project(path) {
         Ok(project) => {
+            clear_automatic_computation();
             STATE.with(|state| {
                 let mut state = state.borrow_mut();
                 invalidate_running_simulation(&mut state);
@@ -1316,7 +1497,7 @@ extern "C" fn create_system_view(
         return std::ptr::null_mut();
     }
     ensure_session_loaded();
-    ensure_estimate_loaded();
+    ensure_results_loaded();
     let root = GtkBox::new(Orientation::Vertical, 0);
     root.set_hexpand(true);
     root.set_vexpand(true);
@@ -1333,7 +1514,7 @@ extern "C" fn create_estimate_view(
         return std::ptr::null_mut();
     }
     ensure_session_loaded();
-    ensure_estimate_loaded();
+    ensure_results_loaded();
     let root = GtkBox::new(Orientation::Vertical, 0);
     root.set_hexpand(true);
     root.set_vexpand(true);
@@ -1350,7 +1531,7 @@ extern "C" fn create_simulation_view(
         return std::ptr::null_mut();
     }
     ensure_session_loaded();
-    ensure_estimate_loaded();
+    ensure_results_loaded();
     let root = GtkBox::new(Orientation::Vertical, 0);
     root.set_hexpand(true);
     root.set_vexpand(true);
@@ -1367,7 +1548,7 @@ extern "C" fn create_details_view(
         return std::ptr::null_mut();
     }
     ensure_session_loaded();
-    ensure_estimate_loaded();
+    ensure_results_loaded();
     let root = GtkBox::new(Orientation::Vertical, 0);
     root.set_hexpand(true);
     root.set_vexpand(true);
@@ -1863,7 +2044,7 @@ fn append_array_fields(content: &GtkBox, project: &PvProjectDocument) {
             .unwrap_or(0.0),
         2,
         |value| {
-            update_input_state(|state| {
+            update_simulation_input_state(|state| {
                 if let Some(project) = state.project.as_mut() {
                     project.inputs.estimate_request.storage_usable_kwh =
                         (value > 0.0).then_some(value);
@@ -2012,6 +2193,26 @@ fn non_empty_text(value: &str) -> Option<String> {
 }
 
 fn save_array(index: Option<usize>, array: EstimateArray) {
+    if let Some(index) = index {
+        let current = STATE.with(|state| {
+            state
+                .borrow()
+                .project
+                .as_ref()
+                .and_then(|project| project.inputs.arrays.get(index))
+                .cloned()
+        });
+        if let Some(current) = current {
+            if current == array {
+                return;
+            }
+            if !array_edit_is_functional(&current, &array) {
+                rename_array(index, array.name);
+                return;
+            }
+        }
+    }
+
     update_state(|state| {
         let Some(project) = state.project.as_mut() else {
             return;
@@ -2024,6 +2225,45 @@ fn save_array(index: Option<usize>, array: EstimateArray) {
         }
         sync_request_from_arrays(state);
     });
+}
+
+fn array_edit_is_functional(current: &EstimateArray, updated: &EstimateArray) -> bool {
+    current.peak_power_kwp != updated.peak_power_kwp
+        || current.tilt_deg != updated.tilt_deg
+        || current.azimuth_deg != updated.azimuth_deg
+}
+
+fn rename_array(index: usize, name: Option<String>) {
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let Some(project) = state.project.as_mut() else {
+            return;
+        };
+        let Some(array) = project.inputs.arrays.get_mut(index) else {
+            return;
+        };
+        array.name = name.clone();
+
+        if let Some(reference) = project
+            .results
+            .estimate
+            .as_mut()
+            .and_then(|estimate| estimate.references.get_mut("arrays"))
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|arrays| arrays.get_mut(index))
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            if let Some(name) = name {
+                reference.insert("name".to_string(), serde_json::Value::String(name));
+            } else {
+                reference.remove("name");
+            }
+        }
+
+        state.dirty = true;
+        state.status = "Array renamed".to_string();
+    });
+    refresh_views();
 }
 
 fn confirm_delete_array(index: usize) {
@@ -2113,7 +2353,7 @@ fn append_consumption_fields(content: &GtkBox, inputs: &pv_desktop_core::Project
         LoadProfile::DailyKwh { daily_kwh, .. } => *daily_kwh * 365.0,
     };
     let annual_entry = number_entry(annual, 0, |value| {
-        update_input_state(|state| {
+        update_simulation_input_state(|state| {
             if let Some(project) = state.project.as_mut() {
                 let shape = load_shape(&project.inputs.load_profile);
                 project.inputs.load_profile = LoadProfile::AnnualKwh {
@@ -2133,7 +2373,7 @@ fn append_consumption_fields(content: &GtkBox, inputs: &pv_desktop_core::Project
         let next_shape = LoadShape::BuiltIn {
             shape_id: shape_from_index(dropdown.selected()),
         };
-        update_input_state(|state| {
+        update_simulation_state(|state| {
             if let Some(project) = state.project.as_mut() {
                 let annual_kwh = match project.inputs.load_profile {
                     LoadProfile::AnnualKwh { annual_kwh, .. } => annual_kwh,
@@ -2158,7 +2398,7 @@ fn render_estimate_into(root: &GtkBox) {
         if project.results.estimate.is_some() {
             append_estimate_result(&content, project);
         } else {
-            append_estimate_empty_state(&content);
+            append_estimate_empty_state(&content, &state);
         }
     } else {
         append_no_project_state(
@@ -2171,14 +2411,18 @@ fn render_estimate_into(root: &GtkBox) {
     root.append(&scroller);
 }
 
-fn append_estimate_empty_state(content: &GtkBox) {
+fn append_estimate_empty_state(content: &GtkBox, state: &DesktopState) {
     let summary = Grid::new();
     summary.set_column_spacing(18);
     summary.set_row_spacing(8);
     summary.set_hexpand(true);
     add_estimate_metric_row(&summary, 0, "Annual kWh", "-", EstimateTone::Strong);
     content.append(&summary);
-    content.append(&body_label("No estimate"));
+    content.append(&body_label(computation_empty_message(
+        state,
+        ComputationStage::Estimate,
+    )));
+    append_retry_action(content, state, ComputationStage::Estimate);
 }
 
 fn append_estimate_result(content: &GtkBox, project: &PvProjectDocument) {
@@ -2274,8 +2518,11 @@ fn append_estimate_details(content: &GtkBox, state: &DesktopState) {
     };
 
     let Some(document) = &project.results.estimate else {
-        content.append(&body_label("No estimate result is available."));
-        append_estimate_actions(content);
+        content.append(&body_label(computation_empty_message(
+            state,
+            ComputationStage::Estimate,
+        )));
+        append_retry_action(content, state, ComputationStage::Estimate);
         return;
     };
 
@@ -2322,8 +2569,6 @@ fn append_estimate_details(content: &GtkBox, state: &DesktopState) {
     for note in estimate_diagnostics(project, document) {
         append_detail_note(content, &note);
     }
-
-    append_estimate_actions(content);
 }
 
 fn append_simulation_details(content: &GtkBox, state: &DesktopState) {
@@ -2371,12 +2616,16 @@ fn append_simulation_details(content: &GtkBox, state: &DesktopState) {
     }
 
     let Some(result) = &project.results.simulation else {
-        content.append(&body_label("No simulation result is available."));
+        content.append(&body_label(computation_empty_message(
+            state,
+            ComputationStage::Simulation,
+        )));
         content.append(&section_separator());
         content.append(&section_label("Diagnostics"));
         for note in missing_simulation_diagnostics(project) {
             append_detail_note(content, &note);
         }
+        append_retry_action(content, state, ComputationStage::Simulation);
         return;
     };
 
@@ -2573,12 +2822,13 @@ fn estimate_diagnostics(
 fn missing_simulation_diagnostics(project: &PvProjectDocument) -> Vec<String> {
     let mut diagnostics = Vec::new();
     if project.results.production_profile.is_none() {
-        diagnostics.push(
-            "Run an estimate before simulation so hourly production is available.".to_string(),
-        );
-    } else {
         diagnostics
-            .push("Run a simulation to inspect grid interaction and load coverage.".to_string());
+            .push("The production estimate is being prepared before simulation.".to_string());
+    } else {
+        diagnostics.push(
+            "Simulation updates automatically when system or consumption inputs change."
+                .to_string(),
+        );
     }
     if project.inputs.estimate_request.storage_usable_kwh.is_none() {
         diagnostics.push(
@@ -2589,17 +2839,46 @@ fn missing_simulation_diagnostics(project: &PvProjectDocument) -> Vec<String> {
     diagnostics
 }
 
-fn append_estimate_actions(content: &GtkBox) {
-    let run = Button::with_label("Run Estimate");
-    apply_button_role(&run, "primary");
-    run.connect_clicked(|_| {
-        show_estimate_workbench_panel();
-        if let Err(message) = run_estimate() {
-            append_log(message);
-            refresh_workbench_views();
+fn computation_empty_message(state: &DesktopState, stage: ComputationStage) -> &'static str {
+    if let Some(failed_stage) = state.retry_stage {
+        return match (failed_stage, stage) {
+            (ComputationStage::Estimate, ComputationStage::Estimate) => "Estimate update failed.",
+            (ComputationStage::Estimate, ComputationStage::Simulation) => {
+                "Estimate update failed; simulation is waiting."
+            }
+            (ComputationStage::Simulation, ComputationStage::Simulation) => {
+                "Simulation stopped before completion."
+            }
+            (ComputationStage::Simulation, ComputationStage::Estimate) => {
+                "Estimate is unavailable."
+            }
+        };
+    }
+    match (state.computation_phase, stage) {
+        (ComputationPhase::Debouncing, _) => "Waiting for input changes to settle…",
+        (ComputationPhase::Estimating, ComputationStage::Estimate) => "Updating estimate…",
+        (ComputationPhase::Estimating, ComputationStage::Simulation) => {
+            "Updating estimate before simulation…"
         }
-    });
-    content.append(&run);
+        (ComputationPhase::WaitingForSimulation, ComputationStage::Simulation) => {
+            "Waiting for the previous simulation to stop…"
+        }
+        (_, ComputationStage::Estimate) => "Preparing estimate…",
+        (_, ComputationStage::Simulation) => "Preparing simulation…",
+    }
+}
+
+fn append_retry_action(content: &GtkBox, state: &DesktopState, stage: ComputationStage) {
+    let Some(retry_stage) = state.retry_stage else {
+        return;
+    };
+    if retry_stage != stage && stage != ComputationStage::Simulation {
+        return;
+    }
+    let retry = Button::with_label("Retry");
+    apply_button_role(&retry, "primary");
+    retry.connect_clicked(move |_| retry_automatic_computation(retry_stage));
+    content.append(&retry);
 }
 
 fn append_project_actions(content: &GtkBox) {
@@ -2648,7 +2927,7 @@ fn render_simulation_into(root: &GtkBox) {
     } else if let Some(result) = &project.results.simulation {
         append_simulation_result(&content, project, result);
     } else {
-        append_simulation_empty_state(&content);
+        append_simulation_empty_state(&content, &state);
     }
     scroller.set_child(Some(&content));
     root.append(&scroller);
@@ -3519,37 +3798,14 @@ fn format_percent_value(value: f64) -> String {
     format!("{:.0}%", value * 100.0)
 }
 
-fn append_simulation_empty_state(content: &GtkBox) {
-    content.append(&simulation_empty_label());
-    let run = Button::new();
-    run.set_halign(Align::Start);
-    run.set_tooltip_text(Some("Run simulation"));
-    run.set_size_request(96, 40);
-    apply_button_role(&run, "primary");
-    run.set_child(Some(&simulation_run_button_content()));
-    run.connect_clicked(|_| {
-        let _ = run_simulation_action();
-    });
-    content.append(&run);
-}
-
-fn simulation_run_button_content() -> GtkBox {
-    let content = GtkBox::new(Orientation::Horizontal, 8);
-    content.set_margin_top(7);
-    content.set_margin_bottom(7);
-    content.set_margin_start(12);
-    content.set_margin_end(14);
-    let icon = Image::from_icon_name("media-playback-start-symbolic");
-    icon.set_icon_size(gtk::IconSize::Normal);
-    content.append(&icon);
-    content.append(&Label::new(Some("Run")));
-    content
-}
-
-fn simulation_empty_label() -> Label {
-    let label = body_label("No simulation run yet.");
+fn append_simulation_empty_state(content: &GtkBox, state: &DesktopState) {
+    let label = body_label(computation_empty_message(
+        state,
+        ComputationStage::Simulation,
+    ));
     apply_text_role(&label, "section-label");
-    label
+    content.append(&label);
+    append_retry_action(content, state, ComputationStage::Simulation);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3559,11 +3815,39 @@ enum RefreshScope {
 }
 
 fn update_state(update: impl FnOnce(&mut DesktopState)) {
-    update_project_inputs(update, RefreshScope::All);
+    update_project_inputs(
+        update,
+        RefreshScope::All,
+        ComputationImpact::EstimateAndSimulation,
+        ComputationTrigger::Immediate,
+    );
 }
 
 fn update_input_state(update: impl FnOnce(&mut DesktopState)) {
-    update_project_inputs(update, RefreshScope::Workbench);
+    update_project_inputs(
+        update,
+        RefreshScope::Workbench,
+        ComputationImpact::EstimateAndSimulation,
+        ComputationTrigger::Debounced,
+    );
+}
+
+fn update_simulation_input_state(update: impl FnOnce(&mut DesktopState)) {
+    update_project_inputs(
+        update,
+        RefreshScope::Workbench,
+        ComputationImpact::Simulation,
+        ComputationTrigger::Debounced,
+    );
+}
+
+fn update_simulation_state(update: impl FnOnce(&mut DesktopState)) {
+    update_project_inputs(
+        update,
+        RefreshScope::All,
+        ComputationImpact::Simulation,
+        ComputationTrigger::Immediate,
+    );
 }
 
 fn rename_setup_from_entry(name: &Entry) -> bool {
@@ -3591,60 +3875,43 @@ fn rename_setup(name: String) {
     refresh_views();
 }
 
-fn update_project_inputs(update: impl FnOnce(&mut DesktopState), refresh_scope: RefreshScope) {
-    let project = STATE.with(|state| {
+fn update_project_inputs(
+    update: impl FnOnce(&mut DesktopState),
+    refresh_scope: RefreshScope,
+    impact: ComputationImpact,
+    trigger: ComputationTrigger,
+) {
+    let updated = STATE.with(|state| {
         let mut state = state.borrow_mut();
         if state.project.is_none() {
             let message = "Open or create a project first".to_string();
             state.status = message.clone();
             state.log.push(message);
-            return None;
+            return false;
         }
         update(&mut state);
         state.dirty = true;
-        let project = if let Some(project) = state.project.as_mut() {
-            project.results.simulation = None;
-            project.results.simulation_metadata = None;
-            Some(project.clone())
-        } else {
-            None
-        };
-        if project.is_some() {
-            invalidate_running_simulation(&mut state);
-        }
-        project
-    });
-
-    let Some(project) = project else {
-        refresh_views();
-        return;
-    };
-
-    match compute_estimate_for_project(&project) {
-        Ok((estimate, production_profile, annual_kwh)) => store_estimate_result(
-            estimate,
-            production_profile,
-            format!("Estimate updated: {annual_kwh:.0} kWh/year"),
-            false,
-            true,
-        ),
-        Err(message) => STATE.with(|state| {
-            let mut state = state.borrow_mut();
-            let invalidated = if let Some(project) = state.project.as_mut() {
+        if let Some(project) = state.project.as_mut() {
+            if impact == ComputationImpact::EstimateAndSimulation {
                 project.results.estimate = None;
                 project.results.production_profile = None;
-                project.results.simulation = None;
-                project.results.simulation_metadata = None;
-                true
-            } else {
-                false
-            };
-            if invalidated {
-                invalidate_running_simulation(&mut state);
+            } else if let Some(document) = project.results.estimate.as_mut() {
+                document.system.storage_usable_kwh =
+                    project.inputs.estimate_request.storage_usable_kwh;
             }
-            state.status = message;
-        }),
+            project.results.simulation = None;
+            project.results.simulation_metadata = None;
+            invalidate_running_simulation(&mut state);
+        }
+        true
+    });
+
+    if !updated {
+        refresh_views();
+        return;
     }
+
+    schedule_automatic_computation(impact, trigger);
 
     match refresh_scope {
         RefreshScope::All => refresh_views(),
@@ -3700,6 +3967,7 @@ fn number_entry(value: f64, digits: u32, update: impl Fn(f64) + 'static) -> Entr
             update(value);
         }
     });
+    entry.connect_activate(|_| flush_pending_computation());
     entry
 }
 
@@ -3721,6 +3989,7 @@ fn optional_number_entry(
             update(Some(value));
         }
     });
+    entry.connect_activate(|_| flush_pending_computation());
     entry
 }
 
@@ -4189,5 +4458,67 @@ mod tests {
         assert_eq!(azimuth_direction_label(-180.0), "N");
         assert_eq!(azimuth_direction_label(45.0), "SW");
         assert_eq!(azimuth_direction_label(-45.0), "SE");
+    }
+
+    #[test]
+    fn computation_impact_keeps_the_strongest_dependency() {
+        assert_eq!(
+            ComputationImpact::Simulation.merge(ComputationImpact::Simulation),
+            ComputationImpact::Simulation
+        );
+        assert_eq!(
+            ComputationImpact::Simulation.merge(ComputationImpact::EstimateAndSimulation),
+            ComputationImpact::EstimateAndSimulation
+        );
+        assert_eq!(
+            ComputationImpact::EstimateAndSimulation.merge(ComputationImpact::Simulation),
+            ComputationImpact::EstimateAndSimulation
+        );
+    }
+
+    #[test]
+    fn missing_or_stale_results_select_the_minimum_computation() {
+        assert_eq!(
+            required_computation(false, false, None, 10_000),
+            Some(ComputationImpact::EstimateAndSimulation)
+        );
+        assert_eq!(
+            required_computation(true, true, None, 10_000),
+            Some(ComputationImpact::Simulation)
+        );
+        assert_eq!(
+            required_computation(true, true, Some((true, 10_000)), 10_000),
+            Some(ComputationImpact::Simulation)
+        );
+        assert_eq!(
+            required_computation(true, true, Some((false, 1_000)), 10_000),
+            Some(ComputationImpact::Simulation)
+        );
+        assert_eq!(
+            required_computation(true, true, Some((false, 10_000)), 10_000),
+            None
+        );
+    }
+
+    #[test]
+    fn array_name_is_cosmetic_but_electrical_fields_are_functional() {
+        let current = EstimateArray {
+            name: Some("Roof".to_string()),
+            peak_power_kwp: 4.0,
+            tilt_deg: 30.0,
+            azimuth_deg: 0.0,
+        };
+        let mut updated = current.clone();
+        updated.name = Some("South roof".to_string());
+        assert!(!array_edit_is_functional(&current, &updated));
+
+        updated.peak_power_kwp = 4.1;
+        assert!(array_edit_is_functional(&current, &updated));
+        updated = current.clone();
+        updated.tilt_deg = 31.0;
+        assert!(array_edit_is_functional(&current, &updated));
+        updated = current.clone();
+        updated.azimuth_deg = 1.0;
+        assert!(array_edit_is_functional(&current, &updated));
     }
 }

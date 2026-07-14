@@ -98,8 +98,7 @@ impl SourceModelEstimator {
         request: &EstimateRequest,
         arrays: &[EstimateArray],
     ) -> Result<ProductionProfile> {
-        let finished =
-            self.finish_prepared(self.runtime.prepare_estimate_arrays(request, arrays)?)?;
+        let finished = self.estimate_arrays_with_profile(request, arrays)?;
         Ok(finished.production_profile)
     }
 
@@ -108,9 +107,16 @@ impl SourceModelEstimator {
         request: &EstimateRequest,
         arrays: &[EstimateArray],
     ) -> Result<SourceEnsembleEstimateDocument> {
-        let finished =
-            self.finish_prepared(self.runtime.prepare_estimate_arrays(request, arrays)?)?;
+        let finished = self.estimate_arrays_with_profile(request, arrays)?;
         Ok(finished.estimate)
+    }
+
+    pub fn estimate_arrays_with_profile(
+        &mut self,
+        request: &EstimateRequest,
+        arrays: &[EstimateArray],
+    ) -> Result<FinishedEstimate> {
+        self.finish_prepared(self.runtime.prepare_estimate_arrays(request, arrays)?)
     }
 
     fn finish_prepared(&mut self, prepared: PreparedEstimate) -> Result<FinishedEstimate> {
@@ -154,5 +160,32 @@ fn embedded_onnx_bytes(path: &Path) -> Result<&'static [u8]> {
             "embedded source-model artifact is missing {}",
             path.display()
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn combined_estimate_returns_the_matching_production_profile() {
+        let request = EstimateRequest::default();
+        let arrays = [request.single_array()];
+        let mut estimator = SourceModelEstimator::load_embedded().expect("load embedded models");
+
+        let finished = estimator
+            .estimate_arrays_with_profile(&request, &arrays)
+            .expect("estimate and profile");
+
+        assert_eq!(finished.production_profile.hourly_mean_kwh.len(), 8760);
+        assert_eq!(
+            finished
+                .estimate
+                .ensemble_estimate
+                .annual_energy
+                .mean
+                .as_kilowatt_hours(),
+            finished.production_profile.annual_mean_kwh
+        );
     }
 }

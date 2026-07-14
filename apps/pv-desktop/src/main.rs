@@ -31,10 +31,6 @@ fn main() {
             label: "File".to_string(),
         },
         MenuRootSpec {
-            id: "project".to_string(),
-            label: "Project".to_string(),
-        },
-        MenuRootSpec {
             id: "help".to_string(),
             label: "Help".to_string(),
         },
@@ -51,18 +47,6 @@ fn main() {
             "pv.project.save_as",
         ),
         menu_item("file-exit", "file", "Exit", "pv.app.exit"),
-        menu_item(
-            "project-estimate",
-            "project",
-            "Run Estimate",
-            "pv.project.run_estimate",
-        ),
-        menu_item(
-            "project-simulation",
-            "project",
-            "Run Simulation",
-            "pv.project.run_simulation",
-        ),
         menu_item("help-about", "help", "About", "shell.about"),
     ];
     product.commands = vec![
@@ -71,8 +55,6 @@ fn main() {
         command("pv.project.close", "Close Project"),
         command("pv.project.save", "Save Project"),
         command("pv.project.save_as", "Save Project As"),
-        command("pv.project.run_estimate", "Run Estimate"),
-        command("pv.project.run_simulation", "Run Simulation"),
         command("pv.project.set_simulation_runs", "Set Simulation Runs"),
         command("pv.app.exit", "Exit"),
     ];
@@ -84,20 +66,6 @@ fn main() {
             "pv.project.save",
             false,
             ToolbarDisplayMode::IconAndText,
-        ),
-        toolbar_item(
-            "estimate",
-            Some("x-office-spreadsheet-symbolic"),
-            "Estimate",
-            "pv.project.run_estimate",
-            true,
-        ),
-        toolbar_item(
-            "simulation",
-            Some("media-playback-start-symbolic"),
-            "Simulation",
-            "pv.project.run_simulation",
-            true,
         ),
         toolbar_dropdown_item(
             "simulation-runs",
@@ -182,27 +150,13 @@ fn main() {
     let (application, handle) = build_application_with_handle(config);
     let workspace_handle = handle.clone();
     let launcher_handle = handle.clone();
-    let estimate_handle = handle.clone();
-    let simulation_handle = handle.clone();
     let workspace_shell = project_shell.clone();
-    let estimate_shell = project_shell.clone();
-    let simulation_shell = project_shell.clone();
     pv_desktop_plugin::install_shell_mode_handlers(
         move || {
             switch_to_project_workspace(&workspace_handle, &workspace_shell);
         },
         move || {
             let _ = launcher_handle.switch_to_launcher();
-        },
-        move || {
-            ensure_workbench_tab(&estimate_handle, &estimate_shell, estimate_workbench_tab());
-        },
-        move || {
-            ensure_workbench_tab(
-                &simulation_handle,
-                &simulation_shell,
-                simulation_workbench_tab(),
-            );
         },
     );
     application.run();
@@ -228,7 +182,7 @@ fn estimate_workbench_tab() -> TabSpec {
         "Estimate",
         ESTIMATE_VIEW_ID,
         "The PV estimate view could not be created.",
-        true,
+        false,
     )
 }
 
@@ -239,7 +193,7 @@ fn simulation_workbench_tab() -> TabSpec {
         "Simulation",
         SIMULATION_VIEW_ID,
         "The PV simulation view could not be created.",
-        true,
+        false,
     )
 }
 
@@ -268,7 +222,16 @@ fn repaired_workspace_spec(default_shell: &ShellSpec) -> ShellSpec {
     if ensure_workbench_has_any_tab(&mut shell.spec.workbench) {
         changed = true;
     }
+    if ensure_workbench_tab_present(&mut shell.spec.workbench, estimate_workbench_tab()) {
+        changed = true;
+    }
+    if ensure_workbench_tab_present(&mut shell.spec.workbench, simulation_workbench_tab()) {
+        changed = true;
+    }
     if ensure_right_panel_detail_tab(&mut shell.spec.right_panel) {
+        changed = true;
+    }
+    if remove_legacy_run_toolbar_items(&mut shell.spec.toolbar_items) {
         changed = true;
     }
     sync_simulation_runs_toolbar(&mut shell.spec);
@@ -313,6 +276,12 @@ fn sync_simulation_runs_toolbar_items(items: &mut [ToolbarItemSpec]) {
             item.selected_index = selected_index;
         }
     }
+}
+
+fn remove_legacy_run_toolbar_items(items: &mut Vec<ToolbarItemSpec>) -> bool {
+    let previous_len = items.len();
+    items.retain(|item| item.id != "estimate" && item.id != "simulation");
+    items.len() != previous_len
 }
 
 fn simulation_runs_toolbar_index(runs: usize) -> u32 {
@@ -399,47 +368,40 @@ fn workbench_has_tabs(node: &WorkbenchNodeSpec) -> bool {
     }
 }
 
-fn ensure_workbench_tab(
-    handle: &maruzzella::MaruzzellaHandle,
-    default_shell: &ShellSpec,
-    tab: TabSpec,
-) {
-    let workspace_persistence_id = layout::scoped_persistence_id(PERSISTENCE_ID, WORKSPACE_SLOT);
-    let mut shell = layout::load_for_slot(PERSISTENCE_ID, WORKSPACE_SLOT, default_shell);
-    if !ensure_tab_active_in_workbench(&mut shell.spec.workbench, tab) {
-        return;
-    }
-
-    let spec = shell.spec.clone();
-    layout::save(&workspace_persistence_id, &shell);
-    let _ = handle.switch_to_workspace(WorkspaceSession::new(spec));
-}
-
-fn ensure_tab_active_in_workbench(node: &mut WorkbenchNodeSpec, tab: TabSpec) -> bool {
-    if let Some(changed) = activate_existing_workbench_tab(node, &tab) {
-        return changed;
-    }
-    insert_tab_in_first_workbench_group(node, tab)
-}
-
-fn activate_existing_workbench_tab(node: &mut WorkbenchNodeSpec, tab: &TabSpec) -> Option<bool> {
+fn ensure_workbench_tab_present(node: &mut WorkbenchNodeSpec, tab: TabSpec) -> bool {
     match node {
         WorkbenchNodeSpec::Group(group) => {
-            let tab_id = group
-                .tabs
-                .iter()
-                .find(|candidate| tab_matches(candidate, tab))
-                .map(|candidate| candidate.id.clone())?;
-            if group.active_tab_id.as_deref() == Some(tab_id.as_str()) {
-                Some(false)
+            if let Some(existing) = group.tabs.iter_mut().find(|candidate| {
+                candidate.id == tab.id
+                    || candidate.plugin_view_id.as_deref() == tab.plugin_view_id.as_deref()
+            }) {
+                let changed = existing.closable != tab.closable;
+                existing.closable = tab.closable;
+                changed
             } else {
-                group.active_tab_id = Some(tab_id);
-                Some(true)
+                insert_tab_in_first_workbench_group(node, tab)
             }
         }
+        WorkbenchNodeSpec::Split { children, .. } => {
+            for child in children.iter_mut() {
+                if workbench_contains_tab(child, &tab) {
+                    return ensure_workbench_tab_present(child, tab);
+                }
+            }
+            insert_tab_in_first_workbench_group(node, tab)
+        }
+    }
+}
+
+fn workbench_contains_tab(node: &WorkbenchNodeSpec, tab: &TabSpec) -> bool {
+    match node {
+        WorkbenchNodeSpec::Group(group) => group.tabs.iter().any(|candidate| {
+            candidate.id == tab.id
+                || candidate.plugin_view_id.as_deref() == tab.plugin_view_id.as_deref()
+        }),
         WorkbenchNodeSpec::Split { children, .. } => children
-            .iter_mut()
-            .find_map(|child| activate_existing_workbench_tab(child, tab)),
+            .iter()
+            .any(|child| workbench_contains_tab(child, tab)),
     }
 }
 
@@ -449,24 +411,15 @@ fn insert_tab_in_first_workbench_group(node: &mut WorkbenchNodeSpec, mut tab: Ta
             tab.panel_id = group.id.clone();
             let tab_id = tab.id.clone();
             group.tabs.push(tab);
-            group.active_tab_id = Some(tab_id);
+            if group.active_tab_id.is_none() {
+                group.active_tab_id = Some(tab_id);
+            }
             true
         }
         WorkbenchNodeSpec::Split { children, .. } => children
             .iter_mut()
             .any(|child| insert_tab_in_first_workbench_group(child, tab.clone())),
     }
-}
-
-fn tab_matches(candidate: &TabSpec, tab: &TabSpec) -> bool {
-    candidate.id == tab.id
-        || match (
-            candidate.plugin_view_id.as_deref(),
-            tab.plugin_view_id.as_deref(),
-        ) {
-            (Some(candidate_view_id), Some(view_id)) => candidate_view_id == view_id,
-            _ => false,
-        }
 }
 
 fn no_project_launcher(product: &maruzzella::ProductSpec) -> LauncherSpec {
@@ -513,23 +466,6 @@ fn command(id: &str, title: &str) -> CommandSpec {
         id: id.to_string(),
         title: title.to_string(),
     }
-}
-
-fn toolbar_item(
-    id: &str,
-    icon_name: Option<&str>,
-    label: &str,
-    command_id: &str,
-    secondary: bool,
-) -> ToolbarItemSpec {
-    toolbar_item_with_display(
-        id,
-        icon_name,
-        label,
-        command_id,
-        secondary,
-        ToolbarDisplayMode::IconOnly,
-    )
 }
 
 fn toolbar_item_with_display(
