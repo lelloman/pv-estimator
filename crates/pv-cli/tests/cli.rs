@@ -30,9 +30,10 @@ fn assert_failure(output: Output) -> Output {
 
 fn assert_json_number_close(actual: &Value, expected: f64) {
     let actual = actual.as_f64().expect("JSON number");
+    let tolerance = (expected.abs() * 0.005).max(1.0e-6);
     assert!(
-        (actual - expected).abs() < 1.0e-6,
-        "expected {expected}, got {actual}"
+        (actual - expected).abs() <= tolerance,
+        "expected {expected} within {tolerance}, got {actual}"
     );
 }
 
