@@ -60,6 +60,49 @@ const CMD_EXIT: &str = "pv.app.exit";
 const SAVE_ACTION_IDS: &[&str] = &["pv-project-save", "file-save", "save"];
 const DETAILS_PANEL_MIN_WIDTH: i32 = 320;
 const COMPUTATION_DEBOUNCE: Duration = Duration::from_millis(750);
+const AUTO_SAVE_DEBOUNCE: Duration = Duration::from_millis(900);
+const SIMULATION_RUN_OPTIONS: [usize; 7] = [
+    1_000,
+    10_000,
+    100_000,
+    1_000_000,
+    10_000_000,
+    100_000_000,
+    1_000_000_000,
+];
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ColorPalettePreference {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct ApplicationSettings {
+    #[serde(default = "default_true")]
+    automatic_simulation_updates: bool,
+    #[serde(default)]
+    color_palette: ColorPalettePreference,
+    #[serde(default)]
+    automatic_project_save: bool,
+}
+
+impl Default for ApplicationSettings {
+    fn default() -> Self {
+        Self {
+            automatic_simulation_updates: true,
+            color_palette: ColorPalettePreference::System,
+            automatic_project_save: false,
+        }
+    }
+}
+
+const fn default_true() -> bool {
+    true
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ComputationImpact {
@@ -114,6 +157,8 @@ struct DesktopState {
 struct DesktopSession {
     schema_version: u32,
     last_project_path: Option<PathBuf>,
+    #[serde(default)]
+    settings: ApplicationSettings,
 }
 
 impl Default for DesktopState {
@@ -142,6 +187,10 @@ struct AutomaticComputationState {
 struct ShellModeHandlers {
     show_workspace: Box<dyn Fn()>,
     show_launcher: Box<dyn Fn()>,
+}
+
+struct AppearanceHandlers {
+    apply_color_palette: Box<dyn Fn(ColorPalettePreference)>,
 }
 
 struct SimulationRunState {
@@ -192,6 +241,9 @@ thread_local! {
     static ACTIVE_FILE_CHOOSER: RefCell<Option<FileChooserDialog>> = const { RefCell::new(None) };
     static SIMULATION_RUN: RefCell<Option<SimulationRunState>> = const { RefCell::new(None) };
     static AUTOMATIC_COMPUTATION: RefCell<AutomaticComputationState> = RefCell::new(AutomaticComputationState::default());
+    static APPLICATION_SETTINGS: RefCell<Option<ApplicationSettings>> = const { RefCell::new(None) };
+    static APPEARANCE_HANDLERS: RefCell<Option<AppearanceHandlers>> = const { RefCell::new(None) };
+    static AUTOMATIC_SAVE: RefCell<Option<gtk::glib::SourceId>> = const { RefCell::new(None) };
     static SIMULATION_GRAPH_DATE: RefCell<DailyProjectionDate> = const { RefCell::new(DailyProjectionDate { month: 6, day: 21 }) };
     static SIMULATION_PROGRESS_VIEWS: RefCell<Vec<SimulationProgressWidgets>> = const { RefCell::new(Vec::new()) };
     static SYSTEM_VIEWS: RefCell<Vec<gtk::glib::WeakRef<GtkBox>>> = const { RefCell::new(Vec::new()) };
@@ -212,6 +264,61 @@ pub fn install_shell_mode_handlers(
             show_launcher: Box::new(show_launcher),
         });
     });
+}
+
+pub fn install_color_palette_handler(
+    apply_color_palette: impl Fn(ColorPalettePreference) + 'static,
+) {
+    APPEARANCE_HANDLERS.with(|handlers| {
+        *handlers.borrow_mut() = Some(AppearanceHandlers {
+            apply_color_palette: Box::new(apply_color_palette),
+        });
+    });
+}
+
+pub fn current_color_palette() -> ColorPalettePreference {
+    application_settings().color_palette
+}
+
+fn automatic_simulation_updates_enabled() -> bool {
+    application_settings().automatic_simulation_updates
+}
+
+fn set_automatic_simulation_updates(enabled: bool) {
+    if automatic_simulation_updates_enabled() == enabled {
+        return;
+    }
+    update_application_settings(|settings| settings.automatic_simulation_updates = enabled);
+    if enabled {
+        ensure_results_loaded();
+    } else {
+        clear_automatic_computation();
+    }
+    refresh_workbench_views();
+}
+
+fn set_color_palette(palette: ColorPalettePreference) {
+    if current_color_palette() == palette {
+        return;
+    }
+    update_application_settings(|settings| settings.color_palette = palette);
+    APPEARANCE_HANDLERS.with(|handlers| {
+        if let Some(handlers) = handlers.borrow().as_ref() {
+            (handlers.apply_color_palette)(palette);
+        }
+    });
+}
+
+fn set_automatic_project_save(enabled: bool) {
+    if application_settings().automatic_project_save == enabled {
+        return;
+    }
+    update_application_settings(|settings| settings.automatic_project_save = enabled);
+    if enabled {
+        schedule_automatic_save();
+    } else {
+        clear_automatic_save();
+    }
 }
 
 extern "C" fn observe_context_event(
@@ -359,6 +466,7 @@ extern "C" fn command_new_project(
 
 fn create_new_project() {
     clear_automatic_computation();
+    clear_automatic_save();
     STATE.with(|state| {
         let mut state = state.borrow_mut();
         invalidate_running_simulation(&mut state);
@@ -448,6 +556,9 @@ extern "C" fn command_set_simulation_runs(
 }
 
 fn set_simulation_runs(runs: usize) {
+    if current_simulation_runs() == runs {
+        return;
+    }
     update_simulation_state(|state| {
         let Some(project) = state.project.as_mut() else {
             return;
@@ -457,6 +568,37 @@ fn set_simulation_runs(runs: usize) {
         state.status = message.clone();
         state.log.push(message);
     });
+    sync_simulation_run_controls(runs);
+}
+
+fn sync_simulation_run_controls(runs: usize) {
+    let Some(selected) = SIMULATION_RUN_OPTIONS
+        .iter()
+        .position(|candidate| *candidate == runs)
+        .map(|index| index as u32)
+    else {
+        return;
+    };
+    let Some(window) = active_window() else {
+        return;
+    };
+    sync_simulation_run_controls_in(&window.upcast(), selected);
+}
+
+fn sync_simulation_run_controls_in(widget: &gtk::Widget, selected: u32) {
+    if let Some(dropdown) = widget.downcast_ref::<DropDown>()
+        && (dropdown.has_css_class("simulation-runs-control")
+            || dropdown.tooltip_text().as_deref() == Some("Simulation runs"))
+        && dropdown.selected() != selected
+    {
+        dropdown.set_selected(selected);
+    }
+
+    let mut child = widget.first_child();
+    while let Some(current) = child {
+        sync_simulation_run_controls_in(&current, selected);
+        child = current.next_sibling();
+    }
 }
 
 pub fn current_simulation_runs() -> usize {
@@ -539,6 +681,9 @@ fn store_estimate_result(
             state.log.push(status);
         }
     });
+    if mark_dirty {
+        schedule_automatic_save();
+    }
 }
 
 fn recompute_current_estimate(
@@ -872,6 +1017,7 @@ fn run_simulation() -> Result<(), RunSimulationError> {
         state.status = message.clone();
         state.log.push(message);
     });
+    schedule_automatic_save();
     schedule_simulation_poll();
     refresh_workbench_views();
     Ok(())
@@ -1069,6 +1215,7 @@ fn finish_simulation_run(
                 state.status = status.clone();
                 state.log.push(status);
             });
+            schedule_automatic_save();
         }
         Err(message) => computation_failed(ComputationStage::Simulation, message),
     }
@@ -1164,7 +1311,43 @@ fn has_open_project() -> bool {
     STATE.with(|state| state.borrow().project.is_some())
 }
 
+fn clear_automatic_save() {
+    AUTOMATIC_SAVE.with(|pending| {
+        if let Some(source) = pending.borrow_mut().take() {
+            source.remove();
+        }
+    });
+}
+
+fn schedule_automatic_save() {
+    clear_automatic_save();
+    if !application_settings().automatic_project_save {
+        return;
+    }
+    let eligible = STATE.with(|state| {
+        let state = state.borrow();
+        state.project.is_some() && state.path.is_some() && state.dirty
+    });
+    if !eligible {
+        return;
+    }
+
+    let source = gtk::glib::timeout_add_local_once(AUTO_SAVE_DEBOUNCE, || {
+        AUTOMATIC_SAVE.with(|pending| {
+            pending.borrow_mut().take();
+        });
+        if let Err(message) = save_current_project() {
+            append_log(format!("Automatic save failed: {message}"));
+            refresh_views();
+        }
+    });
+    AUTOMATIC_SAVE.with(|pending| {
+        *pending.borrow_mut() = Some(source);
+    });
+}
+
 fn save_current_project() -> Result<SaveDisposition, String> {
+    clear_automatic_save();
     let (path, project) = STATE.with(|state| {
         let state = state.borrow();
         (state.path.clone(), state.project.clone())
@@ -1189,6 +1372,7 @@ fn save_current_project() -> Result<SaveDisposition, String> {
 }
 
 fn open_project(path: PathBuf) {
+    clear_automatic_save();
     if load_project_into_state(&path, true) {
         ensure_results_loaded();
         show_project_workspace();
@@ -1197,6 +1381,7 @@ fn open_project(path: PathBuf) {
 }
 
 fn close_project() {
+    clear_automatic_save();
     clear_automatic_computation();
     STATE.with(|state| {
         let mut state = state.borrow_mut();
@@ -1258,6 +1443,7 @@ fn load_project_into_state(path: &Path, remember: bool) -> bool {
 }
 
 fn save_project_as(path: PathBuf) {
+    clear_automatic_save();
     let path = ensure_project_extension(path);
     let Some(project) = STATE.with(|state| state.borrow().project.clone()) else {
         append_log("Open or create a project first".to_string());
@@ -1328,6 +1514,38 @@ fn load_desktop_session() -> Option<DesktopSession> {
     (session.schema_version == DESKTOP_SESSION_SCHEMA_VERSION).then_some(session)
 }
 
+fn application_settings() -> ApplicationSettings {
+    if let Some(settings) = APPLICATION_SETTINGS.with(|settings| settings.borrow().clone()) {
+        return settings;
+    }
+    let settings = load_desktop_session()
+        .map(|session| session.settings)
+        .unwrap_or_default();
+    APPLICATION_SETTINGS.with(|slot| {
+        *slot.borrow_mut() = Some(settings.clone());
+    });
+    settings
+}
+
+fn persist_application_settings() {
+    let state_project_path = STATE.with(|state| {
+        let state = state.borrow();
+        state.session_loaded.then(|| state.path.clone())
+    });
+    let last_project_path = state_project_path
+        .unwrap_or_else(|| load_desktop_session().and_then(|session| session.last_project_path));
+    save_desktop_session(last_project_path.as_deref());
+}
+
+fn update_application_settings(update: impl FnOnce(&mut ApplicationSettings)) {
+    let mut settings = application_settings();
+    update(&mut settings);
+    APPLICATION_SETTINGS.with(|slot| {
+        *slot.borrow_mut() = Some(settings);
+    });
+    persist_application_settings();
+}
+
 fn save_desktop_session(last_project_path: Option<&Path>) {
     let Some(path) = desktop_session_path() else {
         return;
@@ -1341,6 +1559,7 @@ fn save_desktop_session(last_project_path: Option<&Path>) {
     let session = DesktopSession {
         schema_version: DESKTOP_SESSION_SCHEMA_VERSION,
         last_project_path: last_project_path.map(Path::to_path_buf),
+        settings: application_settings(),
     };
     if let Ok(bytes) = serde_json::to_vec_pretty(&session) {
         let _ = fs::write(path, bytes);
@@ -1367,12 +1586,6 @@ fn active_window() -> Option<Window> {
         .and_then(|application| application.downcast::<gtk::Application>().ok())
         .and_then(|application| application.active_window())
         .map(|window| window.upcast())
-}
-
-fn prefer_dark_gtk_theme() {
-    if let Some(settings) = gtk::Settings::default() {
-        settings.set_gtk_application_prefer_dark_theme(true);
-    }
 }
 
 fn apply_text_role(label: &Label, role: &str) {
@@ -1422,7 +1635,6 @@ fn show_open_project_dialog() {
         append_log("GTK is not initialized; cannot open file dialog".to_string());
         return;
     }
-    prefer_dark_gtk_theme();
     let parent = active_window();
     let dialog = FileChooserDialog::new(
         Some("Open PV Project"),
@@ -1455,7 +1667,6 @@ fn show_save_project_dialog() {
         append_log("GTK is not initialized; cannot open file dialog".to_string());
         return;
     }
-    prefer_dark_gtk_theme();
     let parent = active_window();
     let dialog = FileChooserDialog::new(
         Some("Save PV Project"),
@@ -1582,32 +1793,41 @@ extern "C" fn create_settings_view(
     page.set_margin_start(32);
     page.set_margin_end(32);
     page.set_hexpand(true);
+    let settings = application_settings();
 
-    let run_values = [
-        1_000usize,
-        10_000,
-        100_000,
-        1_000_000,
-        10_000_000,
-        100_000_000,
-        1_000_000_000,
-    ];
-    let run_labels = run_values.map(format_runs);
+    let run_labels = SIMULATION_RUN_OPTIONS.map(format_runs);
     let run_label_refs = run_labels.iter().map(String::as_str).collect::<Vec<_>>();
     let runs = DropDown::from_strings(&run_label_refs);
     runs.set_selected(
-        run_values
+        SIMULATION_RUN_OPTIONS
             .iter()
             .position(|runs| *runs == current_simulation_runs())
             .unwrap_or(1) as u32,
     );
     runs.set_size_request(220, -1);
     runs.add_css_class("settings-control");
+    runs.add_css_class("simulation-runs-control");
+    runs.set_sensitive(has_open_project());
     mark_clickable(&runs);
+    runs.connect_selected_notify(move |dropdown| {
+        let selected = dropdown.selected();
+        if selected == gtk::INVALID_LIST_POSITION {
+            return;
+        }
+        if let Some(runs) = SIMULATION_RUN_OPTIONS.get(selected as usize) {
+            set_simulation_runs(*runs);
+        }
+    });
 
-    let automatic_updates = Switch::builder().active(true).valign(Align::Center).build();
+    let automatic_updates = Switch::builder()
+        .active(settings.automatic_simulation_updates)
+        .valign(Align::Center)
+        .build();
     automatic_updates.add_css_class("settings-switch");
     mark_clickable(&automatic_updates);
+    automatic_updates.connect_active_notify(|toggle| {
+        set_automatic_simulation_updates(toggle.is_active());
+    });
 
     let simulation = settings_group();
     simulation.append(&settings_row(
@@ -1626,32 +1846,32 @@ extern "C" fn create_settings_view(
 
     let palette_group = GtkBox::new(Orientation::Vertical, 0);
     palette_group.add_css_class("settings-palette-group");
-    let system_palette = palette_option(
+    let (system_palette, system_radio) = palette_option(
         "System",
         "Follow the desktop appearance",
         &["#f4f6f8", "#d9dee5", "#323842", "#171a1f"],
         None,
-        true,
+        ColorPalettePreference::System,
     );
-    let system_radio = system_palette
-        .first_child()
-        .and_then(|widget| widget.downcast::<CheckButton>().ok())
-        .expect("palette option starts with a radio button");
-    let light_palette = palette_option(
+    let (light_palette, light_radio) = palette_option(
         "Light",
         "Bright surfaces with dark text",
         &["#ffffff", "#edf1f5", "#cad2dc", "#2463a7"],
         Some(&system_radio),
-        false,
+        ColorPalettePreference::Light,
     );
-    let dark_palette = palette_option(
+    let (dark_palette, dark_radio) = palette_option(
         "Dark",
         "Low-glare surfaces with light text",
         &["#111419", "#1c222a", "#394451", "#4f91d8"],
         Some(&system_radio),
-        false,
+        ColorPalettePreference::Dark,
     );
-    system_radio.set_active(true);
+    match settings.color_palette {
+        ColorPalettePreference::System => system_radio.set_active(true),
+        ColorPalettePreference::Light => light_radio.set_active(true),
+        ColorPalettePreference::Dark => dark_radio.set_active(true),
+    }
     palette_group.append(&system_palette);
     palette_group.append(&Separator::new(Orientation::Horizontal));
     palette_group.append(&light_palette);
@@ -1669,11 +1889,14 @@ extern "C" fn create_settings_view(
     page.append(&Separator::new(Orientation::Horizontal));
 
     let automatic_save = Switch::builder()
-        .active(false)
+        .active(settings.automatic_project_save)
         .valign(Align::Center)
         .build();
     automatic_save.add_css_class("settings-switch");
     mark_clickable(&automatic_save);
+    automatic_save.connect_active_notify(|toggle| {
+        set_automatic_project_save(toggle.is_active());
+    });
     let projects = settings_group();
     projects.append(&settings_row(
         "Save changes automatically",
@@ -1741,16 +1964,20 @@ fn palette_option(
     description: &str,
     colors: &[&str],
     group: Option<&CheckButton>,
-    active: bool,
-) -> GtkBox {
+    palette: ColorPalettePreference,
+) -> (GtkBox, CheckButton) {
     let option = GtkBox::new(Orientation::Horizontal, 12);
     option.add_css_class("settings-palette-option");
 
     let radio = CheckButton::new();
     radio.set_group(group);
-    radio.set_active(active);
     radio.set_valign(Align::Center);
     mark_clickable(&radio);
+    radio.connect_toggled(move |radio| {
+        if radio.is_active() {
+            set_color_palette(palette);
+        }
+    });
     option.append(&radio);
 
     let copy = GtkBox::new(Orientation::Vertical, 3);
@@ -1786,7 +2013,7 @@ fn palette_option(
     click.connect_released(move |_, _, _, _| radio_for_click.set_active(true));
     option.add_controller(click);
     mark_clickable(&option);
-    option
+    (option, radio)
 }
 
 fn parse_hex_color(color: &str) -> (f64, f64, f64) {
@@ -2503,6 +2730,7 @@ fn rename_array(index: usize, name: Option<String>) {
         state.dirty = true;
         state.status = "Array renamed".to_string();
     });
+    schedule_automatic_save();
     refresh_views();
 }
 
@@ -2663,6 +2891,7 @@ fn append_estimate_empty_state(content: &GtkBox, state: &DesktopState) {
         ComputationStage::Estimate,
     )));
     append_retry_action(content, state, ComputationStage::Estimate);
+    append_manual_computation_action(content, state, ComputationStage::Estimate);
 }
 
 fn append_estimate_result(content: &GtkBox, project: &PvProjectDocument) {
@@ -3064,11 +3293,13 @@ fn missing_simulation_diagnostics(project: &PvProjectDocument) -> Vec<String> {
     if project.results.production_profile.is_none() {
         diagnostics
             .push("The production estimate is being prepared before simulation.".to_string());
-    } else {
+    } else if automatic_simulation_updates_enabled() {
         diagnostics.push(
             "Simulation updates automatically when system or consumption inputs change."
                 .to_string(),
         );
+    } else {
+        diagnostics.push("Run the simulation to apply the latest input changes.".to_string());
     }
     if project.inputs.estimate_request.storage_usable_kwh.is_none() {
         diagnostics.push(
@@ -3092,6 +3323,12 @@ fn computation_empty_message(state: &DesktopState, stage: ComputationStage) -> &
             (ComputationStage::Simulation, ComputationStage::Estimate) => {
                 "Estimate is unavailable."
             }
+        };
+    }
+    if !automatic_simulation_updates_enabled() {
+        return match stage {
+            ComputationStage::Estimate => "Estimate update required.",
+            ComputationStage::Simulation => "Simulation update required.",
         };
     }
     match (state.computation_phase, stage) {
@@ -3119,6 +3356,27 @@ fn append_retry_action(content: &GtkBox, state: &DesktopState, stage: Computatio
     apply_button_role(&retry, "primary");
     retry.connect_clicked(move |_| retry_automatic_computation(retry_stage));
     content.append(&retry);
+}
+
+fn append_manual_computation_action(
+    content: &GtkBox,
+    state: &DesktopState,
+    stage: ComputationStage,
+) {
+    if automatic_simulation_updates_enabled() || state.retry_stage.is_some() {
+        return;
+    }
+    let (label, impact) = match stage {
+        ComputationStage::Estimate => ("Update estimate", ComputationImpact::EstimateAndSimulation),
+        ComputationStage::Simulation => ("Run simulation", ComputationImpact::Simulation),
+    };
+    let run = Button::with_label(label);
+    apply_button_role(&run, "primary");
+    mark_clickable(&run);
+    run.connect_clicked(move |_| {
+        schedule_automatic_computation(impact, ComputationTrigger::Immediate)
+    });
+    content.append(&run);
 }
 
 fn append_project_actions(content: &GtkBox) {
@@ -4046,6 +4304,7 @@ fn append_simulation_empty_state(content: &GtkBox, state: &DesktopState) {
     apply_text_role(&label, "section-label");
     content.append(&label);
     append_retry_action(content, state, ComputationStage::Simulation);
+    append_manual_computation_action(content, state, ComputationStage::Simulation);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4112,6 +4371,7 @@ fn rename_setup(name: String) {
         state.dirty = true;
         state.status = format!("Renamed setup to {name}");
     });
+    schedule_automatic_save();
     refresh_views();
 }
 
@@ -4151,7 +4411,12 @@ fn update_project_inputs(
         return;
     }
 
-    schedule_automatic_computation(impact, trigger);
+    schedule_automatic_save();
+    if automatic_simulation_updates_enabled() {
+        schedule_automatic_computation(impact, trigger);
+    } else {
+        clear_automatic_computation();
+    }
 
     match refresh_scope {
         RefreshScope::All => refresh_views(),
@@ -4169,6 +4434,7 @@ fn set_energy_price(value: Option<f64>) {
         state.dirty = true;
         state.status = "Energy price updated".to_string();
     });
+    schedule_automatic_save();
     refresh_workbench_views();
 }
 
@@ -4688,6 +4954,39 @@ export_plugin!(PvDesktopPlugin);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_desktop_session_uses_safe_settings_defaults() {
+        let session: DesktopSession =
+            serde_json::from_str(r#"{"schema_version":1,"last_project_path":null}"#)
+                .expect("legacy desktop session should deserialize");
+
+        assert!(session.settings.automatic_simulation_updates);
+        assert_eq!(
+            session.settings.color_palette,
+            ColorPalettePreference::System
+        );
+        assert!(!session.settings.automatic_project_save);
+    }
+
+    #[test]
+    fn application_settings_roundtrip_through_session_json() {
+        let session = DesktopSession {
+            schema_version: DESKTOP_SESSION_SCHEMA_VERSION,
+            last_project_path: Some(PathBuf::from("example.pvproj")),
+            settings: ApplicationSettings {
+                automatic_simulation_updates: false,
+                color_palette: ColorPalettePreference::Light,
+                automatic_project_save: true,
+            },
+        };
+
+        let json = serde_json::to_string(&session).expect("session should serialize");
+        let restored: DesktopSession =
+            serde_json::from_str(&json).expect("session should deserialize");
+        assert_eq!(restored.settings, session.settings);
+        assert_eq!(restored.last_project_path, session.last_project_path);
+    }
 
     #[test]
     fn desktop_azimuth_label_matches_pvgis_convention() {

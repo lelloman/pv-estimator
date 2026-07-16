@@ -1,9 +1,11 @@
 use gtk::gio::prelude::ApplicationExtManual;
+use gtk::prelude::*;
 use maruzzella::{
     CommandSpec, LauncherSpec, MaruzzellaConfig, MenuItemSpec, MenuRootSpec, PanelResizePolicy,
-    ShellChrome, ShellMode, ShellSpec, TabGroupSpec, TabSpec, ToolbarDisplayMode, ToolbarItemSpec,
-    ToolbarOptionSpec, ToolbarPlacement, WorkbenchNodeSpec, WorkspaceSession,
-    build_application_with_handle, default_product_spec, layout, load_static_plugin, plugin_tab,
+    ShellChrome, ShellMode, ShellSpec, TabGroupSpec, TabSpec, ThemePalette, ThemeSpec,
+    ToolbarDisplayMode, ToolbarItemSpec, ToolbarOptionSpec, ToolbarPlacement, WorkbenchNodeSpec,
+    WorkspaceSession, build_application_with_handle, default_product_spec, layout,
+    load_static_plugin, plugin_tab,
 };
 use maruzzella::{MzContextActivationPolicy, MzSurfaceRole};
 
@@ -19,6 +21,7 @@ const DETAILS_VIEW_ID: &str = "com.lelloman.pv_estimator.details";
 const SETTINGS_VIEW_ID: &str = "com.lelloman.pv_estimator.settings";
 
 fn main() {
+    let initial_palette = pv_desktop_plugin::current_color_palette();
     let mut product = default_product_spec();
     product.branding.title = "PV Estimator".to_string();
     product.branding.status_text = "PV engineering workbench".to_string();
@@ -155,6 +158,7 @@ fn main() {
         .with_startup_mode(startup_mode)
         .with_launcher(launcher)
         .with_workspace_chrome(workspace_chrome())
+        .with_theme(theme_for_palette(initial_palette))
         .with_builtin_plugin(embedded_pv_plugin);
 
     let (application, handle) = build_application_with_handle(config);
@@ -169,7 +173,64 @@ fn main() {
             let _ = launcher_handle.switch_to_launcher();
         },
     );
+    pv_desktop_plugin::install_color_palette_handler(apply_color_palette);
+    application
+        .connect_activate(|_| apply_color_palette(pv_desktop_plugin::current_color_palette()));
     application.run();
+}
+
+fn apply_color_palette(palette: pv_desktop_plugin::ColorPalettePreference) {
+    let dark = match palette {
+        pv_desktop_plugin::ColorPalettePreference::System => system_prefers_dark_palette(),
+        pv_desktop_plugin::ColorPalettePreference::Light => false,
+        pv_desktop_plugin::ColorPalettePreference::Dark => true,
+    };
+    if let Some(settings) = gtk::Settings::default() {
+        settings.set_gtk_application_prefer_dark_theme(dark);
+    }
+    maruzzella::theme::install(if dark {
+        ThemeSpec::default()
+    } else {
+        light_theme()
+    });
+}
+
+fn theme_for_palette(palette: pv_desktop_plugin::ColorPalettePreference) -> ThemeSpec {
+    match palette {
+        pv_desktop_plugin::ColorPalettePreference::Light => light_theme(),
+        pv_desktop_plugin::ColorPalettePreference::System
+        | pv_desktop_plugin::ColorPalettePreference::Dark => ThemeSpec::default(),
+    }
+}
+
+fn system_prefers_dark_palette() -> bool {
+    gtk::Settings::default()
+        .and_then(|settings| settings.gtk_theme_name())
+        .is_some_and(|name| name.to_ascii_lowercase().contains("dark"))
+        || std::env::var("GTK_THEME")
+            .ok()
+            .is_some_and(|name| name.to_ascii_lowercase().contains("dark"))
+}
+
+fn light_theme() -> ThemeSpec {
+    ThemeSpec {
+        palette: ThemePalette {
+            bg_0: "#f4f6f8".to_string(),
+            bg_1: "#ffffff".to_string(),
+            workbench: "#ffffff".to_string(),
+            panel_left: "#edf1f5".to_string(),
+            panel_right: "#edf1f5".to_string(),
+            panel_bottom: "#edf1f5".to_string(),
+            border: "#d3d9e1".to_string(),
+            border_strong: "#b8c1cc".to_string(),
+            text_0: "#171a1f".to_string(),
+            text_1: "#38414c".to_string(),
+            text_2: "#687482".to_string(),
+            accent: "#2463a7".to_string(),
+            accent_strong: "#174c82".to_string(),
+        },
+        ..ThemeSpec::default()
+    }
 }
 
 fn workspace_chrome() -> ShellChrome {
