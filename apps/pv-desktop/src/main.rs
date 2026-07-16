@@ -16,6 +16,7 @@ const SIMULATION_TAB_ID: &str = "simulation";
 const SIMULATION_VIEW_ID: &str = "com.lelloman.pv_estimator.simulation";
 const DETAILS_TAB_ID: &str = "details";
 const DETAILS_VIEW_ID: &str = "com.lelloman.pv_estimator.details";
+const SETTINGS_VIEW_ID: &str = "com.lelloman.pv_estimator.settings";
 
 fn main() {
     let mut product = default_product_spec();
@@ -46,6 +47,14 @@ fn main() {
             "Save Project As",
             "pv.project.save_as",
         ),
+        menu_item("file-exit-separator", "file", "", ""),
+        menu_item_with_payload(
+            "file-settings",
+            "file",
+            "Settings",
+            "shell.settings",
+            SETTINGS_VIEW_ID.as_bytes(),
+        ),
         menu_item("file-exit", "file", "Exit", "pv.app.exit"),
         menu_item("help-about", "help", "About", "shell.about"),
     ];
@@ -56,6 +65,7 @@ fn main() {
         command("pv.project.save", "Save Project"),
         command("pv.project.save_as", "Save Project As"),
         command("pv.project.set_simulation_runs", "Set Simulation Runs"),
+        command("shell.settings", "Settings"),
         command("pv.app.exit", "Exit"),
     ];
     product.toolbar_items = vec![
@@ -459,6 +469,18 @@ fn menu_item(id: &str, root_id: &str, label: &str, command_id: &str) -> MenuItem
         command_id: command_id.to_string(),
         payload: Vec::new(),
     }
+}
+
+fn menu_item_with_payload(
+    id: &str,
+    root_id: &str,
+    label: &str,
+    command_id: &str,
+    payload: &[u8],
+) -> MenuItemSpec {
+    let mut item = menu_item(id, root_id, label, command_id);
+    item.payload = payload.to_vec();
+    item
 }
 
 fn command(id: &str, title: &str) -> CommandSpec {

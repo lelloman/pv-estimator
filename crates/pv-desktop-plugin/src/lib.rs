@@ -14,14 +14,15 @@ use directories::ProjectDirs;
 use gtk::glib::translate::IntoGlibPtr;
 use gtk::prelude::*;
 use gtk::{
-    Align, Box as GtkBox, Button, DrawingArea, DropDown, Entry, FileChooserAction,
+    Align, Box as GtkBox, Button, CheckButton, DrawingArea, DropDown, Entry, FileChooserAction,
     FileChooserDialog, FileFilter, Grid, Image, Label, ListBox, Orientation, PolicyType, Popover,
-    ProgressBar, ResponseType, ScrolledWindow, SelectionMode, Separator, Window,
+    ProgressBar, ResponseType, ScrolledWindow, SelectionMode, Separator, Switch, Window,
 };
 use maruzzella_sdk::{
     CommandSpec, HostApi, MzHostEvent, MzStatusCode, MzSurfaceFocusEvent, MzViewPlacement, Plugin,
     PluginDependency, PluginDescriptor, SurfaceContributionSpec, Version, ViewFactorySpec,
-    button_css_class, decode_json_payload, export_plugin, input_css_class, text_css_class,
+    button_css_class, decode_json_payload, export_plugin, input_css_class, mark_clickable,
+    text_css_class,
 };
 use pv_core::simulation::{
     BuiltInLoadShapeId, LoadProfile, LoadShape, MetricSummary, ProductionProfile,
@@ -46,6 +47,7 @@ const VIEW_SYSTEM: &str = "com.lelloman.pv_estimator.system";
 const VIEW_ESTIMATE: &str = "com.lelloman.pv_estimator.estimate";
 const VIEW_SIMULATION: &str = "com.lelloman.pv_estimator.simulation";
 const VIEW_DETAILS: &str = "com.lelloman.pv_estimator.details";
+const VIEW_SETTINGS: &str = "com.lelloman.pv_estimator.settings";
 const DESKTOP_SESSION_SCHEMA_VERSION: u32 = 1;
 
 const CMD_NEW: &str = "pv.project.new";
@@ -335,6 +337,13 @@ impl Plugin for PvDesktopPlugin {
             "Details",
             MzViewPlacement::SidePanel,
             create_details_view,
+        ))?;
+        host.register_view_factory(ViewFactorySpec::new(
+            PLUGIN_ID,
+            VIEW_SETTINGS,
+            "Settings",
+            MzViewPlacement::Workbench,
+            create_settings_view,
         ))?;
 
         Ok(())
@@ -1556,6 +1565,237 @@ extern "C" fn create_details_view(
     render_details_into(&root);
     remember_view(&DETAIL_VIEWS, &root);
     widget_ptr(root)
+}
+
+extern "C" fn create_settings_view(
+    _host: *const maruzzella_sdk::ffi::MzHostApi,
+    _request: *const maruzzella_sdk::ffi::MzViewRequest,
+) -> *mut c_void {
+    if !gtk::is_initialized_main_thread() && gtk::init().is_err() {
+        return std::ptr::null_mut();
+    }
+
+    let page = GtkBox::new(Orientation::Vertical, 0);
+    page.add_css_class("settings-page");
+    page.set_margin_top(0);
+    page.set_margin_bottom(40);
+    page.set_margin_start(32);
+    page.set_margin_end(32);
+    page.set_hexpand(true);
+
+    let run_values = [
+        1_000usize,
+        10_000,
+        100_000,
+        1_000_000,
+        10_000_000,
+        100_000_000,
+        1_000_000_000,
+    ];
+    let run_labels = run_values.map(format_runs);
+    let run_label_refs = run_labels.iter().map(String::as_str).collect::<Vec<_>>();
+    let runs = DropDown::from_strings(&run_label_refs);
+    runs.set_selected(
+        run_values
+            .iter()
+            .position(|runs| *runs == current_simulation_runs())
+            .unwrap_or(1) as u32,
+    );
+    runs.set_size_request(220, -1);
+    runs.add_css_class("settings-control");
+    mark_clickable(&runs);
+
+    let automatic_updates = Switch::builder().active(true).valign(Align::Center).build();
+    automatic_updates.add_css_class("settings-switch");
+    mark_clickable(&automatic_updates);
+
+    let simulation = settings_group();
+    simulation.append(&settings_row(
+        "Simulation runs",
+        "Higher values produce more stable results but take longer to calculate.",
+        &runs,
+    ));
+    simulation.append(&Separator::new(Orientation::Horizontal));
+    simulation.append(&settings_row(
+        "Update simulations automatically",
+        "Recalculate results after system parameters change.",
+        &automatic_updates,
+    ));
+    page.append(&simulation);
+    page.append(&Separator::new(Orientation::Horizontal));
+
+    let palette_group = GtkBox::new(Orientation::Vertical, 0);
+    palette_group.add_css_class("settings-palette-group");
+    let system_palette = palette_option(
+        "System",
+        "Follow the desktop appearance",
+        &["#f4f6f8", "#d9dee5", "#323842", "#171a1f"],
+        None,
+        true,
+    );
+    let system_radio = system_palette
+        .first_child()
+        .and_then(|widget| widget.downcast::<CheckButton>().ok())
+        .expect("palette option starts with a radio button");
+    let light_palette = palette_option(
+        "Light",
+        "Bright surfaces with dark text",
+        &["#ffffff", "#edf1f5", "#cad2dc", "#2463a7"],
+        Some(&system_radio),
+        false,
+    );
+    let dark_palette = palette_option(
+        "Dark",
+        "Low-glare surfaces with light text",
+        &["#111419", "#1c222a", "#394451", "#4f91d8"],
+        Some(&system_radio),
+        false,
+    );
+    system_radio.set_active(true);
+    palette_group.append(&system_palette);
+    palette_group.append(&Separator::new(Orientation::Horizontal));
+    palette_group.append(&light_palette);
+    palette_group.append(&Separator::new(Orientation::Horizontal));
+    palette_group.append(&dark_palette);
+
+    let appearance = settings_group();
+    appearance.append(&settings_label(
+        "Color palette",
+        "Choose the application-wide appearance.",
+    ));
+    appearance.append(&Separator::new(Orientation::Horizontal));
+    appearance.append(&palette_group);
+    page.append(&appearance);
+    page.append(&Separator::new(Orientation::Horizontal));
+
+    let automatic_save = Switch::builder()
+        .active(false)
+        .valign(Align::Center)
+        .build();
+    automatic_save.add_css_class("settings-switch");
+    mark_clickable(&automatic_save);
+    let projects = settings_group();
+    projects.append(&settings_row(
+        "Save changes automatically",
+        "Save edits after a short delay once the project has a file location.",
+        &automatic_save,
+    ));
+    page.append(&projects);
+
+    let scroller = ScrolledWindow::builder()
+        .hscrollbar_policy(PolicyType::Never)
+        .vscrollbar_policy(PolicyType::Automatic)
+        .child(&page)
+        .build();
+    scroller.set_hexpand(true);
+    scroller.set_vexpand(true);
+    widget_ptr(scroller)
+}
+
+fn settings_group() -> GtkBox {
+    let group = GtkBox::new(Orientation::Vertical, 0);
+    group.add_css_class("settings-group");
+    group
+}
+
+fn settings_label(title: &str, description: &str) -> GtkBox {
+    let label = GtkBox::new(Orientation::Vertical, 4);
+    label.add_css_class("settings-row");
+    let title_label = Label::new(Some(title));
+    title_label.set_xalign(0.0);
+    title_label.add_css_class("settings-row-title");
+    label.append(&title_label);
+    let description_label = Label::new(Some(description));
+    description_label.set_xalign(0.0);
+    description_label.set_wrap(true);
+    description_label.add_css_class("settings-row-description");
+    label.append(&description_label);
+    label
+}
+
+fn settings_row<C: IsA<gtk::Widget>>(title: &str, description: &str, control: &C) -> GtkBox {
+    let row = GtkBox::new(Orientation::Horizontal, 24);
+    row.add_css_class("settings-row");
+
+    let copy = GtkBox::new(Orientation::Vertical, 4);
+    copy.set_hexpand(true);
+    let title_label = Label::new(Some(title));
+    title_label.set_xalign(0.0);
+    title_label.add_css_class("settings-row-title");
+    copy.append(&title_label);
+    let description_label = Label::new(Some(description));
+    description_label.set_xalign(0.0);
+    description_label.set_wrap(true);
+    description_label.add_css_class("settings-row-description");
+    copy.append(&description_label);
+    row.append(&copy);
+
+    control.set_halign(Align::End);
+    control.set_valign(Align::Center);
+    row.append(control);
+    row
+}
+
+fn palette_option(
+    title: &str,
+    description: &str,
+    colors: &[&str],
+    group: Option<&CheckButton>,
+    active: bool,
+) -> GtkBox {
+    let option = GtkBox::new(Orientation::Horizontal, 12);
+    option.add_css_class("settings-palette-option");
+
+    let radio = CheckButton::new();
+    radio.set_group(group);
+    radio.set_active(active);
+    radio.set_valign(Align::Center);
+    mark_clickable(&radio);
+    option.append(&radio);
+
+    let copy = GtkBox::new(Orientation::Vertical, 3);
+    copy.set_hexpand(true);
+    let title_label = Label::new(Some(title));
+    title_label.set_xalign(0.0);
+    title_label.add_css_class("settings-row-title");
+    copy.append(&title_label);
+    let description_label = Label::new(Some(description));
+    description_label.set_xalign(0.0);
+    description_label.add_css_class("settings-row-description");
+    copy.append(&description_label);
+    option.append(&copy);
+
+    let preview = GtkBox::new(Orientation::Horizontal, 0);
+    preview.add_css_class("settings-palette-preview");
+    for color in colors {
+        let swatch = DrawingArea::new();
+        swatch.set_content_width(30);
+        swatch.set_content_height(24);
+        let rgb = parse_hex_color(color);
+        swatch.set_draw_func(move |_, context, width, height| {
+            context.set_source_rgb(rgb.0, rgb.1, rgb.2);
+            context.rectangle(0.0, 0.0, f64::from(width), f64::from(height));
+            let _ = context.fill();
+        });
+        preview.append(&swatch);
+    }
+    option.append(&preview);
+
+    let click = gtk::GestureClick::new();
+    let radio_for_click = radio.clone();
+    click.connect_released(move |_, _, _, _| radio_for_click.set_active(true));
+    option.add_controller(click);
+    mark_clickable(&option);
+    option
+}
+
+fn parse_hex_color(color: &str) -> (f64, f64, f64) {
+    let value = u32::from_str_radix(color.trim_start_matches('#'), 16).unwrap_or_default();
+    (
+        f64::from((value >> 16) as u8) / 255.0,
+        f64::from((value >> 8) as u8) / 255.0,
+        f64::from(value as u8) / 255.0,
+    )
 }
 
 fn widget_ptr<W: IsA<gtk::Widget>>(widget: W) -> *mut c_void {
