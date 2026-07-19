@@ -3,9 +3,8 @@ use gtk::prelude::*;
 use maruzzella::{
     CommandSpec, LauncherSpec, MaruzzellaConfig, MenuItemSpec, MenuRootSpec, PanelResizePolicy,
     ShellChrome, ShellMode, ShellSpec, TabGroupSpec, TabSpec, ThemePalette, ThemeSpec,
-    ToolbarDisplayMode, ToolbarItemSpec, ToolbarOptionSpec, ToolbarPlacement, WorkbenchNodeSpec,
-    WorkspaceSession, build_application_with_handle, default_product_spec, layout,
-    load_static_plugin, plugin_tab,
+    ToolbarDisplayMode, ToolbarItemSpec, ToolbarPlacement, WorkbenchNodeSpec, WorkspaceSession,
+    build_application_with_handle, default_product_spec, layout, load_static_plugin, plugin_tab,
 };
 use maruzzella::{MzContextActivationPolicy, MzSurfaceRole};
 
@@ -35,6 +34,10 @@ fn main() {
             label: "File".to_string(),
         },
         MenuRootSpec {
+            id: "view".to_string(),
+            label: "View".to_string(),
+        },
+        MenuRootSpec {
             id: "help".to_string(),
             label: "Help".to_string(),
         },
@@ -59,6 +62,20 @@ fn main() {
             SETTINGS_VIEW_ID.as_bytes(),
         ),
         menu_item("file-exit", "file", "Exit", "pv.app.exit"),
+        menu_item_with_payload(
+            "view-estimate",
+            "view",
+            "Estimate",
+            "shell.settings",
+            ESTIMATE_VIEW_ID.as_bytes(),
+        ),
+        menu_item_with_payload(
+            "view-simulation",
+            "view",
+            "Simulation",
+            "shell.settings",
+            SIMULATION_VIEW_ID.as_bytes(),
+        ),
         menu_item("help-about", "help", "About", "shell.about"),
     ];
     product.commands = vec![
@@ -67,7 +84,6 @@ fn main() {
         command("pv.project.close", "Close Project"),
         command("pv.project.save", "Save Project"),
         command("pv.project.save_as", "Save Project As"),
-        command("pv.project.set_simulation_runs", "Set Simulation Runs"),
         command("shell.settings", "Settings"),
         command("pv.app.exit", "Exit"),
     ];
@@ -80,21 +96,17 @@ fn main() {
             false,
             ToolbarDisplayMode::IconAndText,
         ),
-        toolbar_dropdown_item(
-            "simulation-runs",
-            "Simulation runs",
-            "pv.project.set_simulation_runs",
-            &[
-                ("1,000 runs", "1000"),
-                ("10,000 runs", "10000"),
-                ("100,000 runs", "100000"),
-                ("1,000,000 runs", "1000000"),
-                ("10,000,000 runs", "10000000"),
-                ("100,000,000 runs", "100000000"),
-                ("1,000,000,000 runs", "1000000000"),
-            ],
-            1,
-            true,
+        toolbar_view_item(
+            "view-estimate",
+            "x-office-spreadsheet-symbolic",
+            "Estimate",
+            ESTIMATE_VIEW_ID,
+        ),
+        toolbar_view_item(
+            "view-simulation",
+            "media-playback-start-symbolic",
+            "Simulation",
+            SIMULATION_VIEW_ID,
         ),
     ];
 
@@ -135,9 +147,6 @@ fn main() {
     );
 
     let has_restorable_session = pv_desktop_plugin::has_restorable_desktop_session();
-    if has_restorable_session {
-        sync_simulation_runs_toolbar_items(&mut product.toolbar_items);
-    }
     let project_shell = product.shell_spec();
     let startup_workspace_shell = if has_restorable_session {
         Some(repaired_workspace_spec(&project_shell))
@@ -302,10 +311,9 @@ fn repaired_workspace_spec(default_shell: &ShellSpec) -> ShellSpec {
     if ensure_right_panel_detail_tab(&mut shell.spec.right_panel) {
         changed = true;
     }
-    if remove_legacy_run_toolbar_items(&mut shell.spec.toolbar_items) {
+    if remove_legacy_toolbar_items(&mut shell.spec.toolbar_items) {
         changed = true;
     }
-    sync_simulation_runs_toolbar(&mut shell.spec);
     if changed {
         layout::save(&workspace_persistence_id, &shell);
     }
@@ -335,37 +343,12 @@ fn active_workbench_plugin_view_id(node: &WorkbenchNodeSpec) -> Option<&'static 
     }
 }
 
-fn sync_simulation_runs_toolbar(spec: &mut ShellSpec) {
-    sync_simulation_runs_toolbar_items(&mut spec.toolbar_items);
-}
-
-fn sync_simulation_runs_toolbar_items(items: &mut [ToolbarItemSpec]) {
-    let selected_index =
-        simulation_runs_toolbar_index(pv_desktop_plugin::current_simulation_runs());
-    for item in items {
-        if item.id == "simulation-runs" {
-            item.selected_index = selected_index;
-        }
-    }
-}
-
-fn remove_legacy_run_toolbar_items(items: &mut Vec<ToolbarItemSpec>) -> bool {
+fn remove_legacy_toolbar_items(items: &mut Vec<ToolbarItemSpec>) -> bool {
     let previous_len = items.len();
-    items.retain(|item| item.id != "estimate" && item.id != "simulation");
+    items.retain(|item| {
+        item.id != "estimate" && item.id != "simulation" && item.id != "simulation-runs"
+    });
     items.len() != previous_len
-}
-
-fn simulation_runs_toolbar_index(runs: usize) -> u32 {
-    match runs {
-        1_000 => 0,
-        10_000 => 1,
-        100_000 => 2,
-        1_000_000 => 3,
-        10_000_000 => 4,
-        100_000_000 => 5,
-        1_000_000_000 => 6,
-        _ => 1,
-    }
 }
 
 fn ensure_right_panel_detail_tab(group: &mut TabGroupSpec) -> bool {
@@ -517,9 +500,27 @@ fn no_project_launcher(product: &maruzzella::ProductSpec) -> LauncherSpec {
     launcher.menu_items = product.menu_items.clone();
     launcher.commands = product.commands.clone();
     launcher.toolbar_items = product.toolbar_items.clone();
+    launcher.menu_roots.retain(|root| root.id != "view");
+    launcher.menu_items.retain(|item| item.root_id != "view");
+    launcher
+        .toolbar_items
+        .retain(|item| item.id != "view-estimate" && item.id != "view-simulation");
     launcher.include_base_toolbar_items = product.include_base_toolbar_items;
     launcher.chrome = workspace_chrome();
     launcher
+}
+
+fn toolbar_view_item(id: &str, icon_name: &str, label: &str, view_id: &str) -> ToolbarItemSpec {
+    let mut item = toolbar_item_with_display(
+        id,
+        Some(icon_name),
+        label,
+        "shell.settings",
+        true,
+        ToolbarDisplayMode::IconAndText,
+    );
+    item.payload = view_id.as_bytes().to_vec();
+    item
 }
 
 fn menu_item(id: &str, root_id: &str, label: &str, command_id: &str) -> MenuItemSpec {
@@ -570,34 +571,6 @@ fn toolbar_item_with_display(
         appearance_id: "toolbar".to_string(),
         options: Vec::new(),
         selected_index: 0,
-    }
-}
-
-fn toolbar_dropdown_item(
-    id: &str,
-    label: &str,
-    command_id: &str,
-    options: &[(&str, &str)],
-    selected_index: u32,
-    secondary: bool,
-) -> ToolbarItemSpec {
-    ToolbarItemSpec {
-        id: id.to_string(),
-        icon_name: None,
-        label: Some(label.to_string()),
-        command_id: command_id.to_string(),
-        payload: Vec::new(),
-        secondary,
-        display_mode: ToolbarDisplayMode::Dropdown,
-        appearance_id: "toolbar".to_string(),
-        options: options
-            .iter()
-            .map(|(label, payload)| ToolbarOptionSpec {
-                label: (*label).to_string(),
-                payload: payload.as_bytes().to_vec(),
-            })
-            .collect(),
-        selected_index,
     }
 }
 
