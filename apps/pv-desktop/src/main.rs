@@ -1,10 +1,9 @@
 use gtk::gio::prelude::ApplicationExtManual;
-use gtk::prelude::*;
 use maruzzella::{
     CommandSpec, LauncherSpec, MaruzzellaConfig, MenuItemSpec, MenuRootSpec, PanelResizePolicy,
-    ShellChrome, ShellMode, ShellSpec, TabGroupSpec, TabSpec, ThemePalette, ThemeSpec,
-    ToolbarDisplayMode, ToolbarItemSpec, ToolbarPlacement, WorkbenchNodeSpec, WorkspaceSession,
-    build_application_with_handle, default_product_spec, layout, load_static_plugin, plugin_tab,
+    ShellChrome, ShellMode, ShellSpec, TabGroupSpec, TabSpec, ToolbarDisplayMode, ToolbarItemSpec,
+    ToolbarPlacement, WorkbenchNodeSpec, WorkspaceSession, build_application_with_handle,
+    default_product_spec, layout, load_static_plugin, plugin_tab, theme,
 };
 use maruzzella::{MzContextActivationPolicy, MzSurfaceRole};
 
@@ -17,10 +16,15 @@ const SIMULATION_TAB_ID: &str = "simulation";
 const SIMULATION_VIEW_ID: &str = "com.lelloman.pv_estimator.simulation";
 const DETAILS_TAB_ID: &str = "details";
 const DETAILS_VIEW_ID: &str = "com.lelloman.pv_estimator.details";
+/// The PV settings view; Maruzzella's Settings page embeds it.
 const SETTINGS_VIEW_ID: &str = "com.lelloman.pv_estimator.settings";
+/// The base plugin's config stores the palette picked on Maruzzella's
+/// Appearance settings page under this key.
+const MARUZZELLA_BASE_PLUGIN_ID: &str = "maruzzella.base";
+const MARUZZELLA_PALETTE_KEY: &str = "palette";
 
 fn main() {
-    let initial_palette = pv_desktop_plugin::current_color_palette();
+    migrate_legacy_color_palette();
     let mut product = default_product_spec();
     product.branding.title = "PV Estimator".to_string();
     product.branding.status_text = "PV engineering workbench".to_string();
@@ -54,13 +58,7 @@ fn main() {
             "pv.project.save_as",
         ),
         menu_item("file-exit-separator", "file", "", ""),
-        menu_item_with_payload(
-            "file-settings",
-            "file",
-            "Settings",
-            "shell.settings",
-            SETTINGS_VIEW_ID.as_bytes(),
-        ),
+        menu_item("file-settings", "file", "Settings", "shell.settings"),
         menu_item("file-exit", "file", "Exit", "pv.app.exit"),
         menu_item_with_payload(
             "view-estimate",
@@ -167,7 +165,6 @@ fn main() {
         .with_startup_mode(startup_mode)
         .with_launcher(launcher)
         .with_workspace_chrome(workspace_chrome())
-        .with_theme(theme_for_palette(initial_palette))
         .with_builtin_plugin(embedded_pv_plugin);
 
     let (application, handle) = build_application_with_handle(config);
@@ -182,66 +179,88 @@ fn main() {
             let _ = launcher_handle.switch_to_launcher();
         },
     );
-    pv_desktop_plugin::install_color_palette_handler(apply_color_palette);
-    application
-        .connect_activate(|_| apply_color_palette(pv_desktop_plugin::current_color_palette()));
     application.run();
 }
 
-fn apply_color_palette(palette: pv_desktop_plugin::ColorPalettePreference) {
-    let dark = match palette {
-        pv_desktop_plugin::ColorPalettePreference::System => system_prefers_dark_palette(),
-        pv_desktop_plugin::ColorPalettePreference::Light => false,
-        pv_desktop_plugin::ColorPalettePreference::Dark => true,
+/// Carries the palette picked in the color palette setting of earlier versions
+/// over to Maruzzella's Appearance settings, once. "System" is resolved to the
+/// palette the desktop prefers right now, since Maruzzella has no palette that
+/// follows the desktop.
+fn migrate_legacy_color_palette() {
+    let Some(legacy) = pv_desktop_plugin::legacy_color_palette() else {
+        return;
     };
-    if let Some(settings) = gtk::Settings::default() {
-        settings.set_gtk_application_prefer_dark_theme(dark);
+    let light = match legacy {
+        pv_desktop_plugin::LegacyColorPalette::Light => true,
+        pv_desktop_plugin::LegacyColorPalette::Dark => false,
+        pv_desktop_plugin::LegacyColorPalette::System => !system_prefers_dark_palette(),
+    };
+    if light && !save_light_palette_choice() {
+        // Keep the old setting so the next start can try again.
+        return;
     }
-    maruzzella::theme::install(if dark {
-        ThemeSpec::default()
-    } else {
-        light_theme()
-    });
+    pv_desktop_plugin::forget_legacy_color_palette();
 }
 
-fn theme_for_palette(palette: pv_desktop_plugin::ColorPalettePreference) -> ThemeSpec {
-    match palette {
-        pv_desktop_plugin::ColorPalettePreference::Light => light_theme(),
-        pv_desktop_plugin::ColorPalettePreference::System
-        | pv_desktop_plugin::ColorPalettePreference::Dark => ThemeSpec::default(),
-    }
-}
-
+/// The check the old "System" option used: a dark GTK theme name.
 fn system_prefers_dark_palette() -> bool {
-    gtk::Settings::default()
-        .and_then(|settings| settings.gtk_theme_name())
-        .is_some_and(|name| name.to_ascii_lowercase().contains("dark"))
-        || std::env::var("GTK_THEME")
-            .ok()
-            .is_some_and(|name| name.to_ascii_lowercase().contains("dark"))
+    let named_dark = |name: &str| name.to_ascii_lowercase().contains("dark");
+    std::env::var("GTK_THEME")
+        .ok()
+        .is_some_and(|name| named_dark(&name))
+        || (gtk::init().is_ok()
+            && gtk::Settings::default()
+                .and_then(|settings| settings.gtk_theme_name())
+                .is_some_and(|name| named_dark(&name)))
 }
 
-fn light_theme() -> ThemeSpec {
-    ThemeSpec {
-        palette: ThemePalette {
-            bg_0: "#f4f6f8".to_string(),
-            bg_1: "#ffffff".to_string(),
-            workbench: "#ffffff".to_string(),
-            panel_left: "#edf1f5".to_string(),
-            panel_right: "#edf1f5".to_string(),
-            panel_bottom: "#edf1f5".to_string(),
-            border: "#d3d9e1".to_string(),
-            border_strong: "#b8c1cc".to_string(),
-            text_0: "#171a1f".to_string(),
-            text_1: "#38414c".to_string(),
-            text_2: "#687482".to_string(),
-            accent: "#2463a7".to_string(),
-            accent_strong: "#174c82".to_string(),
-            // Empty: Maruzzella picks its light terminal colors.
-            terminal_ansi: Vec::new(),
-        },
-        ..ThemeSpec::default()
+/// Records Maruzzella's built-in light palette as the one picked on its
+/// Appearance settings page, unless a palette was already picked there.
+fn save_light_palette_choice() -> bool {
+    let Some(light_id) = theme::builtin_palettes()
+        .into_iter()
+        .find(|builtin| builtin.palette.is_light())
+        .map(|builtin| builtin.id)
+    else {
+        return false;
+    };
+    let mut configs = layout::load_plugin_configs(PERSISTENCE_ID);
+    match record_palette_choice(&mut configs, light_id) {
+        Some(true) => layout::save_plugin_configs(PERSISTENCE_ID, &configs).is_ok(),
+        Some(false) => true,
+        None => false,
     }
+}
+
+/// Stores `palette_id` in the base plugin's config the way Maruzzella's
+/// Appearance page does. Returns whether `configs` changed, or `None` when
+/// they cannot be safely rewritten.
+fn record_palette_choice(configs: &mut layout::PluginConfigs, palette_id: &str) -> Option<bool> {
+    if !configs.invalid_entries.is_empty() {
+        // Saving would drop the entries Maruzzella could not read.
+        return None;
+    }
+    let entry = configs
+        .entries
+        .entry(MARUZZELLA_BASE_PLUGIN_ID.to_string())
+        .or_default();
+    let mut config = if entry.payload.is_empty() {
+        serde_json::Map::new()
+    } else {
+        match serde_json::from_slice(&entry.payload).ok()? {
+            serde_json::Value::Object(config) => config,
+            _ => return None,
+        }
+    };
+    if config.contains_key(MARUZZELLA_PALETTE_KEY) {
+        return Some(false);
+    }
+    config.insert(
+        MARUZZELLA_PALETTE_KEY.to_string(),
+        serde_json::Value::String(palette_id.to_string()),
+    );
+    entry.payload = serde_json::to_vec(&config).ok()?;
+    Some(true)
 }
 
 fn workspace_chrome() -> ShellChrome {
@@ -300,7 +319,10 @@ fn switch_to_project_workspace(handle: &maruzzella::MaruzzellaHandle, default_sh
 fn repaired_workspace_spec(default_shell: &ShellSpec) -> ShellSpec {
     let workspace_persistence_id = layout::scoped_persistence_id(PERSISTENCE_ID, WORKSPACE_SLOT);
     let mut shell = layout::load_for_slot(PERSISTENCE_ID, WORKSPACE_SLOT, default_shell);
-    let mut changed = normalize_empty_workbench_groups(&mut shell.spec.workbench);
+    let mut changed = remove_standalone_settings_tabs(&mut shell.spec.workbench);
+    if normalize_empty_workbench_groups(&mut shell.spec.workbench) {
+        changed = true;
+    }
     if ensure_workbench_has_any_tab(&mut shell.spec.workbench) {
         changed = true;
     }
@@ -351,6 +373,35 @@ fn remove_legacy_toolbar_items(items: &mut Vec<ToolbarItemSpec>) -> bool {
         item.id != "estimate" && item.id != "simulation" && item.id != "simulation-runs"
     });
     items.len() != previous_len
+}
+
+/// Earlier versions opened the PV settings in a tab of their own; they now
+/// live in Maruzzella's Settings, so restored layouts drop those tabs.
+fn remove_standalone_settings_tabs(node: &mut WorkbenchNodeSpec) -> bool {
+    match node {
+        WorkbenchNodeSpec::Group(group) => {
+            let previous_len = group.tabs.len();
+            group
+                .tabs
+                .retain(|tab| tab.plugin_view_id.as_deref() != Some(SETTINGS_VIEW_ID));
+            if group.tabs.len() == previous_len {
+                return false;
+            }
+            let active_is_present = group
+                .active_tab_id
+                .as_ref()
+                .is_some_and(|active| group.tabs.iter().any(|tab| &tab.id == active));
+            if !active_is_present {
+                group.active_tab_id = group.tabs.first().map(|tab| tab.id.clone());
+            }
+            true
+        }
+        WorkbenchNodeSpec::Split { children, .. } => {
+            children.iter_mut().fold(false, |changed, child| {
+                remove_standalone_settings_tabs(child) || changed
+            })
+        }
+    }
 }
 
 fn ensure_right_panel_detail_tab(group: &mut TabGroupSpec) -> bool {
@@ -581,4 +632,88 @@ fn embedded_pv_plugin() -> Result<maruzzella::LoadedPlugin, maruzzella::PluginLo
         "builtin:pv-desktop-plugin",
         pv_desktop_plugin::maruzzella_plugin_entry,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn palette_choice_is_added_next_to_other_base_plugin_settings() {
+        let mut configs = layout::PluginConfigs::default();
+        configs.entries.insert(
+            MARUZZELLA_BASE_PLUGIN_ID.to_string(),
+            layout::PluginConfigEntry {
+                schema_version: Some(1),
+                payload: br#"{"editor_drafts":{}}"#.to_vec(),
+            },
+        );
+
+        assert_eq!(record_palette_choice(&mut configs, "light"), Some(true));
+        let entry = &configs.entries[MARUZZELLA_BASE_PLUGIN_ID];
+        let config: serde_json::Value = serde_json::from_slice(&entry.payload).unwrap();
+        assert_eq!(config["palette"], "light");
+        assert!(config["editor_drafts"].is_object());
+        assert_eq!(entry.schema_version, Some(1));
+    }
+
+    #[test]
+    fn palette_choice_keeps_a_palette_already_picked_in_maruzzella() {
+        let mut configs = layout::PluginConfigs::default();
+        configs.entries.insert(
+            MARUZZELLA_BASE_PLUGIN_ID.to_string(),
+            layout::PluginConfigEntry {
+                schema_version: Some(1),
+                payload: br#"{"palette":"dark"}"#.to_vec(),
+            },
+        );
+
+        assert_eq!(record_palette_choice(&mut configs, "light"), Some(false));
+        let config: serde_json::Value =
+            serde_json::from_slice(&configs.entries[MARUZZELLA_BASE_PLUGIN_ID].payload).unwrap();
+        assert_eq!(config["palette"], "dark");
+    }
+
+    #[test]
+    fn palette_choice_is_recorded_in_a_fresh_config() {
+        let mut configs = layout::PluginConfigs::default();
+        assert_eq!(record_palette_choice(&mut configs, "light"), Some(true));
+        let config: serde_json::Value =
+            serde_json::from_slice(&configs.entries[MARUZZELLA_BASE_PLUGIN_ID].payload).unwrap();
+        assert_eq!(config["palette"], "light");
+    }
+
+    #[test]
+    fn palette_choice_leaves_unreadable_configs_alone() {
+        let mut configs = layout::PluginConfigs::default();
+        configs
+            .invalid_entries
+            .insert("other".to_string(), "unreadable".to_string());
+        assert_eq!(record_palette_choice(&mut configs, "light"), None);
+    }
+
+    #[test]
+    fn standalone_settings_tabs_are_dropped_from_restored_layouts() {
+        let settings_tab = plugin_tab(
+            "settings",
+            WORKBENCH_GROUP_ID,
+            "Settings",
+            SETTINGS_VIEW_ID,
+            "",
+            true,
+        );
+        let mut workbench = WorkbenchNodeSpec::Group(TabGroupSpec::new(
+            WORKBENCH_GROUP_ID,
+            Some("settings"),
+            vec![estimate_workbench_tab(), settings_tab],
+        ));
+
+        assert!(remove_standalone_settings_tabs(&mut workbench));
+        let WorkbenchNodeSpec::Group(group) = &workbench else {
+            panic!("workbench should stay a group");
+        };
+        assert_eq!(group.tabs.len(), 1);
+        assert_eq!(group.active_tab_id.as_deref(), Some(ESTIMATE_TAB_ID));
+        assert!(!remove_standalone_settings_tabs(&mut workbench));
+    }
 }

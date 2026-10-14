@@ -12,3 +12,4 @@ workspace = true
 gtk = { package = "gtk4", version = "0.9" }
 maruzzella = { version = "0.2.0", path = "../../../maruzzella" }
 pv-desktop-plugin = { path = "../../crates/pv-desktop-plugin", default-features = false }
+serde_json = "1.0"

@@ -14,15 +14,16 @@ use directories::ProjectDirs;
 use gtk::glib::translate::IntoGlibPtr;
 use gtk::prelude::*;
 use gtk::{
-    Align, Box as GtkBox, Button, CheckButton, DrawingArea, DropDown, Entry, FileChooserAction,
+    Align, Box as GtkBox, Button, DrawingArea, DropDown, Entry, FileChooserAction,
     FileChooserDialog, FileFilter, Grid, Image, Label, ListBox, Orientation, PolicyType, Popover,
     ProgressBar, ResponseType, ScrolledWindow, SelectionMode, Separator, Switch, Window,
 };
+use maruzzella_sdk::ffi::MzSettingsPage;
 use maruzzella_sdk::{
-    CommandSpec, HostApi, MzHostEvent, MzStatusCode, MzSurfaceFocusEvent, MzViewPlacement, Plugin,
-    PluginDependency, PluginDescriptor, SurfaceContributionSpec, Version, ViewFactorySpec,
-    button_css_class, decode_json_payload, export_plugin, input_css_class, mark_clickable,
-    text_css_class,
+    CommandSpec, HostApi, MzHostEvent, MzSettingsCategory, MzStatusCode, MzSurfaceFocusEvent,
+    MzViewPlacement, Plugin, PluginDependency, PluginDescriptor, SurfaceContributionSpec, Version,
+    ViewFactorySpec, button_css_class, decode_json_payload, export_plugin, input_css_class,
+    mark_clickable, text_css_class, ui,
 };
 use pv_core::simulation::{
     BuiltInLoadShapeId, LoadProfile, LoadShape, MetricSummary, ProductionProfile,
@@ -57,6 +58,7 @@ const CMD_SAVE: &str = "pv.project.save";
 const CMD_SAVE_AS: &str = "pv.project.save_as";
 const CMD_SET_SIMULATION_RUNS: &str = "pv.project.set_simulation_runs";
 const CMD_EXIT: &str = "pv.app.exit";
+const SIMULATION_RUNS_WIDGET_NAME: &str = "pv-simulation-runs";
 const SAVE_ACTION_IDS: &[&str] = &["pv-project-save", "file-save", "save"];
 const DETAILS_PANEL_MIN_WIDTH: i32 = 320;
 const COMPUTATION_DEBOUNCE: Duration = Duration::from_millis(750);
@@ -71,10 +73,11 @@ const SIMULATION_RUN_OPTIONS: [usize; 7] = [
     1_000_000_000,
 ];
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// The color palette setting of earlier versions. The palette is now picked
+/// on Maruzzella's Appearance settings page; the app migrates this once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ColorPalettePreference {
-    #[default]
+pub enum LegacyColorPalette {
     System,
     Light,
     Dark,
@@ -84,8 +87,9 @@ pub enum ColorPalettePreference {
 struct ApplicationSettings {
     #[serde(default = "default_true")]
     automatic_simulation_updates: bool,
-    #[serde(default)]
-    color_palette: ColorPalettePreference,
+    /// Read for the one-time migration, never written back.
+    #[serde(default, rename = "color_palette", skip_serializing)]
+    legacy_color_palette: Option<LegacyColorPalette>,
     #[serde(default)]
     automatic_project_save: bool,
 }
@@ -94,7 +98,7 @@ impl Default for ApplicationSettings {
     fn default() -> Self {
         Self {
             automatic_simulation_updates: true,
-            color_palette: ColorPalettePreference::System,
+            legacy_color_palette: None,
             automatic_project_save: false,
         }
     }
@@ -189,10 +193,6 @@ struct ShellModeHandlers {
     show_launcher: Box<dyn Fn()>,
 }
 
-struct AppearanceHandlers {
-    apply_color_palette: Box<dyn Fn(ColorPalettePreference)>,
-}
-
 struct SimulationRunState {
     requested_runs: usize,
     completed_runs: usize,
@@ -242,7 +242,6 @@ thread_local! {
     static SIMULATION_RUN: RefCell<Option<SimulationRunState>> = const { RefCell::new(None) };
     static AUTOMATIC_COMPUTATION: RefCell<AutomaticComputationState> = RefCell::new(AutomaticComputationState::default());
     static APPLICATION_SETTINGS: RefCell<Option<ApplicationSettings>> = const { RefCell::new(None) };
-    static APPEARANCE_HANDLERS: RefCell<Option<AppearanceHandlers>> = const { RefCell::new(None) };
     static AUTOMATIC_SAVE: RefCell<Option<gtk::glib::SourceId>> = const { RefCell::new(None) };
     static SIMULATION_GRAPH_DATE: RefCell<DailyProjectionDate> = const { RefCell::new(DailyProjectionDate { month: 6, day: 21 }) };
     static SIMULATION_PROGRESS_VIEWS: RefCell<Vec<SimulationProgressWidgets>> = const { RefCell::new(Vec::new()) };
@@ -266,18 +265,16 @@ pub fn install_shell_mode_handlers(
     });
 }
 
-pub fn install_color_palette_handler(
-    apply_color_palette: impl Fn(ColorPalettePreference) + 'static,
-) {
-    APPEARANCE_HANDLERS.with(|handlers| {
-        *handlers.borrow_mut() = Some(AppearanceHandlers {
-            apply_color_palette: Box::new(apply_color_palette),
-        });
-    });
+/// The color palette stored by earlier versions, if it was not migrated yet.
+pub fn legacy_color_palette() -> Option<LegacyColorPalette> {
+    load_desktop_session().and_then(|session| session.settings.legacy_color_palette)
 }
 
-pub fn current_color_palette() -> ColorPalettePreference {
-    application_settings().color_palette
+/// Drops the legacy color palette from the stored settings once migrated.
+pub fn forget_legacy_color_palette() {
+    if let Some(session) = load_desktop_session() {
+        write_desktop_session(&session);
+    }
 }
 
 fn automatic_simulation_updates_enabled() -> bool {
@@ -295,18 +292,6 @@ fn set_automatic_simulation_updates(enabled: bool) {
         clear_automatic_computation();
     }
     refresh_workbench_views();
-}
-
-fn set_color_palette(palette: ColorPalettePreference) {
-    if current_color_palette() == palette {
-        return;
-    }
-    update_application_settings(|settings| settings.color_palette = palette);
-    APPEARANCE_HANDLERS.with(|handlers| {
-        if let Some(handlers) = handlers.borrow().as_ref() {
-            (handlers.apply_color_palette)(palette);
-        }
-    });
 }
 
 fn set_automatic_project_save(enabled: bool) {
@@ -452,6 +437,17 @@ impl Plugin for PvDesktopPlugin {
             MzViewPlacement::Workbench,
             create_settings_view,
         ))?;
+        host.register_surface_contribution(SurfaceContributionSpec::settings_page_with_view(
+            PLUGIN_ID,
+            "pv-desktop-settings",
+            MzSettingsPage::new(
+                "pv-estimator",
+                "PV Estimator",
+                "Simulation and project saving.",
+                MzSettingsCategory::Workspace,
+            )
+            .with_view(VIEW_SETTINGS, MzViewPlacement::Workbench),
+        ))?;
 
         Ok(())
     }
@@ -587,7 +583,7 @@ fn sync_simulation_run_controls(runs: usize) {
 
 fn sync_simulation_run_controls_in(widget: &gtk::Widget, selected: u32) {
     if let Some(dropdown) = widget.downcast_ref::<DropDown>()
-        && (dropdown.has_css_class("simulation-runs-control")
+        && (dropdown.widget_name() == SIMULATION_RUNS_WIDGET_NAME
             || dropdown.tooltip_text().as_deref() == Some("Simulation runs"))
         && dropdown.selected() != selected
     {
@@ -1547,6 +1543,14 @@ fn update_application_settings(update: impl FnOnce(&mut ApplicationSettings)) {
 }
 
 fn save_desktop_session(last_project_path: Option<&Path>) {
+    write_desktop_session(&DesktopSession {
+        schema_version: DESKTOP_SESSION_SCHEMA_VERSION,
+        last_project_path: last_project_path.map(Path::to_path_buf),
+        settings: application_settings(),
+    });
+}
+
+fn write_desktop_session(session: &DesktopSession) {
     let Some(path) = desktop_session_path() else {
         return;
     };
@@ -1556,12 +1560,7 @@ fn save_desktop_session(last_project_path: Option<&Path>) {
     if fs::create_dir_all(parent).is_err() {
         return;
     }
-    let session = DesktopSession {
-        schema_version: DESKTOP_SESSION_SCHEMA_VERSION,
-        last_project_path: last_project_path.map(Path::to_path_buf),
-        settings: application_settings(),
-    };
-    if let Ok(bytes) = serde_json::to_vec_pretty(&session) {
+    if let Ok(bytes) = serde_json::to_vec_pretty(session) {
         let _ = fs::write(path, bytes);
     }
 }
@@ -1778,6 +1777,8 @@ extern "C" fn create_details_view(
     widget_ptr(root)
 }
 
+/// The settings page shown in Maruzzella's Settings, next to its own
+/// Appearance page.
 extern "C" fn create_settings_view(
     _host: *const maruzzella_sdk::ffi::MzHostApi,
     _request: *const maruzzella_sdk::ffi::MzViewRequest,
@@ -1786,12 +1787,7 @@ extern "C" fn create_settings_view(
         return std::ptr::null_mut();
     }
 
-    let page = GtkBox::new(Orientation::Vertical, 0);
-    page.add_css_class("settings-page");
-    page.set_margin_top(0);
-    page.set_margin_bottom(40);
-    page.set_margin_start(32);
-    page.set_margin_end(32);
+    let page = ui::vbox(24);
     page.set_hexpand(true);
     let settings = application_settings();
 
@@ -1804,9 +1800,8 @@ extern "C" fn create_settings_view(
             .position(|runs| *runs == current_simulation_runs())
             .unwrap_or(1) as u32,
     );
-    runs.set_size_request(220, -1);
-    runs.add_css_class("settings-control");
-    runs.add_css_class("simulation-runs-control");
+    runs.set_widget_name(SIMULATION_RUNS_WIDGET_NAME);
+    runs.set_tooltip_text(Some("Simulation runs"));
     runs.set_sensitive(has_open_project());
     mark_clickable(&runs);
     runs.connect_selected_notify(move |dropdown| {
@@ -1821,208 +1816,57 @@ extern "C" fn create_settings_view(
 
     let automatic_updates = Switch::builder()
         .active(settings.automatic_simulation_updates)
-        .valign(Align::Center)
         .build();
-    automatic_updates.add_css_class("settings-switch");
     mark_clickable(&automatic_updates);
     automatic_updates.connect_active_notify(|toggle| {
         set_automatic_simulation_updates(toggle.is_active());
     });
 
-    let simulation = settings_group();
-    simulation.append(&settings_row(
+    let simulation = ui::vbox(16);
+    simulation.append(&setting_row(
         "Simulation runs",
         "Higher values produce more stable results but take longer to calculate.",
         &runs,
     ));
-    simulation.append(&Separator::new(Orientation::Horizontal));
-    simulation.append(&settings_row(
+    simulation.append(&setting_row(
         "Update simulations automatically",
         "Recalculate results after system parameters change.",
         &automatic_updates,
     ));
-    page.append(&simulation);
-    page.append(&Separator::new(Orientation::Horizontal));
-
-    let palette_group = GtkBox::new(Orientation::Vertical, 0);
-    palette_group.add_css_class("settings-palette-group");
-    let (system_palette, system_radio) = palette_option(
-        "System",
-        "Follow the desktop appearance",
-        &["#f4f6f8", "#d9dee5", "#323842", "#171a1f"],
-        None,
-        ColorPalettePreference::System,
-    );
-    let (light_palette, light_radio) = palette_option(
-        "Light",
-        "Bright surfaces with dark text",
-        &["#ffffff", "#edf1f5", "#cad2dc", "#2463a7"],
-        Some(&system_radio),
-        ColorPalettePreference::Light,
-    );
-    let (dark_palette, dark_radio) = palette_option(
-        "Dark",
-        "Low-glare surfaces with light text",
-        &["#111419", "#1c222a", "#394451", "#4f91d8"],
-        Some(&system_radio),
-        ColorPalettePreference::Dark,
-    );
-    match settings.color_palette {
-        ColorPalettePreference::System => system_radio.set_active(true),
-        ColorPalettePreference::Light => light_radio.set_active(true),
-        ColorPalettePreference::Dark => dark_radio.set_active(true),
-    }
-    palette_group.append(&system_palette);
-    palette_group.append(&Separator::new(Orientation::Horizontal));
-    palette_group.append(&light_palette);
-    palette_group.append(&Separator::new(Orientation::Horizontal));
-    palette_group.append(&dark_palette);
-
-    let appearance = settings_group();
-    appearance.append(&settings_label(
-        "Color palette",
-        "Choose the application-wide appearance.",
-    ));
-    appearance.append(&Separator::new(Orientation::Horizontal));
-    appearance.append(&palette_group);
-    page.append(&appearance);
-    page.append(&Separator::new(Orientation::Horizontal));
+    page.append(&ui::section("Simulation", &[], &simulation));
 
     let automatic_save = Switch::builder()
         .active(settings.automatic_project_save)
-        .valign(Align::Center)
         .build();
-    automatic_save.add_css_class("settings-switch");
     mark_clickable(&automatic_save);
     automatic_save.connect_active_notify(|toggle| {
         set_automatic_project_save(toggle.is_active());
     });
-    let projects = settings_group();
-    projects.append(&settings_row(
-        "Save changes automatically",
-        "Save edits after a short delay once the project has a file location.",
-        &automatic_save,
+    page.append(&ui::section(
+        "Projects",
+        &[],
+        &setting_row(
+            "Save changes automatically",
+            "Save edits after a short delay once the project has a file location.",
+            &automatic_save,
+        ),
     ));
-    page.append(&projects);
 
-    let scroller = ScrolledWindow::builder()
-        .hscrollbar_policy(PolicyType::Never)
-        .vscrollbar_policy(PolicyType::Automatic)
-        .child(&page)
-        .build();
-    scroller.set_hexpand(true);
-    scroller.set_vexpand(true);
-    widget_ptr(scroller)
+    widget_ptr(page)
 }
 
-fn settings_group() -> GtkBox {
-    let group = GtkBox::new(Orientation::Vertical, 0);
-    group.add_css_class("settings-group");
-    group
-}
-
-fn settings_label(title: &str, description: &str) -> GtkBox {
-    let label = GtkBox::new(Orientation::Vertical, 4);
-    label.add_css_class("settings-row");
-    let title_label = Label::new(Some(title));
-    title_label.set_xalign(0.0);
-    title_label.add_css_class("settings-row-title");
-    label.append(&title_label);
-    let description_label = Label::new(Some(description));
-    description_label.set_xalign(0.0);
-    description_label.set_wrap(true);
-    description_label.add_css_class("settings-row-description");
-    label.append(&description_label);
-    label
-}
-
-fn settings_row<C: IsA<gtk::Widget>>(title: &str, description: &str, control: &C) -> GtkBox {
-    let row = GtkBox::new(Orientation::Horizontal, 24);
-    row.add_css_class("settings-row");
-
-    let copy = GtkBox::new(Orientation::Vertical, 4);
+/// A setting: its name and explanation, then the control at the end.
+fn setting_row<C: IsA<gtk::Widget>>(title: &str, description: &str, control: &C) -> GtkBox {
+    let row = ui::hbox(24);
+    let copy = ui::vbox(2);
     copy.set_hexpand(true);
-    let title_label = Label::new(Some(title));
-    title_label.set_xalign(0.0);
-    title_label.add_css_class("settings-row-title");
-    copy.append(&title_label);
-    let description_label = Label::new(Some(description));
-    description_label.set_xalign(0.0);
-    description_label.set_wrap(true);
-    description_label.add_css_class("settings-row-description");
-    copy.append(&description_label);
+    copy.append(&ui::text(title, "body"));
+    copy.append(&ui::hint(description));
     row.append(&copy);
-
     control.set_halign(Align::End);
     control.set_valign(Align::Center);
     row.append(control);
     row
-}
-
-fn palette_option(
-    title: &str,
-    description: &str,
-    colors: &[&str],
-    group: Option<&CheckButton>,
-    palette: ColorPalettePreference,
-) -> (GtkBox, CheckButton) {
-    let option = GtkBox::new(Orientation::Horizontal, 12);
-    option.add_css_class("settings-palette-option");
-
-    let radio = CheckButton::new();
-    radio.set_group(group);
-    radio.set_valign(Align::Center);
-    mark_clickable(&radio);
-    radio.connect_toggled(move |radio| {
-        if radio.is_active() {
-            set_color_palette(palette);
-        }
-    });
-    option.append(&radio);
-
-    let copy = GtkBox::new(Orientation::Vertical, 3);
-    copy.set_hexpand(true);
-    let title_label = Label::new(Some(title));
-    title_label.set_xalign(0.0);
-    title_label.add_css_class("settings-row-title");
-    copy.append(&title_label);
-    let description_label = Label::new(Some(description));
-    description_label.set_xalign(0.0);
-    description_label.add_css_class("settings-row-description");
-    copy.append(&description_label);
-    option.append(&copy);
-
-    let preview = GtkBox::new(Orientation::Horizontal, 0);
-    preview.add_css_class("settings-palette-preview");
-    for color in colors {
-        let swatch = DrawingArea::new();
-        swatch.set_content_width(30);
-        swatch.set_content_height(24);
-        let rgb = parse_hex_color(color);
-        swatch.set_draw_func(move |_, context, width, height| {
-            context.set_source_rgb(rgb.0, rgb.1, rgb.2);
-            context.rectangle(0.0, 0.0, f64::from(width), f64::from(height));
-            let _ = context.fill();
-        });
-        preview.append(&swatch);
-    }
-    option.append(&preview);
-
-    let click = gtk::GestureClick::new();
-    let radio_for_click = radio.clone();
-    click.connect_released(move |_, _, _, _| radio_for_click.set_active(true));
-    option.add_controller(click);
-    mark_clickable(&option);
-    (option, radio)
-}
-
-fn parse_hex_color(color: &str) -> (f64, f64, f64) {
-    let value = u32::from_str_radix(color.trim_start_matches('#'), 16).unwrap_or_default();
-    (
-        f64::from((value >> 16) as u8) / 255.0,
-        f64::from((value >> 8) as u8) / 255.0,
-        f64::from(value as u8) / 255.0,
-    )
 }
 
 fn widget_ptr<W: IsA<gtk::Widget>>(widget: W) -> *mut c_void {
@@ -4962,11 +4806,29 @@ mod tests {
                 .expect("legacy desktop session should deserialize");
 
         assert!(session.settings.automatic_simulation_updates);
-        assert_eq!(
-            session.settings.color_palette,
-            ColorPalettePreference::System
-        );
+        assert_eq!(session.settings.legacy_color_palette, None);
         assert!(!session.settings.automatic_project_save);
+    }
+
+    #[test]
+    fn legacy_color_palette_is_read_but_not_written_back() {
+        let session: DesktopSession = serde_json::from_str(
+            r#"{"schema_version":1,"last_project_path":null,"settings":{"automatic_simulation_updates":false,"color_palette":"light","automatic_project_save":true}}"#,
+        )
+        .expect("session with a color palette should deserialize");
+        assert_eq!(
+            session.settings.legacy_color_palette,
+            Some(LegacyColorPalette::Light)
+        );
+        assert!(!session.settings.automatic_simulation_updates);
+        assert!(session.settings.automatic_project_save);
+
+        let json = serde_json::to_string(&session).expect("session should serialize");
+        assert!(!json.contains("color_palette"));
+        let restored: DesktopSession =
+            serde_json::from_str(&json).expect("session should deserialize");
+        assert_eq!(restored.settings.legacy_color_palette, None);
+        assert!(restored.settings.automatic_project_save);
     }
 
     #[test]
@@ -4976,7 +4838,7 @@ mod tests {
             last_project_path: Some(PathBuf::from("example.pvproj")),
             settings: ApplicationSettings {
                 automatic_simulation_updates: false,
-                color_palette: ColorPalettePreference::Light,
+                legacy_color_palette: None,
                 automatic_project_save: true,
             },
         };

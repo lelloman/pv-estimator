@@ -1409,6 +1409,7 @@ dependencies = [
  "gtk4",
  "maruzzella",
  "pv-desktop-plugin",
+ "serde_json",
 ]
 
 [[package]]
