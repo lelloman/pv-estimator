@@ -237,6 +237,8 @@ fn light_theme() -> ThemeSpec {
             text_2: "#687482".to_string(),
             accent: "#2463a7".to_string(),
             accent_strong: "#174c82".to_string(),
+            // Empty: Maruzzella picks its light terminal colors.
+            terminal_ansi: Vec::new(),
         },
         ..ThemeSpec::default()
     }
