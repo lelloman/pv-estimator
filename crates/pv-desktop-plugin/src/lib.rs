@@ -3629,6 +3629,9 @@ struct ChartColors {
     text: gtk::gdk::RGBA,
     production: gtk::gdk::RGBA,
     load: gtk::gdk::RGBA,
+    /// The UI font, so axis labels match the rest of the window.
+    font_family: String,
+    font_size: f64,
 }
 
 impl ChartColors {
@@ -3646,11 +3649,34 @@ impl ChartColors {
                 .unwrap_or(load)
         };
         let palette = palette.as_ref();
+        let font = widget.pango_context().font_description();
+        let font_family = font
+            .as_ref()
+            .and_then(|font| font.family())
+            .map(|family| family.to_string())
+            .unwrap_or_else(|| "Sans".to_string());
+        // Labels sit a step below the UI font; Pango sizes are in points
+        // (or device units when absolute), cairo's in pixels.
+        let font_size = font
+            .as_ref()
+            .filter(|font| font.size() > 0)
+            .map(|font| {
+                let size = f64::from(font.size()) / f64::from(gtk::pango::SCALE);
+                let pixels = if font.is_size_absolute() {
+                    size
+                } else {
+                    size * 96.0 / 72.0
+                };
+                (pixels * 0.85).clamp(9.0, 14.0)
+            })
+            .unwrap_or(11.0);
         Self {
             grid: color(palette.map(|palette| &palette.border)),
             text: color(palette.map(|palette| &palette.text_2)),
             production: color(palette.map(|palette| &palette.accent)),
             load,
+            font_family,
+            font_size,
         }
     }
 
@@ -3852,11 +3878,11 @@ fn draw_axis_label(
 ) {
     set_source_rgba(context, &colors.text);
     context.select_font_face(
-        "Sans",
+        &colors.font_family,
         gtk::cairo::FontSlant::Normal,
         gtk::cairo::FontWeight::Normal,
     );
-    context.set_font_size(10.0);
+    context.set_font_size(colors.font_size);
     context.move_to(x, y);
     let _ = context.show_text(text);
 }
