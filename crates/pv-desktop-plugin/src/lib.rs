@@ -16,14 +16,14 @@ use gtk::prelude::*;
 use gtk::{
     Align, Box as GtkBox, Button, DrawingArea, DropDown, Entry, FileChooserAction,
     FileChooserDialog, FileFilter, Grid, Image, Label, ListBox, Orientation, PolicyType, Popover,
-    ProgressBar, ResponseType, ScrolledWindow, SelectionMode, Separator, Switch, Window,
+    ProgressBar, ResponseType, ScrolledWindow, SelectionMode, Switch, Window,
 };
 use maruzzella_sdk::ffi::MzSettingsPage;
 use maruzzella_sdk::{
     CommandSpec, HostApi, MzHostEvent, MzSettingsCategory, MzStatusCode, MzSurfaceFocusEvent,
-    MzViewPlacement, Plugin, PluginDependency, PluginDescriptor, SurfaceContributionSpec, Version,
-    ViewFactorySpec, button_css_class, decode_json_payload, export_plugin, input_css_class,
-    mark_clickable, text_css_class, ui,
+    MzThemePalette, MzViewPlacement, Plugin, PluginDependency, PluginDescriptor,
+    SurfaceContributionSpec, Version, ViewFactorySpec, decode_json_payload, export_plugin,
+    input_css_class, mark_clickable, theme_palette_from_event, ui,
 };
 use pv_core::simulation::{
     BuiltInLoadShapeId, LoadProfile, LoadShape, MetricSummary, ProductionProfile,
@@ -60,7 +60,6 @@ const CMD_SET_SIMULATION_RUNS: &str = "pv.project.set_simulation_runs";
 const CMD_EXIT: &str = "pv.app.exit";
 const SIMULATION_RUNS_WIDGET_NAME: &str = "pv-simulation-runs";
 const SAVE_ACTION_IDS: &[&str] = &["pv-project-save", "file-save", "save"];
-const DETAILS_PANEL_MIN_WIDTH: i32 = 320;
 const COMPUTATION_DEBOUNCE: Duration = Duration::from_millis(750);
 const AUTO_SAVE_DEBOUNCE: Duration = Duration::from_millis(900);
 const SIMULATION_RUN_OPTIONS: [usize; 7] = [
@@ -251,6 +250,8 @@ thread_local! {
     static DETAIL_VIEWS: RefCell<Vec<gtk::glib::WeakRef<GtkBox>>> = const { RefCell::new(Vec::new()) };
     static ACTIVE_CONTEXT: RefCell<Option<MzSurfaceFocusEvent>> = const { RefCell::new(None) };
     static INITIAL_DETAILS_VIEW: RefCell<Option<&'static str>> = const { RefCell::new(None) };
+    static THEME_PALETTE: RefCell<Option<MzThemePalette>> = const { RefCell::new(None) };
+    static CHARTS: RefCell<Vec<gtk::glib::WeakRef<DrawingArea>>> = const { RefCell::new(Vec::new()) };
 }
 
 pub fn install_shell_mode_handlers(
@@ -326,6 +327,36 @@ extern "C" fn observe_context_event(
     maruzzella_sdk::ffi::MzStatus::OK
 }
 
+/// Redraws the charts in the colors of a palette the user switched to.
+extern "C" fn observe_palette_change(
+    payload: maruzzella_sdk::ffi::MzBytes,
+) -> maruzzella_sdk::ffi::MzStatus {
+    let Some(palette) = theme_palette_from_event(payload) else {
+        return maruzzella_sdk::ffi::MzStatus::new(MzStatusCode::InvalidArgument);
+    };
+    THEME_PALETTE.with(|current| current.replace(Some(palette)));
+    CHARTS.with(|charts| {
+        charts.borrow_mut().retain(|chart| match chart.upgrade() {
+            Some(chart) => {
+                chart.queue_draw();
+                true
+            }
+            None => false,
+        });
+    });
+    maruzzella_sdk::ffi::MzStatus::OK
+}
+
+/// Keeps `chart` in the colors of the active palette.
+fn remember_chart(chart: &DrawingArea) {
+    ui::set_fg_tone(chart, ui::Tone::Warning);
+    CHARTS.with(|charts| {
+        let mut charts = charts.borrow_mut();
+        charts.retain(|chart| chart.upgrade().is_some());
+        charts.push(chart.downgrade());
+    });
+}
+
 pub fn set_initial_details_view(plugin_view_id: &'static str) {
     INITIAL_DETAILS_VIEW.with(|slot| {
         *slot.borrow_mut() = Some(plugin_view_id);
@@ -394,6 +425,12 @@ impl Plugin for PvDesktopPlugin {
             "maruzzella.context.active_changed",
             observe_context_event,
         )?;
+
+        if let Ok(Some(palette)) = host.read_theme_palette() {
+            THEME_PALETTE.with(|current| current.replace(Some(palette)));
+        }
+        // Hosts without palette events keep the palette read at startup.
+        let _ = host.subscribe_theme_palette_changed(observe_palette_change);
 
         host.register_view_factory(ViewFactorySpec::new(
             PLUGIN_ID,
@@ -1587,14 +1624,6 @@ fn active_window() -> Option<Window> {
         .map(|window| window.upcast())
 }
 
-fn apply_text_role(label: &Label, role: &str) {
-    label.add_css_class(&text_css_class(role));
-}
-
-fn apply_button_role(button: &Button, role: &str) {
-    button.add_css_class(&button_css_class(role));
-}
-
 fn apply_input_role(entry: &Entry, role: &str) {
     entry.add_css_class(&input_css_class(role));
 }
@@ -1771,7 +1800,6 @@ extern "C" fn create_details_view(
     let root = GtkBox::new(Orientation::Vertical, 0);
     root.set_hexpand(true);
     root.set_vexpand(true);
-    root.set_size_request(DETAILS_PANEL_MIN_WIDTH, -1);
     render_details_into(&root);
     remember_view(&DETAIL_VIEWS, &root);
     widget_ptr(root)
@@ -1936,113 +1964,82 @@ fn refresh_view_group(
 
 fn render_launcher_into(root: &GtkBox) {
     clear_box(root);
-    let content = GtkBox::new(Orientation::Vertical, 8);
-    content.set_margin_top(12);
-    content.set_margin_bottom(12);
-    content.set_margin_start(12);
-    content.set_margin_end(12);
-    append_no_project_state(
-        &content,
-        "No project open",
+    root.append(&no_project_state(
         "Create a new project or open an existing .pvproj file.",
-    );
-    root.append(&content);
+    ));
 }
 
 fn render_system_into(root: &GtkBox) {
     clear_box(root);
     let state = snapshot();
-    let scroller = ScrolledWindow::builder()
-        .hexpand(true)
-        .vexpand(true)
-        .hscrollbar_policy(PolicyType::Automatic)
-        .vscrollbar_policy(PolicyType::Automatic)
-        .build();
-    let content = GtkBox::new(Orientation::Vertical, 8);
-    content.set_margin_top(10);
-    content.set_margin_bottom(10);
-    content.set_margin_start(10);
-    content.set_margin_end(10);
-    if let Some(project) = &state.project {
-        append_scenario_switcher(&content, project);
-        content.append(&section_separator());
-        append_location_fields(&content, &project.inputs.estimate_request);
-        content.append(&section_separator());
-        append_array_fields(&content, project);
-        content.append(&section_separator());
-        append_consumption_fields(&content, &project.inputs);
-    } else {
-        append_no_project_state(
-            &content,
-            "No project open",
+    let Some(project) = &state.project else {
+        root.append(&no_project_state(
             "Create a new project or open an existing .pvproj file.",
-        );
-    }
+        ));
+        return;
+    };
+    root.append(&system_header());
+    let scroller = panel_scroller();
+    let content = panel_content();
+    append_scenario_switcher(&content, project);
+    append_location_fields(&content, &project.inputs.estimate_request);
+    append_array_fields(&content, project);
+    append_consumption_fields(&content, &project.inputs);
     scroller.set_child(Some(&content));
     root.append(&scroller);
 }
 
-fn append_no_project_state(content: &GtkBox, title: &str, message: &str) {
-    content.set_valign(Align::Center);
-    content.append(&header_label(title));
-    content.append(&body_label(message));
-
-    let actions = GtkBox::new(Orientation::Horizontal, 6);
-    actions.set_halign(Align::Start);
-    let new_project = Button::with_label("New Project");
-    apply_button_role(&new_project, "primary");
-    new_project.connect_clicked(|_| create_new_project());
-    actions.append(&new_project);
-    let open_project = Button::with_label("Open Project");
-    apply_button_role(&open_project, "secondary");
-    open_project.connect_clicked(|_| show_open_project_dialog());
-    actions.append(&open_project);
-    content.append(&actions);
+/// The centered "No project open" state with the actions that start one.
+fn no_project_state(message: &str) -> GtkBox {
+    let state = ui::empty_state("folder-open-symbolic", "No project open", message, None);
+    state.set_hexpand(true);
+    state.set_vexpand(true);
+    let actions = project_actions();
+    actions.set_halign(Align::Center);
+    actions.set_margin_top(4);
+    state.append(&actions);
+    state
 }
 
-fn append_scenario_switcher(content: &GtkBox, project: &PvProjectDocument) {
-    let row = GtkBox::new(Orientation::Horizontal, 6);
-    row.set_hexpand(true);
+/// The tool window title row of the system panel with the setup actions.
+fn system_header() -> GtkBox {
+    let header = ui::tool_window_header("System", 0);
+    header.append(&ui::spacer());
 
-    let setup_name = project.title_for_window();
-    let dropdown = DropDown::from_strings(&[setup_name.as_str()]);
-    dropdown.set_hexpand(true);
-    dropdown.set_halign(Align::Fill);
-    dropdown.set_selected(0);
-    dropdown.set_tooltip_text(Some("Active setup"));
-    row.append(&dropdown);
-
-    let add = icon_button("list-add-symbolic", "Add setup");
+    let add = ui::icon_button("list-add-symbolic", "Add setup");
     add.connect_clicked(|_| {
         append_log("Setup creation is not wired yet".to_string());
         refresh_views();
     });
-    row.append(&add);
+    header.append(&add);
 
-    let more = icon_button("open-menu-symbolic", "Setup actions");
-    let menu = Popover::new();
-    menu.set_has_arrow(false);
-    menu.set_parent(&more);
-    let menu_content = GtkBox::new(Orientation::Vertical, 0);
-    menu_content.set_margin_top(6);
-    menu_content.set_margin_bottom(6);
-    menu_content.set_margin_start(6);
-    menu_content.set_margin_end(6);
+    let more = ui::icon_button("view-more-symbolic", "Setup actions");
+    let popup = Popover::new();
+    ui::style_popup(&popup);
+    popup.set_parent(&more);
+    let menu = ui::menu();
     let rename = Button::with_label("Rename setup");
-    apply_button_role(&rename, "secondary");
     rename.set_halign(Align::Fill);
-    let menu_for_rename = menu.clone();
+    mark_clickable(&rename);
+    let popup_for_rename = popup.clone();
     rename.connect_clicked(move |_| {
-        menu_for_rename.popdown();
+        popup_for_rename.popdown();
         show_rename_setup_dialog();
     });
-    menu_content.append(&rename);
-    menu.set_child(Some(&menu_content));
-    let menu_for_more = menu.clone();
-    more.connect_clicked(move |_| menu_for_more.popup());
-    row.append(&more);
+    menu.append(&rename);
+    popup.set_child(Some(&menu));
+    more.connect_clicked(move |_| popup.popup());
+    header.append(&more);
+    header
+}
 
-    content.append(&row);
+fn append_scenario_switcher(content: &GtkBox, project: &PvProjectDocument) {
+    let setup_name = project.title_for_window();
+    let dropdown = DropDown::from_strings(&[setup_name.as_str()]);
+    dropdown.set_hexpand(true);
+    dropdown.set_selected(0);
+    dropdown.set_tooltip_text(Some("Active setup"));
+    content.append(&dropdown);
 }
 
 fn show_rename_setup_dialog() {
@@ -2062,33 +2059,14 @@ fn show_rename_setup_dialog() {
         refresh_views();
         return;
     };
-    let window = Window::builder()
-        .title("Rename Setup")
-        .modal(true)
-        .default_width(360)
-        .build();
-    window.add_css_class("app-dialog");
-
-    let content = GtkBox::new(Orientation::Vertical, 12);
-    content.set_margin_top(14);
-    content.set_margin_bottom(8);
-    content.set_margin_start(14);
-    content.set_margin_end(14);
+    let (window, content) = dialog_window("Rename Setup", 360);
 
     let name = field_entry();
     name.set_text(&current_name);
     name.set_placeholder_text(Some("Setup name"));
     content.append(&field_row("Name", &name));
 
-    let footer = GtkBox::new(Orientation::Horizontal, 6);
-    footer.set_halign(Align::End);
-    footer.set_margin_bottom(0);
-    let cancel = Button::with_label("Cancel");
-    apply_button_role(&cancel, "secondary");
-    let window_for_cancel = window.clone();
-    cancel.connect_clicked(move |_| window_for_cancel.close());
-    let save = Button::with_label("Save");
-    apply_button_role(&save, "primary");
+    let save = ui::button("Save", ui::ButtonKind::Primary);
     let window_for_save = window.clone();
     let name_for_save = name.clone();
     save.connect_clicked(move |_| {
@@ -2096,22 +2074,51 @@ fn show_rename_setup_dialog() {
             window_for_save.close();
         }
     });
-    footer.append(&cancel);
-    footer.append(&save);
-    content.append(&footer);
+    content.append(&dialog_buttons(&window, &save));
 
-    window.set_child(Some(&content));
     window.present();
     name.grab_focus();
 }
 
+/// A modal dialog window and its content box, styled by Maruzzella.
+fn dialog_window(title: &str, width: i32) -> (Window, GtkBox) {
+    let window = Window::builder()
+        .title(title)
+        .modal(true)
+        .default_width(width)
+        .build();
+    window.add_css_class("app-dialog");
+    if let Some(parent) = active_window() {
+        window.set_transient_for(Some(&parent));
+    }
+    let content = ui::vbox(12);
+    content.set_margin_top(20);
+    content.set_margin_bottom(16);
+    content.set_margin_start(20);
+    content.set_margin_end(20);
+    window.set_child(Some(&content));
+    (window, content)
+}
+
+/// The right-aligned Cancel button followed by the dialog's main action.
+fn dialog_buttons(window: &Window, action: &Button) -> GtkBox {
+    let buttons = ui::hbox(8);
+    buttons.set_halign(Align::End);
+    buttons.set_margin_top(4);
+    let cancel = ui::button("Cancel", ui::ButtonKind::Secondary);
+    let window = window.clone();
+    cancel.connect_clicked(move |_| window.close());
+    buttons.append(&cancel);
+    buttons.append(action);
+    buttons
+}
+
 fn append_location_fields(content: &GtkBox, request: &EstimateRequest) {
-    content.append(&section_label("Location"));
-    let name = Button::with_label(&request.name);
-    apply_button_role(&name, "secondary");
-    name.set_halign(Align::Fill);
+    let fields = form();
+    let name = ui::button(&request.name, ui::ButtonKind::Secondary);
+    name.set_tooltip_text(Some("Search location"));
     name.connect_clicked(|_| show_location_search_dialog());
-    content.append(&field_row("Name", &name));
+    fields.append(&field_row("Name", &name));
     let lat = number_entry(request.latitude, 4, |value| {
         update_input_state(|state| {
             if let Some(project) = state.project.as_mut() {
@@ -2119,7 +2126,7 @@ fn append_location_fields(content: &GtkBox, request: &EstimateRequest) {
             }
         });
     });
-    content.append(&field_row("Latitude", &lat));
+    fields.append(&field_row("Latitude", &lat));
     let lon = number_entry(request.longitude, 4, |value| {
         update_input_state(|state| {
             if let Some(project) = state.project.as_mut() {
@@ -2127,7 +2134,8 @@ fn append_location_fields(content: &GtkBox, request: &EstimateRequest) {
             }
         });
     });
-    content.append(&field_row("Longitude", &lon));
+    fields.append(&field_row("Longitude", &lon));
+    content.append(&ui::section("Location", &[], &fields));
 }
 
 fn show_location_search_dialog() {
@@ -2147,19 +2155,8 @@ fn show_location_search_dialog() {
         refresh_views();
         return;
     };
-    let window = Window::builder()
-        .title("Search Location")
-        .modal(true)
-        .default_width(460)
-        .default_height(520)
-        .build();
-    window.add_css_class("app-dialog");
-
-    let content = GtkBox::new(Orientation::Vertical, 10);
-    content.set_margin_top(14);
-    content.set_margin_bottom(8);
-    content.set_margin_start(14);
-    content.set_margin_end(14);
+    let (window, content) = dialog_window("Search Location", 460);
+    window.set_default_height(520);
 
     let search = search_entry();
     search.set_placeholder_text(Some("Search city"));
@@ -2167,94 +2164,100 @@ fn show_location_search_dialog() {
     content.append(&search);
 
     let list = ListBox::new();
+    ui::style_list(&list);
     list.set_selection_mode(SelectionMode::None);
+    let results = std::rc::Rc::new(RefCell::new(Vec::new()));
+    {
+        let results = results.clone();
+        let window = window.clone();
+        list.connect_row_activated(move |_, row| {
+            let result = usize::try_from(row.index())
+                .ok()
+                .and_then(|index| results.borrow().get(index).cloned());
+            if let Some(result) = result {
+                apply_location_result(&result);
+                window.close();
+            }
+        });
+    }
     let scroller = ScrolledWindow::builder()
         .hexpand(true)
         .vexpand(true)
-        .hscrollbar_policy(PolicyType::Automatic)
+        .hscrollbar_policy(PolicyType::Never)
         .vscrollbar_policy(PolicyType::Automatic)
         .child(&list)
         .build();
     content.append(&scroller);
 
-    let footer = GtkBox::new(Orientation::Horizontal, 6);
-    footer.set_halign(Align::End);
-    footer.set_margin_bottom(0);
-    let cancel = Button::with_label("Cancel");
-    apply_button_role(&cancel, "secondary");
+    let buttons = ui::hbox(8);
+    buttons.set_halign(Align::End);
+    let cancel = ui::button("Cancel", ui::ButtonKind::Secondary);
     let window_for_cancel = window.clone();
     cancel.connect_clicked(move |_| window_for_cancel.close());
-    footer.append(&cancel);
-    content.append(&footer);
+    buttons.append(&cancel);
+    content.append(&buttons);
 
-    window.set_child(Some(&content));
-    refresh_location_results(&list, &window, &current_query);
-
+    refresh_location_results(&list, &results, &current_query);
     let list_for_search = list.clone();
-    let window_for_search = window.clone();
     search.connect_changed(move |entry| {
-        refresh_location_results(&list_for_search, &window_for_search, entry.text().as_str());
+        refresh_location_results(&list_for_search, &results, entry.text().as_str());
     });
 
     window.present();
     search.grab_focus();
 }
 
-fn refresh_location_results(list: &ListBox, window: &Window, query: &str) {
+fn refresh_location_results(list: &ListBox, results: &RefCell<Vec<CitySearchResult>>, query: &str) {
     while let Some(child) = list.first_child() {
         list.remove(&child);
     }
+    results.borrow_mut().clear();
 
     let query = query.trim();
-    if query.len() < 2 {
-        list.append(&meta_label("Type at least 2 characters."));
-        return;
-    }
-
-    let results = search_cities(query, 12);
-    if results.is_empty() {
-        list.append(&meta_label("No matching locations."));
-        return;
-    }
-
-    for result in results {
-        list.append(&location_result_button(window, result));
+    let message = if query.len() < 2 {
+        Some("Type at least 2 characters.")
+    } else {
+        let found = search_cities(query, 12);
+        if found.is_empty() {
+            Some("No matching locations.")
+        } else {
+            for result in &found {
+                list.append(&location_result_row(result));
+            }
+            *results.borrow_mut() = found;
+            None
+        }
+    };
+    if let Some(message) = message {
+        let row = ui::list_row(0);
+        row.append(&ui::hint(message));
+        list.append(&row);
+        if let Some(row) = list.row_at_index(0) {
+            row.set_activatable(false);
+        }
     }
 }
 
-fn location_result_button(window: &Window, result: CitySearchResult) -> Button {
-    let button = Button::new();
-    apply_button_role(&button, "secondary");
-    button.set_halign(Align::Fill);
-
-    let row = GtkBox::new(Orientation::Vertical, 2);
-    row.set_halign(Align::Fill);
-    row.set_hexpand(true);
-
-    let title = Label::new(Some(&format!(
-        "{}, {}",
-        result.display_name, result.country_code
-    )));
-    title.set_xalign(0.0);
-    title.set_hexpand(true);
-
-    let detail = Label::new(Some(&format!(
-        "{:.4}, {:.4} | population {}",
-        result.latitude_degrees, result.longitude_degrees, result.population
-    )));
-    detail.set_xalign(0.0);
-    apply_text_role(&detail, "meta");
-
-    row.append(&title);
-    row.append(&detail);
-    button.set_child(Some(&row));
-
-    let window = window.clone();
-    button.connect_clicked(move |_| {
-        apply_location_result(&result);
-        window.close();
-    });
-    button
+fn location_result_row(result: &CitySearchResult) -> GtkBox {
+    let row = ui::list_row(0);
+    let text = ui::vbox(2);
+    text.set_margin_top(4);
+    text.set_margin_bottom(4);
+    text.append(&ui::text(
+        &format!("{}, {}", result.display_name, result.country_code),
+        "body",
+    ));
+    let detail = ui::text(
+        &format!(
+            "{:.4}, {:.4} | population {}",
+            result.latitude_degrees, result.longitude_degrees, result.population
+        ),
+        "meta",
+    );
+    ui::set_fg_tone(&detail, ui::Tone::Muted);
+    text.append(&detail);
+    row.append(&text);
+    row
 }
 
 fn apply_location_result(result: &CitySearchResult) {
@@ -2272,79 +2275,18 @@ fn apply_location_result(result: &CitySearchResult) {
 
 fn append_array_fields(content: &GtkBox, project: &PvProjectDocument) {
     let arrays = &project.inputs.arrays;
-    let header = GtkBox::new(Orientation::Horizontal, 8);
-    header.set_hexpand(true);
-    let title = section_label("Production");
-    title.set_hexpand(true);
-    let add = icon_button("list-add-symbolic", "Add array");
+    let add = ui::icon_button("list-add-symbolic", "Add array");
     add.connect_clicked(|_| show_array_dialog(None));
-    header.append(&title);
-    header.append(&add);
-    content.append(&header);
 
-    let table = Grid::new();
-    table.set_column_spacing(12);
-    table.set_row_spacing(6);
-    table.set_hexpand(true);
-    table.set_column_homogeneous(false);
-    add_table_header(&table, 1, "kWp", 1.0);
-    add_table_header(&table, 2, "Tilt", 1.0);
-    add_table_header(&table, 3, "Azimuth", 1.0);
-
-    for (index, array) in arrays.iter().enumerate() {
-        let row = (index + 1) as i32;
-        add_table_cell(
-            &table,
-            0,
-            row,
-            array.name.as_deref().unwrap_or("Array"),
-            0.0,
-            true,
-        );
-        add_table_cell(
-            &table,
-            1,
-            row,
-            &format!("{:.2}", array.peak_power_kwp),
-            1.0,
-            false,
-        );
-        add_table_cell(
-            &table,
-            2,
-            row,
-            &format!("{:.1}", array.tilt_deg),
-            1.0,
-            false,
-        );
-        add_table_cell(
-            &table,
-            3,
-            row,
-            &format!(
-                "{:.1} {}",
-                array.azimuth_deg,
-                azimuth_direction_label(array.azimuth_deg)
-            ),
-            1.0,
-            false,
-        );
-
-        let actions = GtkBox::new(Orientation::Horizontal, 4);
-        actions.set_halign(Align::End);
-        actions.set_hexpand(true);
-        let edit = icon_button("document-edit-symbolic", "Edit array");
-        edit.connect_clicked(move |_| show_array_dialog(Some(index)));
-        let delete = icon_button("edit-delete-symbolic", "Delete array");
-        delete.connect_clicked(move |_| confirm_delete_array(index));
-        actions.append(&edit);
-        actions.append(&delete);
-        table.attach(&actions, 4, row, 1, 1);
-    }
-
-    content.append(&table);
+    let fields = form();
     if arrays.is_empty() {
-        content.append(&meta_label("No arrays configured."));
+        fields.append(&ui::hint("No arrays configured."));
+    } else {
+        let list = ui::list_card();
+        for (index, array) in arrays.iter().enumerate() {
+            ui::list_card_item(&list, &array_item(index, array));
+        }
+        fields.append(&list);
     }
 
     let storage = number_entry(
@@ -2363,27 +2305,58 @@ fn append_array_fields(content: &GtkBox, project: &PvProjectDocument) {
             });
         },
     );
-    content.append(&field_row("Storage kWh", &storage));
+    fields.append(&field_row("Storage kWh", &storage));
 
-    let Some(loss) = STATE.with(|state| {
-        state
-            .borrow()
-            .project
-            .as_ref()
-            .map(|project| project.inputs.estimate_request.loss_pct)
-    }) else {
-        append_log("Open or create a project first".to_string());
-        refresh_views();
-        return;
-    };
-    let loss = number_entry(loss, 1, |value| {
+    let loss = number_entry(project.inputs.estimate_request.loss_pct, 1, |value| {
         update_input_state(|state| {
             if let Some(project) = state.project.as_mut() {
                 project.inputs.estimate_request.loss_pct = value;
             }
         });
     });
-    content.append(&field_row("Loss %", &loss));
+    fields.append(&field_row("Loss %", &loss));
+
+    let spacer = ui::spacer();
+    content.append(&ui::section(
+        "Production",
+        &[spacer.upcast_ref(), add.upcast_ref()],
+        &fields,
+    ));
+}
+
+/// One production array: its name and electrical parameters, with actions.
+fn array_item(index: usize, array: &EstimateArray) -> GtkBox {
+    let item = ui::hbox(4);
+    let text = ui::vbox(2);
+    text.set_hexpand(true);
+    text.append(&ui::ellipsized(
+        array.name.as_deref().unwrap_or("Array"),
+        &[],
+    ));
+    let direction = azimuth_direction_label(array.azimuth_deg);
+    let parameters = ui::text(
+        &format!(
+            "{:.2} kWp · tilt {:.1}° · {:.1}° {direction}",
+            array.peak_power_kwp, array.tilt_deg, array.azimuth_deg,
+        ),
+        "meta",
+    );
+    parameters.set_tooltip_text(Some(&format!(
+        "{:.2} kWp, tilt {:.1}°, azimuth {:.1}° {direction}",
+        array.peak_power_kwp, array.tilt_deg, array.azimuth_deg,
+    )));
+    ui::set_fg_tone(&parameters, ui::Tone::Muted);
+    parameters.set_wrap(true);
+    text.append(&parameters);
+    item.append(&text);
+
+    let edit = ui::icon_button("document-edit-symbolic", "Edit array");
+    edit.connect_clicked(move |_| show_array_dialog(Some(index)));
+    let delete = ui::icon_button("edit-delete-symbolic", "Delete array");
+    delete.connect_clicked(move |_| confirm_delete_array(index));
+    item.append(&edit);
+    item.append(&delete);
+    item
 }
 
 fn show_array_dialog(index: Option<usize>) {
@@ -2404,22 +2377,14 @@ fn show_array_dialog(index: Option<usize>) {
         })
         .unwrap_or_else(default_array);
 
-    let window = Window::builder()
-        .title(if index.is_some() {
+    let (window, content) = dialog_window(
+        if index.is_some() {
             "Edit Array"
         } else {
             "Add Array"
-        })
-        .modal(true)
-        .default_width(420)
-        .build();
-    window.add_css_class("app-dialog");
-
-    let content = GtkBox::new(Orientation::Vertical, 12);
-    content.set_margin_top(14);
-    content.set_margin_bottom(8);
-    content.set_margin_start(14);
-    content.set_margin_end(14);
+        },
+        420,
+    );
 
     let name = field_entry();
     name.set_text(array.name.as_deref().unwrap_or(""));
@@ -2434,15 +2399,7 @@ fn show_array_dialog(index: Option<usize>) {
     let azimuth = dialog_number_entry(array.azimuth_deg, 1);
     content.append(&azimuth_field_row(&azimuth));
 
-    let footer = GtkBox::new(Orientation::Horizontal, 6);
-    footer.set_halign(Align::End);
-    footer.set_margin_bottom(0);
-    let cancel = Button::with_label("Cancel");
-    apply_button_role(&cancel, "secondary");
-    let window_for_cancel = window.clone();
-    cancel.connect_clicked(move |_| window_for_cancel.close());
-    let save = Button::with_label("Save");
-    apply_button_role(&save, "primary");
+    let save = ui::button("Save", ui::ButtonKind::Primary);
     let window_for_save = window.clone();
     let name_for_save = name.clone();
     let kwp_for_save = kwp.clone();
@@ -2459,11 +2416,8 @@ fn show_array_dialog(index: Option<usize>) {
             window_for_save.close();
         }
     });
-    footer.append(&cancel);
-    footer.append(&save);
-    content.append(&footer);
+    content.append(&dialog_buttons(&window, &save));
 
-    window.set_child(Some(&content));
     window.present();
     name.grab_focus();
 }
@@ -2594,42 +2548,28 @@ fn confirm_delete_array(index: usize) {
             .unwrap_or_else(|| "this array".to_string())
     });
 
-    let window = Window::builder()
-        .title("Delete Array")
-        .modal(true)
-        .default_width(360)
-        .build();
-    window.add_css_class("app-dialog");
+    let (window, content) = dialog_window("Delete Array", 360);
 
-    let content = GtkBox::new(Orientation::Vertical, 12);
-    content.set_margin_top(14);
-    content.set_margin_bottom(8);
-    content.set_margin_start(14);
-    content.set_margin_end(14);
+    let header = ui::hbox(10);
+    let icon = ui::severity_icon(ui::Severity::Warning);
+    icon.set_valign(Align::Center);
+    header.append(&icon);
+    let message = ui::text(
+        &format!("Delete {array_name}? This cannot be undone."),
+        "body",
+    );
+    message.set_wrap(true);
+    header.append(&message);
+    content.append(&header);
 
-    content.append(&body_label(&format!(
-        "Delete {array_name}? This cannot be undone."
-    )));
-
-    let footer = GtkBox::new(Orientation::Horizontal, 6);
-    footer.set_halign(Align::End);
-    footer.set_margin_bottom(0);
-    let cancel = Button::with_label("Cancel");
-    apply_button_role(&cancel, "secondary");
-    let window_for_cancel = window.clone();
-    cancel.connect_clicked(move |_| window_for_cancel.close());
-    let delete = Button::with_label("Delete");
-    apply_button_role(&delete, "danger");
+    let delete = ui::button("Delete", ui::ButtonKind::Danger);
     let window_for_delete = window.clone();
     delete.connect_clicked(move |_| {
         delete_array(index);
         window_for_delete.close();
     });
-    footer.append(&cancel);
-    footer.append(&delete);
-    content.append(&footer);
+    content.append(&dialog_buttons(&window, &delete));
 
-    window.set_child(Some(&content));
     window.present();
 }
 
@@ -2658,7 +2598,7 @@ fn sync_request_from_arrays(state: &mut DesktopState) {
 }
 
 fn append_consumption_fields(content: &GtkBox, inputs: &pv_desktop_core::ProjectInputs) {
-    content.append(&section_label("Consumption"));
+    let fields = form();
     let load_profile = &inputs.load_profile;
     let annual = match load_profile {
         LoadProfile::AnnualKwh { annual_kwh, .. } => *annual_kwh,
@@ -2675,9 +2615,9 @@ fn append_consumption_fields(content: &GtkBox, inputs: &pv_desktop_core::Project
             }
         });
     });
-    content.append(&field_row("Annual kWh", &annual_entry));
+    fields.append(&field_row("Annual kWh", &annual_entry));
     let price = optional_number_entry(inputs.energy_price_eur_per_kwh, 3, set_energy_price);
-    content.append(&field_row("EUR/kWh", &price));
+    fields.append(&field_row("EUR/kWh", &price));
     let shape = load_shape(load_profile);
     let dropdown = DropDown::from_strings(&["Residential", "Flat", "Daytime", "Evening"]);
     dropdown.set_selected(shape_index(&shape));
@@ -2698,44 +2638,54 @@ fn append_consumption_fields(content: &GtkBox, inputs: &pv_desktop_core::Project
             }
         });
     });
-    content.append(&field_row("Shape", &dropdown));
+    fields.append(&field_row("Shape", &dropdown));
+    content.append(&ui::section("Consumption", &[], &fields));
 }
 
 fn render_estimate_into(root: &GtkBox) {
     clear_box(root);
     let state = snapshot();
+    let Some(project) = &state.project else {
+        root.append(&no_project_state(
+            "Open a project to view production estimates.",
+        ));
+        return;
+    };
+    if project.results.estimate.is_none() {
+        root.append(&computation_state(&state, ComputationStage::Estimate));
+        return;
+    }
     let scroller = workbench_scroller();
     let content = workbench_content();
-    if let Some(project) = &state.project {
-        if project.results.estimate.is_some() {
-            append_estimate_result(&content, project);
-        } else {
-            append_estimate_empty_state(&content, &state);
-        }
-    } else {
-        append_no_project_state(
-            &content,
-            "No project open",
-            "Open a project to view production estimates.",
-        );
-    }
+    append_estimate_result(&content, project);
     scroller.set_child(Some(&content));
     root.append(&scroller);
 }
 
-fn append_estimate_empty_state(content: &GtkBox, state: &DesktopState) {
-    let summary = Grid::new();
-    summary.set_column_spacing(18);
-    summary.set_row_spacing(8);
-    summary.set_hexpand(true);
-    add_estimate_metric_row(&summary, 0, "Annual kWh", "-", EstimateTone::Strong);
-    content.append(&summary);
-    content.append(&body_label(computation_empty_message(
-        state,
-        ComputationStage::Estimate,
-    )));
-    append_retry_action(content, state, ComputationStage::Estimate);
-    append_manual_computation_action(content, state, ComputationStage::Estimate);
+/// The state of a computation that has no result yet, with the actions that
+/// produce it.
+fn computation_state(state: &DesktopState, stage: ComputationStage) -> GtkBox {
+    let empty = ui::empty_state(
+        "content-loading-symbolic",
+        computation_empty_message(state, stage),
+        "",
+        None,
+    );
+    empty.set_hexpand(true);
+    empty.set_vexpand(true);
+    let actions = ui::hbox(8);
+    actions.set_halign(Align::Center);
+    if let Some(retry) = retry_action(state, stage) {
+        actions.append(&retry);
+    }
+    if let Some(run) = manual_computation_action(state, stage) {
+        actions.append(&run);
+    }
+    if actions.first_child().is_some() {
+        actions.set_margin_top(4);
+        empty.append(&actions);
+    }
+    empty
 }
 
 fn append_estimate_result(content: &GtkBox, project: &PvProjectDocument) {
@@ -2743,63 +2693,76 @@ fn append_estimate_result(content: &GtkBox, project: &PvProjectDocument) {
         return;
     };
     let estimate = &document.ensemble_estimate;
-    let sources = document
-        .coverage
-        .applicable_sources
-        .iter()
-        .map(|source| source.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
 
-    let summary = Grid::new();
-    summary.set_column_spacing(18);
-    summary.set_row_spacing(8);
-    summary.set_hexpand(true);
-    add_estimate_metric_row(
-        &summary,
-        0,
-        "Annual kWh",
-        &annual_energy_value(document),
-        EstimateTone::Strong,
-    );
-    let mut row = 1;
+    let annual = annual_energy_parts(document, 1.0);
+    let mut tiles = vec![metric_tile("Annual kWh", &annual.0, &annual.1, true)];
     if let Some(price) = project.inputs.energy_price_eur_per_kwh {
-        add_estimate_metric_row(
-            &summary,
-            row,
-            "Revenue €",
-            &annual_revenue_value(document, price),
-            EstimateTone::Strong,
-        );
-        row += 1;
+        let revenue = annual_energy_parts(document, price);
+        tiles.push(metric_tile("Revenue €", &revenue.0, &revenue.1, true));
     }
-    add_estimate_metric_row(
-        &summary,
-        row,
-        "POA",
+    tiles.push(metric_tile(
+        "POA kWh/m2",
         &format!(
-            "{:.2} kWh/m2",
+            "{:.2}",
             estimate
                 .annual_in_plane_irradiation
                 .mean
                 .as_kilowatt_hours_per_square_meter()
         ),
-        EstimateTone::Normal,
-    );
-    row += 1;
-    add_estimate_metric_row(&summary, row, "Sources", &sources, EstimateTone::Normal);
-    content.append(&summary);
+        "",
+        false,
+    ));
+    let tile_refs = tiles
+        .iter()
+        .map(|tile| tile.upcast_ref())
+        .collect::<Vec<_>>();
+    content.append(&ui::wrap_box(&tile_refs, 12));
+
+    let sources = ui::hbox(6);
+    for source in &document.coverage.applicable_sources {
+        sources.append(&ui::badge(source.as_str(), ui::Tone::Muted));
+    }
+    let sources_label = ui::text("Sources", "body");
+    ui::set_fg_tone(&sources_label, ui::Tone::Muted);
+    let sources_row = ui::hbox(10);
+    sources_row.append(&sources_label);
+    sources_row.append(&sources);
+    content.append(&sources_row);
 
     let rows = monthly_estimate_rows(estimate);
-    content.append(&estimate_monthly_table(&rows));
+    content.append(&ui::section(
+        "Monthly production",
+        &[],
+        &ui::card(&estimate_monthly_table(&rows)),
+    ));
+}
+
+/// A dashboard tile: the value, its caption and an optional range below.
+fn metric_tile(caption: &str, value: &str, range: &str, emphasized: bool) -> GtkBox {
+    let tile = ui::vbox(2);
+    tile.add_css_class(ui::class::STAT_TILE);
+    let number = ui::text(value, "body");
+    number.add_css_class(ui::class::STAT_NUMBER);
+    if emphasized {
+        ui::set_fg_tone(&number, ui::Tone::Accent);
+    }
+    number.set_selectable(true);
+    tile.append(&number);
+    let caption = ui::text(caption, "body");
+    caption.add_css_class(ui::class::STAT_LABEL);
+    tile.append(&caption);
+    if !range.is_empty() {
+        let range = ui::text(range, "body");
+        range.add_css_class(ui::class::STAT_LABEL);
+        tile.append(&range);
+    }
+    tile
 }
 
 fn render_details_into(root: &GtkBox) {
     clear_box(root);
     let state = snapshot();
     let context = ACTIVE_CONTEXT.with(|slot| slot.borrow().clone());
-    let scroller = workbench_scroller();
-    let content = details_content();
 
     let initial_view_id = INITIAL_DETAILS_VIEW.with(|slot| *slot.borrow());
     let view_id = context
@@ -2807,47 +2770,51 @@ fn render_details_into(root: &GtkBox) {
         .and_then(|event| event.current.plugin_view_id.as_deref())
         .or(initial_view_id);
     let tab_id = context.as_ref().map(|event| event.current.tab_id.as_str());
+    let simulation = matches!(
+        (view_id, tab_id),
+        (Some(VIEW_SIMULATION), _) | (_, Some("simulation"))
+    );
 
-    match (view_id, tab_id) {
-        (Some(VIEW_SIMULATION), _) | (_, Some("simulation")) => {
-            append_simulation_details(&content, &state);
-        }
-        (Some(VIEW_ESTIMATE), _) | (_, Some("estimate")) => {
-            append_estimate_details(&content, &state);
-        }
-        _ => append_estimate_details(&content, &state),
+    root.append(&ui::tool_window_header(
+        if simulation { "Simulation" } else { "Estimate" },
+        0,
+    ));
+    let scroller = panel_scroller();
+    let content = panel_content();
+    if simulation {
+        append_simulation_details(&content, &state);
+    } else {
+        append_estimate_details(&content, &state);
     }
-
     scroller.set_child(Some(&content));
     root.append(&scroller);
 }
 
 fn append_estimate_details(content: &GtkBox, state: &DesktopState) {
-    content.append(&section_label("Estimate"));
     let Some(project) = &state.project else {
-        content.append(&body_label("No project open."));
-        append_project_actions(content);
+        append_no_project_details(content);
         return;
     };
 
     let Some(document) = &project.results.estimate else {
-        content.append(&body_label(computation_empty_message(
+        content.append(&ui::hint(computation_empty_message(
             state,
             ComputationStage::Estimate,
         )));
-        append_retry_action(content, state, ComputationStage::Estimate);
+        if let Some(retry) = retry_action(state, ComputationStage::Estimate) {
+            retry.set_halign(Align::Start);
+            content.append(&retry);
+        }
         return;
     };
 
-    content.append(&section_label("Result"));
-    append_detail_row(content, "Annual", &annual_energy_value(document));
+    let mut result = vec![("Annual", annual_energy_value(document))];
     if let Some(price) = project.inputs.energy_price_eur_per_kwh {
-        append_detail_row(content, "Revenue", &annual_revenue_value(document, price));
+        result.push(("Revenue", annual_revenue_value(document, price)));
     }
-    append_detail_row(
-        content,
+    result.push((
         "POA",
-        &format!(
+        format!(
             "{:.2} kWh/m2",
             document
                 .ensemble_estimate
@@ -2855,122 +2822,145 @@ fn append_estimate_details(content: &GtkBox, state: &DesktopState) {
                 .mean
                 .as_kilowatt_hours_per_square_meter()
         ),
-    );
+    ));
+    content.append(&ui::section("Result", &[], &ui::key_value_grid(&result)));
 
-    content.append(&section_separator());
-    content.append(&section_label("Quality"));
-    append_detail_row(content, "Sources", &estimate_sources_label(document));
-    append_detail_row(content, "Band", &estimate_uncertainty_label(document));
-    append_detail_row(content, "Spread", &estimate_source_spread_label(document));
-    append_detail_row(content, "Coverage", estimate_coverage_label(document));
+    content.append(&ui::section(
+        "Quality",
+        &[],
+        &ui::key_value_grid(&[
+            ("Sources", estimate_sources_label(document)),
+            ("Band", estimate_uncertainty_label(document)),
+            ("Spread", estimate_source_spread_label(document)),
+            ("Coverage", estimate_coverage_label(document).to_string()),
+        ]),
+    ));
 
-    content.append(&section_separator());
-    content.append(&section_label("Highlights"));
+    let mut highlights = Vec::new();
     if let Some(best) = estimate_month_highlight(&document.ensemble_estimate, MonthRank::Best) {
-        append_detail_row(content, "Best month", &best);
+        highlights.push(("Best month", best));
     }
     if let Some(worst) = estimate_month_highlight(&document.ensemble_estimate, MonthRank::Worst) {
-        append_detail_row(content, "Lowest month", &worst);
+        highlights.push(("Lowest month", worst));
     }
-    append_detail_note(
-        content,
-        &estimate_seasonality_label(&document.ensemble_estimate),
-    );
+    let highlights_content = ui::vbox(8);
+    highlights_content.append(&ui::key_value_grid(&highlights));
+    highlights_content.append(&ui::hint(&estimate_seasonality_label(
+        &document.ensemble_estimate,
+    )));
+    content.append(&ui::section("Highlights", &[], &highlights_content));
 
-    content.append(&section_separator());
-    content.append(&section_label("Diagnostics"));
-    for note in estimate_diagnostics(project, document) {
-        append_detail_note(content, &note);
+    content.append(&ui::section(
+        "Diagnostics",
+        &[],
+        &notes(&estimate_diagnostics(project, document)),
+    ));
+}
+
+fn append_no_project_details(content: &GtkBox) {
+    content.append(&ui::hint("No project open."));
+    content.append(&project_actions());
+}
+
+/// Muted, wrapping notes, one per line.
+fn notes(notes: &[String]) -> GtkBox {
+    let block = ui::vbox(6);
+    for note in notes {
+        block.append(&ui::hint(note));
     }
+    block
 }
 
 fn append_simulation_details(content: &GtkBox, state: &DesktopState) {
     let Some(project) = &state.project else {
-        content.append(&body_label("No project open."));
-        append_project_actions(content);
+        append_no_project_details(content);
         return;
     };
 
     if let Some(run) = simulation_run_snapshot() {
-        append_detail_row(
-            content,
-            "Status",
-            if run.cancelling {
-                "cancelling"
-            } else {
-                "running"
-            },
-        );
-        append_detail_row(
-            content,
-            "Runs",
-            &format!(
-                "{} / {}",
-                format_runs(run.completed_runs),
-                format_runs(run.requested_runs)
+        let status = if run.cancelling {
+            "cancelling"
+        } else {
+            "running"
+        };
+        let run_content = ui::vbox(12);
+        run_content.append(&ui::key_value_grid(&[
+            ("Status", status.to_string()),
+            (
+                "Runs",
+                format!(
+                    "{} / {}",
+                    format_runs(run.completed_runs),
+                    format_runs(run.requested_runs)
+                ),
             ),
+            ("Started", format_system_time(run.started_wall_time)),
+            ("Elapsed", format_duration(run.started_at.elapsed())),
+        ]));
+        let cancel = ui::button(
+            simulation_cancel_label(run.cancelling),
+            ui::ButtonKind::Secondary,
         );
-        append_detail_row(
-            content,
-            "Started",
-            &format_system_time(run.started_wall_time),
-        );
-        append_detail_row(
-            content,
-            "Elapsed",
-            &format_duration(run.started_at.elapsed()),
-        );
-        let cancel = Button::with_label(simulation_cancel_label(run.cancelling));
-        apply_button_role(&cancel, "secondary");
+        cancel.set_halign(Align::Start);
         cancel.set_sensitive(!run.cancelling);
         cancel.connect_clicked(|_| cancel_simulation_run());
-        content.append(&cancel);
+        run_content.append(&cancel);
+        content.append(&ui::section("Run", &[], &run_content));
         return;
     }
 
     let Some(result) = &project.results.simulation else {
-        content.append(&body_label(computation_empty_message(
+        content.append(&ui::hint(computation_empty_message(
             state,
             ComputationStage::Simulation,
         )));
-        content.append(&section_separator());
-        content.append(&section_label("Diagnostics"));
-        for note in missing_simulation_diagnostics(project) {
-            append_detail_note(content, &note);
+        content.append(&ui::section(
+            "Diagnostics",
+            &[],
+            &notes(&missing_simulation_diagnostics(project)),
+        ));
+        if let Some(retry) = retry_action(state, ComputationStage::Simulation) {
+            retry.set_halign(Align::Start);
+            content.append(&retry);
         }
-        append_retry_action(content, state, ComputationStage::Simulation);
         return;
     };
 
-    append_detail_row(
-        content,
-        "Status",
-        if result.cancelled {
-            "cancelled"
-        } else {
-            "complete"
-        },
-    );
-    append_detail_row(
-        content,
-        "Runs",
-        &format!(
-            "{} / {}",
-            format_runs(result.completed_runs),
-            format_runs(result.requested_runs)
+    let mut run = vec![
+        (
+            "Status",
+            if result.cancelled {
+                "cancelled"
+            } else {
+                "complete"
+            }
+            .to_string(),
         ),
-    );
+        (
+            "Runs",
+            format!(
+                "{} / {}",
+                format_runs(result.completed_runs),
+                format_runs(result.requested_runs)
+            ),
+        ),
+    ];
+    let run_content = ui::vbox(8);
     if let Some(metadata) = &project.results.simulation_metadata {
-        append_detail_row(content, "Started", &metadata.started_at);
-        append_detail_row(content, "Completed", &metadata.completed_at);
-        append_detail_row(
-            content,
+        run.push(("Started", metadata.started_at.clone()));
+        run.push(("Completed", metadata.completed_at.clone()));
+        run.push((
             "Elapsed",
-            &format_duration(Duration::from_millis(metadata.elapsed_ms)),
-        );
+            format_duration(Duration::from_millis(metadata.elapsed_ms)),
+        ));
+        run_content.append(&ui::key_value_grid(&run));
     } else {
-        append_detail_note(content, "Timing metadata is not available for this result.");
+        run_content.append(&ui::key_value_grid(&run));
+        run_content.append(&ui::hint(
+            "Timing metadata is not available for this result.",
+        ));
     }
+    content.append(&ui::section("Run", &[], &run_content));
 }
 
 #[derive(Clone, Copy)]
@@ -3189,120 +3179,101 @@ fn computation_empty_message(state: &DesktopState, stage: ComputationStage) -> &
     }
 }
 
-fn append_retry_action(content: &GtkBox, state: &DesktopState, stage: ComputationStage) {
-    let Some(retry_stage) = state.retry_stage else {
-        return;
-    };
+fn retry_action(state: &DesktopState, stage: ComputationStage) -> Option<Button> {
+    let retry_stage = state.retry_stage?;
     if retry_stage != stage && stage != ComputationStage::Simulation {
-        return;
+        return None;
     }
-    let retry = Button::with_label("Retry");
-    apply_button_role(&retry, "primary");
+    let retry = ui::button("Retry", ui::ButtonKind::Primary);
     retry.connect_clicked(move |_| retry_automatic_computation(retry_stage));
-    content.append(&retry);
+    Some(retry)
 }
 
-fn append_manual_computation_action(
-    content: &GtkBox,
-    state: &DesktopState,
-    stage: ComputationStage,
-) {
+fn manual_computation_action(state: &DesktopState, stage: ComputationStage) -> Option<Button> {
     if automatic_simulation_updates_enabled() || state.retry_stage.is_some() {
-        return;
+        return None;
     }
     let (label, impact) = match stage {
         ComputationStage::Estimate => ("Update estimate", ComputationImpact::EstimateAndSimulation),
         ComputationStage::Simulation => ("Run simulation", ComputationImpact::Simulation),
     };
-    let run = Button::with_label(label);
-    apply_button_role(&run, "primary");
-    mark_clickable(&run);
+    let run = ui::button(label, ui::ButtonKind::Primary);
     run.connect_clicked(move |_| {
         schedule_automatic_computation(impact, ComputationTrigger::Immediate)
     });
-    content.append(&run);
+    Some(run)
 }
 
-fn append_project_actions(content: &GtkBox) {
-    let actions = GtkBox::new(Orientation::Horizontal, 6);
+fn project_actions() -> GtkBox {
+    let actions = ui::hbox(8);
     actions.set_halign(Align::Start);
-    let new_project = Button::with_label("New Project");
-    apply_button_role(&new_project, "primary");
+    let new_project = ui::button("New Project", ui::ButtonKind::Primary);
     new_project.connect_clicked(|_| create_new_project());
     actions.append(&new_project);
-    let open_project = Button::with_label("Open Project");
-    apply_button_role(&open_project, "secondary");
+    let open_project = ui::button("Open Project", ui::ButtonKind::Secondary);
     open_project.connect_clicked(|_| show_open_project_dialog());
     actions.append(&open_project);
-    content.append(&actions);
-}
-
-fn append_detail_row(content: &GtkBox, label: &str, value: &str) {
-    let value = Label::new(Some(value));
-    value.set_xalign(0.0);
-    value.set_wrap(true);
-    apply_text_role(&value, "code");
-    content.append(&field_row(label, &value));
-}
-
-fn append_detail_note(content: &GtkBox, text: &str) {
-    content.append(&meta_label(text));
+    actions
 }
 
 fn render_simulation_into(root: &GtkBox) {
     clear_box(root);
     let state = snapshot();
-    let scroller = workbench_scroller();
-    let content = workbench_content();
     let Some(project) = &state.project else {
-        append_no_project_state(
-            &content,
-            "No project open",
+        root.append(&no_project_state(
             "Open a project to run consumption simulations.",
-        );
-        scroller.set_child(Some(&content));
-        root.append(&scroller);
+        ));
         return;
     };
-    if let Some(run) = simulation_run_snapshot() {
-        append_simulation_progress(&content, run);
-    } else if let Some(result) = &project.results.simulation {
-        append_simulation_result(&content, project, result);
-    } else {
-        append_simulation_empty_state(&content, &state);
-    }
+    let run = simulation_run_snapshot();
+    let Some(result) = project
+        .results
+        .simulation
+        .as_ref()
+        .filter(|_| run.is_none())
+    else {
+        if let Some(run) = run {
+            let content = workbench_content();
+            append_simulation_progress(&content, run);
+            root.append(&content);
+        } else {
+            root.append(&computation_state(&state, ComputationStage::Simulation));
+        }
+        return;
+    };
+    let scroller = workbench_scroller();
+    let content = workbench_content();
+    append_simulation_result(&content, project, result);
     scroller.set_child(Some(&content));
     root.append(&scroller);
 }
 
 fn append_simulation_progress(content: &GtkBox, run: SimulationRunSnapshot) {
-    let heading = section_label(simulation_progress_heading(run.cancelling));
+    let heading = ui::heading(simulation_progress_heading(run.cancelling));
     content.append(&heading);
 
-    let row = GtkBox::new(Orientation::Horizontal, 12);
-    row.set_hexpand(true);
-
-    let progress_column = GtkBox::new(Orientation::Vertical, 6);
+    let row = ui::hbox(12);
+    let progress_column = ui::vbox(6);
     progress_column.set_hexpand(true);
-    progress_column.set_halign(Align::Fill);
 
-    let count = meta_label(&simulation_progress_label(run));
+    let count = ui::text(&simulation_progress_label(run), "body");
+    ui::set_fg_tone(&count, ui::Tone::Muted);
     progress_column.append(&count);
 
     let progress = ProgressBar::new();
     progress.set_hexpand(true);
-    progress.set_halign(Align::Fill);
     progress.set_show_text(false);
     progress.set_fraction(simulation_progress_fraction(run));
     progress_column.append(&progress);
     row.append(&progress_column);
 
     let (cancel, cancel_label) = simulation_cancel_button(run.cancelling);
+    cancel.set_valign(Align::End);
     cancel.connect_clicked(|_| cancel_simulation_run());
     row.append(&cancel);
 
     content.append(&row);
-    let status = meta_label(&simulation_progress_status(
+    let status = ui::hint(&simulation_progress_status(
         run.completed_runs,
         run.requested_runs,
         run.cancelling,
@@ -3415,20 +3386,15 @@ fn simulation_progress_label(run: SimulationRunSnapshot) -> String {
 }
 
 fn simulation_cancel_button(cancelling: bool) -> (Button, Label) {
-    let button = Button::new();
-    apply_button_role(&button, "secondary");
+    let button = ui::button(
+        simulation_cancel_label(cancelling),
+        ui::ButtonKind::Secondary,
+    );
     button.set_tooltip_text(Some("Cancel simulation"));
-    button.set_valign(Align::End);
     button.set_sensitive(!cancelling);
 
-    let content = GtkBox::new(Orientation::Horizontal, 8);
-    content.set_margin_top(7);
-    content.set_margin_bottom(7);
-    content.set_margin_start(12);
-    content.set_margin_end(14);
-    let icon = Image::from_icon_name("process-stop-symbolic");
-    icon.set_icon_size(gtk::IconSize::Normal);
-    content.append(&icon);
+    let content = ui::hbox(6);
+    content.append(&Image::from_icon_name("process-stop-symbolic"));
     let label = Label::new(Some(simulation_cancel_label(cancelling)));
     content.append(&label);
     button.set_child(Some(&content));
@@ -3444,9 +3410,16 @@ fn append_simulation_result(
     project: &PvProjectDocument,
     result: &SimulationResult,
 ) {
-    content.append(&simulation_summary_table(result));
-    content.append(&section_separator());
-    content.append(&simulation_scenario_table(result));
+    content.append(&ui::section(
+        "Summary",
+        &[],
+        &ui::card(&simulation_summary_table(result)),
+    ));
+    content.append(&ui::section(
+        "Scenarios",
+        &[],
+        &ui::card(&simulation_scenario_table(result)),
+    ));
     append_simulation_graphs(content, project);
 }
 
@@ -3454,10 +3427,13 @@ fn append_simulation_graphs(content: &GtkBox, project: &PvProjectDocument) {
     let Some((production, load)) = simulation_graph_series(project) else {
         return;
     };
-    content.append(&section_separator());
-    content.append(&chart_legend());
-    content.append(&monthly_simulation_chart(&production, &load));
-    content.append(&section_separator());
+    let spacer = ui::spacer();
+    let legend = chart_legend();
+    content.append(&ui::section(
+        "Monthly energy",
+        &[spacer.upcast_ref(), legend.upcast_ref()],
+        &monthly_simulation_chart(&production, &load),
+    ));
     append_daily_projection_graph(content, &production, &load);
 }
 
@@ -3479,26 +3455,30 @@ fn simulation_graph_series(project: &PvProjectDocument) -> Option<(Vec<f64>, Vec
 }
 
 fn chart_legend() -> GtkBox {
-    let legend = GtkBox::new(Orientation::Horizontal, 16);
+    let legend = ui::hbox(16);
     legend.append(&legend_item("Production", ChartColorRole::Production));
     legend.append(&legend_item("Load", ChartColorRole::Load));
     legend
 }
 
 fn legend_item(text: &str, role: ChartColorRole) -> GtkBox {
-    let item = GtkBox::new(Orientation::Horizontal, 6);
+    let item = ui::hbox(6);
     let swatch = DrawingArea::new();
     swatch.set_content_width(18);
     swatch.set_content_height(10);
+    swatch.set_valign(Align::Center);
     swatch.set_draw_func(move |swatch, context, width, height| {
-        let colors = ChartColors::from_widget(swatch);
+        let colors = ChartColors::current(swatch);
         set_source_rgba(context, colors.series(role));
         let y = (f64::from(height) / 2.0 - 1.5).max(0.0);
         context.rectangle(0.0, y, f64::from(width), 3.0);
         let _ = context.fill();
     });
+    remember_chart(&swatch);
     item.append(&swatch);
-    item.append(&Label::new(Some(text)));
+    let label = ui::text(text, "meta");
+    ui::set_fg_tone(&label, ui::Tone::Muted);
+    item.append(&label);
     item
 }
 
@@ -3509,7 +3489,7 @@ fn monthly_simulation_chart(production: &[f64], load: &[f64]) -> DrawingArea {
     chart.set_content_height(260);
     chart.set_hexpand(true);
     chart.set_draw_func(move |chart, context, width, height| {
-        let colors = ChartColors::from_widget(chart);
+        let colors = ChartColors::current(chart);
         draw_monthly_chart(
             context,
             width,
@@ -3519,26 +3499,31 @@ fn monthly_simulation_chart(production: &[f64], load: &[f64]) -> DrawingArea {
             &load_months,
         );
     });
+    remember_chart(&chart);
     chart
 }
 
 fn append_daily_projection_graph(content: &GtkBox, production: &[f64], load: &[f64]) {
     let date = selected_daily_projection_date();
-    content.append(&daily_projection_controls(date));
+    let (month, day) = daily_projection_controls(date);
     let production_day = daily_slice(production, date);
     let load_day = daily_slice(load, date);
-    content.append(&daily_projection_chart(production_day, load_day));
+    let spacer = ui::spacer();
+    content.append(&ui::section(
+        "Daily profile",
+        &[spacer.upcast_ref(), month.upcast_ref(), day.upcast_ref()],
+        &daily_projection_chart(production_day, load_day),
+    ));
 }
 
-fn daily_projection_controls(date: DailyProjectionDate) -> GtkBox {
-    let row = GtkBox::new(Orientation::Horizontal, 10);
-    row.set_hexpand(true);
-
+/// The month and day dropdowns picking the projected day.
+fn daily_projection_controls(date: DailyProjectionDate) -> (DropDown, DropDown) {
     let month_names = (1..=12)
         .map(|month| short_month_name(month).unwrap_or("?").to_string())
         .collect::<Vec<_>>();
     let month_refs = month_names.iter().map(String::as_str).collect::<Vec<_>>();
     let month = DropDown::from_strings(&month_refs);
+    ui::style_dropdown(&month);
     month.set_tooltip_text(Some("Projection month"));
     month.set_selected(u32::from(date.month.saturating_sub(1)));
     month.connect_selected_notify(|dropdown| {
@@ -3550,12 +3535,12 @@ fn daily_projection_controls(date: DailyProjectionDate) -> GtkBox {
         });
         refresh_workbench_views();
     });
-    row.append(&field_row("Month", &month));
 
     let days = calendar_days_in_month(date.month);
     let day_labels = (1..=days).map(|day| day.to_string()).collect::<Vec<_>>();
     let day_refs = day_labels.iter().map(String::as_str).collect::<Vec<_>>();
     let day = DropDown::from_strings(&day_refs);
+    ui::style_dropdown(&day);
     day.set_tooltip_text(Some("Projection day"));
     day.set_selected(u32::from(
         date.day.saturating_sub(1).min(days.saturating_sub(1)),
@@ -3565,8 +3550,7 @@ fn daily_projection_controls(date: DailyProjectionDate) -> GtkBox {
         SIMULATION_GRAPH_DATE.with(|selection| selection.borrow_mut().day = day);
         refresh_workbench_views();
     });
-    row.append(&field_row("Day", &day));
-    row
+    (month, day)
 }
 
 fn daily_projection_chart(production: Vec<f64>, load: Vec<f64>) -> DrawingArea {
@@ -3574,9 +3558,10 @@ fn daily_projection_chart(production: Vec<f64>, load: Vec<f64>) -> DrawingArea {
     chart.set_content_height(260);
     chart.set_hexpand(true);
     chart.set_draw_func(move |chart, context, width, height| {
-        let colors = ChartColors::from_widget(chart);
+        let colors = ChartColors::current(chart);
         draw_daily_chart(context, width, height, &colors, &production, &load);
     });
+    remember_chart(&chart);
     chart
 }
 
@@ -3637,7 +3622,6 @@ enum ChartColorRole {
 }
 
 struct ChartColors {
-    background: gtk::gdk::RGBA,
     grid: gtk::gdk::RGBA,
     text: gtk::gdk::RGBA,
     production: gtk::gdk::RGBA,
@@ -3645,13 +3629,25 @@ struct ChartColors {
 }
 
 impl ChartColors {
-    fn from_widget<W: IsA<gtk::Widget>>(widget: &W) -> Self {
+    /// The colors of the active Maruzzella palette: production in the
+    /// accent color, grid lines in the border color and labels in the muted
+    /// text color. Load takes the chart's own text color, the warning tone
+    /// that [`remember_chart`] gives it, which the theme also derives from
+    /// the palette.
+    fn current<W: IsA<gtk::Widget>>(widget: &W) -> Self {
+        let load = widget.color();
+        let palette = THEME_PALETTE.with(|palette| palette.borrow().clone());
+        let color = |value: Option<&String>| {
+            value
+                .and_then(|value| gtk::gdk::RGBA::parse(value.as_str()).ok())
+                .unwrap_or(load)
+        };
+        let palette = palette.as_ref();
         Self {
-            background: theme_color(widget, "workbench", gtk::gdk::RGBA::new(0.0, 0.0, 0.0, 1.0)),
-            grid: theme_color(widget, "border", gtk::gdk::RGBA::new(0.35, 0.35, 0.35, 1.0)),
-            text: theme_color(widget, "text_1", gtk::gdk::RGBA::new(0.8, 0.8, 0.8, 1.0)),
-            production: theme_color(widget, "accent", gtk::gdk::RGBA::new(0.2, 0.45, 0.9, 1.0)),
-            load: theme_color(widget, "warning", gtk::gdk::RGBA::new(0.95, 0.7, 0.25, 1.0)),
+            grid: color(palette.map(|palette| &palette.border)),
+            text: color(palette.map(|palette| &palette.text_2)),
+            production: color(palette.map(|palette| &palette.accent)),
+            load,
         }
     }
 
@@ -3812,10 +3808,6 @@ fn draw_chart_background(
     let chart_width = (width - left - right).max(1.0);
     let chart_height = (height - top - bottom).max(1.0);
 
-    set_source_rgba(context, &colors.background);
-    context.rectangle(0.0, 0.0, width, height);
-    let _ = context.fill();
-
     context.set_line_width(1.0);
     set_source_rgba(context, &colors.grid);
     for tick in 0..=4 {
@@ -3826,7 +3818,7 @@ fn draw_chart_background(
         let value = max_value * (1.0 - tick as f64 / 4.0);
         draw_axis_label(context, 6.0, y + 4.0, colors, &format!("{value:.0}"));
     }
-    draw_axis_label(context, 6.0, top - 4.0, colors, unit);
+    draw_axis_label(context, 6.0, top - 8.0, colors, unit);
 }
 
 fn draw_bar(
@@ -3873,27 +3865,6 @@ fn set_source_rgba(context: &gtk::cairo::Context, color: &gtk::gdk::RGBA) {
         f64::from(color.blue()),
         f64::from(color.alpha()),
     );
-}
-
-fn theme_color<W: IsA<gtk::Widget>>(
-    widget: &W,
-    name: &str,
-    fallback: gtk::gdk::RGBA,
-) -> gtk::gdk::RGBA {
-    widget
-        .style_context()
-        .lookup_color(name)
-        .unwrap_or(fallback)
-}
-
-fn rgba_to_hex(color: &gtk::gdk::RGBA) -> String {
-    let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
-    format!(
-        "#{:02x}{:02x}{:02x}",
-        channel(color.red()),
-        channel(color.green()),
-        channel(color.blue())
-    )
 }
 
 fn simulation_summary_table(result: &SimulationResult) -> Grid {
@@ -4140,17 +4111,6 @@ fn format_percent_value(value: f64) -> String {
     format!("{:.0}%", value * 100.0)
 }
 
-fn append_simulation_empty_state(content: &GtkBox, state: &DesktopState) {
-    let label = body_label(computation_empty_message(
-        state,
-        ComputationStage::Simulation,
-    ));
-    apply_text_role(&label, "section-label");
-    content.append(&label);
-    append_retry_action(content, state, ComputationStage::Simulation);
-    append_manual_computation_action(content, state, ComputationStage::Simulation);
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RefreshScope {
     All,
@@ -4298,16 +4258,6 @@ fn snapshot() -> DesktopState {
     STATE.with(|state| state.borrow().clone())
 }
 
-fn icon_button(icon_name: &str, tooltip: &str) -> Button {
-    let button = Button::new();
-    apply_button_role(&button, "icon");
-    button.set_tooltip_text(Some(tooltip));
-    let icon = Image::from_icon_name(icon_name);
-    icon.set_icon_size(gtk::IconSize::Normal);
-    button.set_child(Some(&icon));
-    button
-}
-
 fn number_entry(value: f64, digits: u32, update: impl Fn(f64) + 'static) -> Entry {
     let entry = field_entry();
     entry.set_input_purpose(gtk::InputPurpose::Number);
@@ -4372,17 +4322,17 @@ fn format_runs(runs: usize) -> String {
 }
 
 fn azimuth_field_row(azimuth: &Entry) -> GtkBox {
-    let value_row = GtkBox::new(Orientation::Horizontal, 8);
+    let value_row = ui::hbox(8);
     value_row.set_hexpand(true);
     azimuth.set_hexpand(true);
     azimuth.set_halign(Align::Fill);
 
-    let direction = Label::new(Some(&azimuth_direction_label(
-        parse_number(&azimuth.text()).unwrap_or(0.0),
-    )));
+    let direction = ui::text(
+        &azimuth_direction_label(parse_number(&azimuth.text()).unwrap_or(0.0)),
+        "body",
+    );
     direction.set_width_chars(3);
-    direction.set_xalign(0.0);
-    apply_text_role(&direction, "meta");
+    ui::set_fg_tone(&direction, ui::Tone::Muted);
 
     let direction_for_change = direction.clone();
     azimuth.connect_changed(move |entry| {
@@ -4406,38 +4356,38 @@ fn azimuth_direction_label(value: f64) -> String {
 }
 
 fn annual_energy_value(document: &pv_core::source_model::SourceEnsembleEstimateDocument) -> String {
+    let (mean, band) = annual_energy_parts(document, 1.0);
+    format!("{mean} {band}")
+}
+
+/// The annual energy scaled by `factor` (1 for kWh, a price for revenue),
+/// rounded, and its "low..high" uncertainty band.
+fn annual_energy_parts(
+    document: &pv_core::source_model::SourceEnsembleEstimateDocument,
+    factor: f64,
+) -> (String, String) {
     let estimate = &document.ensemble_estimate;
-    let mean = estimate.annual_energy.mean.as_kilowatt_hours().round();
-    estimate
+    let mean = (estimate.annual_energy.mean.as_kilowatt_hours() * factor).round();
+    let band = estimate
         .uncertainty
         .annual_energy
         .map(|band| {
             format!(
-                "{mean:.0} low..high {:.0}..{:.0}",
-                band.low.as_kilowatt_hours().round(),
-                band.high.as_kilowatt_hours().round()
+                "low..high {:.0}..{:.0}",
+                (band.low.as_kilowatt_hours() * factor).round(),
+                (band.high.as_kilowatt_hours() * factor).round()
             )
         })
-        .unwrap_or_else(|| format!("{mean:.0} low..high -..-"))
+        .unwrap_or_else(|| "low..high -..-".to_string());
+    (format!("{mean:.0}"), band)
 }
 
 fn annual_revenue_value(
     document: &pv_core::source_model::SourceEnsembleEstimateDocument,
     price: f64,
 ) -> String {
-    let estimate = &document.ensemble_estimate;
-    let mean = (estimate.annual_energy.mean.as_kilowatt_hours() * price).round();
-    estimate
-        .uncertainty
-        .annual_energy
-        .map(|band| {
-            format!(
-                "{mean:.0} low..high {:.0}..{:.0}",
-                (band.low.as_kilowatt_hours() * price).round(),
-                (band.high.as_kilowatt_hours() * price).round()
-            )
-        })
-        .unwrap_or_else(|| format!("{mean:.0} low..high -..-"))
+    let (mean, band) = annual_energy_parts(document, price);
+    format!("{mean} {band}")
 }
 
 fn monthly_estimate_rows(
@@ -4564,38 +4514,21 @@ enum EstimateTone {
     Minimum,
 }
 
-fn add_estimate_metric_row(grid: &Grid, row: i32, label: &str, value: &str, tone: EstimateTone) {
-    grid.attach(
-        &estimate_text_label(label, 0.0, EstimateTone::Muted, false),
-        0,
-        row,
-        1,
-        1,
-    );
-    let value = estimate_text_label(value, 0.0, tone, true);
-    value.set_hexpand(true);
-    value.set_wrap(true);
-    grid.attach(&value, 1, row, 1, 1);
-}
-
 fn add_estimate_table_group_header(grid: &Grid, column: i32, width: i32, text: &str) {
-    grid.attach(
-        &estimate_text_label(text, 0.5, EstimateTone::Muted, true),
-        column,
-        0,
-        width,
-        1,
-    );
+    grid.attach(&table_header_label(text, 0.5), column, 0, width, 1);
 }
 
 fn add_estimate_table_header(grid: &Grid, column: i32, row: i32, text: &str, xalign: f32) {
-    grid.attach(
-        &estimate_text_label(text, xalign, EstimateTone::Muted, true),
-        column,
-        row,
-        1,
-        1,
-    );
+    grid.attach(&table_header_label(text, xalign), column, row, 1, 1);
+}
+
+/// A muted column caption, like the header row of a dense list.
+fn table_header_label(text: &str, xalign: f32) -> Label {
+    let label = ui::text(text, "meta");
+    label.set_xalign(xalign);
+    label.set_hexpand(true);
+    ui::set_fg_tone(&label, ui::Tone::Muted);
+    label
 }
 
 fn add_estimate_table_cell(
@@ -4616,65 +4549,32 @@ fn add_estimate_table_cell(
 }
 
 fn estimate_text_label(text: &str, xalign: f32, tone: EstimateTone, monospace: bool) -> Label {
-    let label = Label::new(None);
+    let label = ui::text(text, if monospace { "code" } else { "body" });
     label.set_xalign(xalign);
     label.set_hexpand(true);
     label.set_halign(Align::Fill);
-    if monospace {
-        apply_text_role(&label, "code");
+    let (fg_tone, strong) = match tone {
+        EstimateTone::Normal => (ui::Tone::Neutral, false),
+        EstimateTone::Muted => (ui::Tone::Muted, false),
+        EstimateTone::Strong | EstimateTone::Mean => (ui::Tone::Accent, true),
+        EstimateTone::Minimum => (ui::Tone::Danger, true),
+    };
+    ui::set_fg_tone(&label, fg_tone);
+    if strong {
+        label.add_css_class(ui::class::STRONG);
     }
-    label.set_markup(&estimate_markup(&label, text, tone));
     label
 }
 
-fn estimate_markup(label: &Label, text: &str, tone: EstimateTone) -> String {
-    let text = escape_markup(text);
-    match tone {
-        EstimateTone::Normal => format!(r##"<span size="large">{text}</span>"##),
-        EstimateTone::Muted => {
-            let color = theme_color_hex(label, "text_2", gtk::gdk::RGBA::new(0.55, 0.55, 0.6, 1.0));
-            format!(r##"<span size="large" foreground="{color}">{text}</span>"##)
-        }
-        EstimateTone::Strong | EstimateTone::Mean => {
-            let color = theme_color_hex(
-                label,
-                "accent_strong",
-                gtk::gdk::RGBA::new(0.7, 0.78, 1.0, 1.0),
-            );
-            format!(r##"<span size="large" foreground="{color}" weight="bold">{text}</span>"##)
-        }
-        EstimateTone::Minimum => {
-            let color = theme_color_hex(label, "danger", gtk::gdk::RGBA::new(1.0, 0.7, 0.67, 1.0));
-            format!(r##"<span size="large" foreground="{color}" weight="bold">{text}</span>"##)
-        }
-    }
-}
-
-fn theme_color_hex<W: IsA<gtk::Widget>>(
-    widget: &W,
-    name: &str,
-    fallback: gtk::gdk::RGBA,
-) -> String {
-    rgba_to_hex(&theme_color(widget, name, fallback))
-}
-fn escape_markup(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
+/// A form row: the field name, then the control filling the rest.
 fn field_row<W: IsA<gtk::Widget>>(label: &str, widget: &W) -> GtkBox {
-    let row = GtkBox::new(Orientation::Horizontal, 12);
+    let row = ui::hbox(12);
     row.set_hexpand(true);
 
-    let label = Label::new(Some(label));
-    label.set_xalign(0.0);
-    label.set_valign(Align::Center);
-    label.set_width_chars(15);
-    label.set_max_width_chars(15);
-    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    apply_text_role(&label, "meta");
+    let label = ui::ellipsized(label, &[]);
+    label.set_width_chars(11);
+    label.set_max_width_chars(11);
+    ui::set_fg_tone(&label, ui::Tone::Muted);
 
     widget.set_hexpand(true);
     widget.set_halign(Align::Fill);
@@ -4684,35 +4584,9 @@ fn field_row<W: IsA<gtk::Widget>>(label: &str, widget: &W) -> GtkBox {
     row
 }
 
-fn header_label(text: &str) -> Label {
-    let label = Label::new(Some(text));
-    label.set_xalign(0.0);
-    apply_text_role(&label, "title");
-    label
-}
-
-fn section_label(text: &str) -> Label {
-    let label = Label::new(Some(text));
-    label.set_xalign(0.0);
-    apply_text_role(&label, "section-label");
-    label
-}
-
-fn body_label(text: &str) -> Label {
-    let label = Label::new(Some(text));
-    label.set_xalign(0.0);
-    label.set_wrap(true);
-    label
-}
-
-fn meta_label(text: &str) -> Label {
-    let label = body_label(text);
-    apply_text_role(&label, "meta");
-    label
-}
-
-fn section_separator() -> Separator {
-    Separator::new(Orientation::Horizontal)
+/// The rows of a form section.
+fn form() -> GtkBox {
+    ui::vbox(8)
 }
 
 fn workbench_scroller() -> ScrolledWindow {
@@ -4725,7 +4599,17 @@ fn workbench_scroller() -> ScrolledWindow {
 }
 
 fn workbench_content() -> GtkBox {
-    let content = GtkBox::new(Orientation::Vertical, 8);
+    let content = ui::vbox(24);
+    content.set_margin_top(20);
+    content.set_margin_bottom(20);
+    content.set_margin_start(24);
+    content.set_margin_end(24);
+    content
+}
+
+/// The padded content of a side tool window.
+fn panel_content() -> GtkBox {
+    let content = ui::vbox(20);
     content.set_margin_top(12);
     content.set_margin_bottom(12);
     content.set_margin_start(12);
@@ -4733,31 +4617,15 @@ fn workbench_content() -> GtkBox {
     content
 }
 
-fn details_content() -> GtkBox {
-    let content = GtkBox::new(Orientation::Vertical, 8);
-    content.set_margin_top(10);
-    content.set_margin_bottom(10);
-    content.set_margin_start(10);
-    content.set_margin_end(10);
-    content
-}
-
-fn add_table_header(grid: &Grid, column: i32, text: &str, xalign: f32) {
-    let label = Label::new(Some(text));
-    label.set_xalign(xalign);
-    label.set_hexpand(column == 0);
-    apply_text_role(&label, "section-label");
-    grid.attach(&label, column, 0, 1, 1);
-}
-
-fn add_table_cell(grid: &Grid, column: i32, row: i32, text: &str, xalign: f32, expands: bool) {
-    let label = Label::new(Some(text));
-    label.set_xalign(xalign);
-    label.set_hexpand(expands);
-    if !expands {
-        apply_text_role(&label, "code");
-    }
-    grid.attach(&label, column, row, 1, 1);
+/// Scrolls a side tool window's content vertically; its text wraps to the
+/// panel width.
+fn panel_scroller() -> ScrolledWindow {
+    ScrolledWindow::builder()
+        .hexpand(true)
+        .vexpand(true)
+        .hscrollbar_policy(PolicyType::Never)
+        .vscrollbar_policy(PolicyType::Automatic)
+        .build()
 }
 
 fn load_shape(load_profile: &LoadProfile) -> LoadShape {
