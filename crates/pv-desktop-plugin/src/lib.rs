@@ -2028,7 +2028,10 @@ fn system_header() -> GtkBox {
     });
     menu.append(&rename);
     popup.set_child(Some(&menu));
-    more.connect_clicked(move |_| popup.popup());
+    let popup_for_more = popup.clone();
+    more.connect_clicked(move |_| popup_for_more.popup());
+    // The panel is rebuilt on every refresh; the popup goes with its button.
+    more.connect_destroy(move |_| popup.unparent());
     header.append(&more);
     header
 }
