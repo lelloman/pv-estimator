@@ -559,7 +559,8 @@ fn no_project_launcher(product: &maruzzella::ProductSpec) -> LauncherSpec {
     launcher.menu_items = product.menu_items.clone();
     launcher.commands = product.commands.clone();
     launcher.toolbar_items = product.toolbar_items.clone();
-    launcher.menu_roots.retain(|root| root.id != "view");
+    // Keep the View root in place: Maruzzella's own View items still land in
+    // it, and a removed root would be re-added after Help.
     launcher.menu_items.retain(|item| item.root_id != "view");
     launcher
         .toolbar_items
