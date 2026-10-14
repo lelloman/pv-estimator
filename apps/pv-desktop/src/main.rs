@@ -407,9 +407,11 @@ fn remove_standalone_settings_tabs(node: &mut WorkbenchNodeSpec) -> bool {
             true
         }
         WorkbenchNodeSpec::Split { children, .. } => {
-            children.iter_mut().fold(false, |changed, child| {
-                remove_standalone_settings_tabs(child) || changed
-            })
+            let mut changed = false;
+            for child in children {
+                changed |= remove_standalone_settings_tabs(child);
+            }
+            changed
         }
     }
 }
