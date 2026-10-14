@@ -1,9 +1,10 @@
 use gtk::gio::prelude::ApplicationExtManual;
 use maruzzella::{
-    CommandSpec, LauncherSpec, MaruzzellaConfig, MenuItemSpec, MenuRootSpec, PanelResizePolicy,
-    ShellChrome, ShellMode, ShellSpec, TabGroupSpec, TabSpec, ToolbarDisplayMode, ToolbarItemSpec,
-    ToolbarPlacement, WorkbenchNodeSpec, WorkspaceSession, build_application_with_handle,
-    default_product_spec, layout, load_static_plugin, plugin_tab, theme,
+    AboutSpec, CommandSpec, LauncherSpec, MaruzzellaConfig, MenuItemSpec, MenuRootSpec,
+    PanelResizePolicy, ShellChrome, ShellMode, ShellSpec, TabGroupSpec, TabSpec,
+    ToolbarDisplayMode, ToolbarItemSpec, ToolbarPlacement, WorkbenchNodeSpec, WorkspaceSession,
+    build_application_with_handle, default_product_spec, layout, load_static_plugin, plugin_tab,
+    theme,
 };
 use maruzzella::{MzContextActivationPolicy, MzSurfaceRole};
 
@@ -28,6 +29,14 @@ fn main() {
     let mut product = default_product_spec();
     product.branding.title = "PV Estimator".to_string();
     product.branding.status_text = "PV engineering workbench".to_string();
+    product.about = AboutSpec::new(
+        env!("CARGO_PKG_VERSION"),
+        "Estimates photovoltaic production from coordinates and simple system settings, \
+         and simulates how much of it a household consumes. It runs locally, with an \
+         embedded city search catalog and source-model bundle, so estimates do not require \
+         a hosted service.",
+    )
+    .with_link("Source code", env!("CARGO_PKG_REPOSITORY"));
     product.include_base_toolbar_items = false;
     product.include_base_menu_items = false;
     product.include_base_startup_tabs = false;
@@ -111,10 +120,11 @@ fn main() {
     product.layout.left_panel_resize = PanelResizePolicy::Fixed;
     product.layout.right_panel_resize = PanelResizePolicy::Fixed;
     product.layout.bottom_panel_resize = PanelResizePolicy::Fixed;
-    product.layout.left_panel = TabGroupSpec::new(
-        "panel-left",
-        Some("system"),
-        vec![plugin_tab(
+    // The panels keep the default product's appearances; only their content
+    // changes.
+    product.layout.left_panel = TabGroupSpec {
+        active_tab_id: Some("system".to_string()),
+        tabs: vec![plugin_tab(
             "system",
             "panel-left",
             "",
@@ -122,27 +132,19 @@ fn main() {
             "The PV system view could not be created.",
             false,
         )],
-    )
-    .with_tab_strip_hidden()
-    .with_panel_appearance("primary")
-    .with_panel_header_appearance("secondary")
-    .with_tab_strip_appearance("utility");
-    product.layout.right_panel = TabGroupSpec::new(
-        "panel-right",
-        Some(DETAILS_TAB_ID),
-        vec![details_panel_tab()],
-    )
-    .with_tab_strip_hidden()
-    .with_panel_appearance("primary")
-    .with_panel_header_appearance("secondary")
-    .with_tab_strip_appearance("utility");
-    product.layout.bottom_panel = TabGroupSpec::new("panel-bottom", None, Vec::new());
-    product.layout.workbench = WorkbenchNodeSpec::Group(
-        TabGroupSpec::new("workbench-main", Some("estimate"), project_workbench_tabs())
-            .with_panel_appearance("workbench")
-            .with_panel_header_appearance("secondary")
-            .with_tab_strip_appearance("editor"),
-    );
+        ..product.layout.left_panel
+    }
+    .with_tab_strip_hidden();
+    product.layout.right_panel = TabGroupSpec {
+        active_tab_id: Some(DETAILS_TAB_ID.to_string()),
+        tabs: vec![details_panel_tab()],
+        ..product.layout.right_panel
+    }
+    .with_tab_strip_hidden();
+    product.layout.workbench = WorkbenchNodeSpec::Group(workbench_group(
+        Some(ESTIMATE_TAB_ID),
+        project_workbench_tabs(),
+    ));
 
     let has_restorable_session = pv_desktop_plugin::has_restorable_desktop_session();
     let project_shell = product.shell_spec();
@@ -270,6 +272,14 @@ fn workspace_chrome() -> ShellChrome {
         show_search: false,
         toolbar_placement: ToolbarPlacement::BelowMenu,
     }
+}
+
+/// The editor area group, with the appearances of Maruzzella's default
+/// workbench.
+fn workbench_group(active_tab_id: Option<&str>, tabs: Vec<TabSpec>) -> TabGroupSpec {
+    TabGroupSpec::new(WORKBENCH_GROUP_ID, active_tab_id, tabs)
+        .with_panel_appearance("workbench")
+        .with_tab_strip_appearance("editor")
 }
 
 fn project_workbench_tabs() -> Vec<TabSpec> {
@@ -426,12 +436,7 @@ fn ensure_workbench_has_any_tab(node: &mut WorkbenchNodeSpec) -> bool {
     if workbench_has_tabs(node) {
         false
     } else {
-        *node = WorkbenchNodeSpec::Group(
-            TabGroupSpec::new(WORKBENCH_GROUP_ID, None, Vec::new())
-                .with_panel_appearance("workbench")
-                .with_panel_header_appearance("secondary")
-                .with_tab_strip_appearance("editor"),
-        );
+        *node = WorkbenchNodeSpec::Group(workbench_group(None, Vec::new()));
         insert_tab_in_first_workbench_group(node, estimate_workbench_tab())
     }
 }
@@ -546,7 +551,6 @@ fn no_project_launcher(product: &maruzzella::ProductSpec) -> LauncherSpec {
         )
         .with_tab_strip_hidden()
         .with_panel_appearance("workbench")
-        .with_panel_header_appearance("secondary")
         .with_tab_strip_appearance("editor"),
     );
     launcher.menu_roots = product.menu_roots.clone();
@@ -621,7 +625,8 @@ fn toolbar_item_with_display(
         payload: Vec::new(),
         secondary,
         display_mode,
-        appearance_id: "toolbar".to_string(),
+        // Maruzzella's defaults for toolbar items contributed by plugins.
+        appearance_id: if secondary { "ghost" } else { "primary" }.to_string(),
         options: Vec::new(),
         selected_index: 0,
     }
